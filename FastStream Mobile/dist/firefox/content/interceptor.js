@@ -1,158 +1,209 @@
 /**
  * FastStream Mobile - In-Page Interceptor
- * Runs in the "MAIN" world to hook native browser APIs.
+ *
+ * Registered in manifest.json as a `"world": "MAIN"` content script at document_start in all
+ * frames, so it runs before page scripts, is immune to the page's CSP, and inherits the
+ * page's cookies / Referer / CORS identity for proxy fetches.
+ *
+ * 1. Detects HLS/DASH manifests requested via fetch/XHR (URL or Content-Type) and media
+ *    elements whose src points at a stream, reporting each URL once.
+ * 2. Signals (URL-less) MSE usage so the engine can rank the frame - never as a stream.
+ * 3. Performs proxy fetches for the extension (FS_FETCH) and returns the body as a
+ *    transferred ArrayBuffer (zero-copy) instead of a JSON array of numbers.
  */
-
 (function () {
-    console.log('[FastStream] Interceptor injected');
+    'use strict';
+    if (window.__FASTSTREAM_INTERCEPTOR__) return;
+    Object.defineProperty(window, '__FASTSTREAM_INTERCEPTOR__', { value: true });
 
-    // Helper to send data to content script
-    function notify(type, payload) {
-        window.postMessage({
-            source: 'faststream-interceptor',
-            type: type,
-            payload: payload
-        }, '*');
+    const TAG_OUT = 'faststream-interceptor';
+    const TAG_IN = 'faststream-sniffer';
+    const MANIFEST_RE = /\.(m3u8|mpd)(\?|#|$)/i;
+    const MANIFEST_MIME = /mpegurl|dash\+xml/i;
+    const reported = new Set();
+
+    // Capture pristine references before any page script can monkey-patch them.
+    const origFetch = window.fetch;
+    const OrigXHR = window.XMLHttpRequest;
+    const xhrOpen = OrigXHR.prototype.open;
+    const postMessage = window.postMessage.bind(window);
+    const OrigAbortController = window.AbortController;
+    const OrigHeaders = window.Headers;
+    const location = window.location;
+
+    function emit(type, payload, transfer) {
+        try {
+            postMessage({ source: TAG_OUT, type, ...payload }, '*', transfer || []);
+        } catch (_) { /* detached frame */ }
     }
 
-    // =========================================================================
-    // 1. Network Hook (Fetch & XHR)
-    // =========================================================================
-    const originalFetch = window.fetch;
-    const originalXHR = window.XMLHttpRequest.prototype.open;
-
-    // Hook Fetch
-    window.fetch = async function (...args) {
-        const [resource, config] = args;
-        const url = (resource instanceof Request) ? resource.url : resource;
-
-        if (url && (typeof url === 'string')) {
-            if (url.includes('.m3u8') || url.includes('.mpd')) {
-                notify('STREAM_FOUND', { url, method: 'fetch', type: url.includes('.m3u8') ? 'hls' : 'dash' });
-            }
+    function absolute(url) {
+        try {
+            return new URL(url, location.href).href;
+        } catch (_) {
+            return null;
         }
-        return originalFetch.apply(this, args);
+    }
+
+    function report(rawUrl, method, mime) {
+        const url = absolute(rawUrl);
+        if (!url || url.startsWith('blob:') || url.startsWith('data:')) return;
+        const byExt = MANIFEST_RE.test(url.split('#')[0]);
+        const byMime = mime && MANIFEST_MIME.test(mime);
+        if (!byExt && !byMime) return;
+        const key = url.split('#')[0];
+        if (reported.has(key)) return;
+        reported.add(key);
+        const isHls = /m3u8/i.test(url) || /mpegurl/i.test(mime || '');
+        emit('STREAM_FOUND', { payload: { url: key, method, mime: mime || '', type: isHls ? 'hls' : 'dash' } });
+    }
+
+    function urlOf(resource) {
+        if (!resource) return null;
+        if (typeof resource === 'string') return resource;
+        if (resource instanceof URL) return resource.href;
+        if (typeof Request !== 'undefined' && resource instanceof Request) return resource.url;
+        try { return String(resource); } catch (_) { return null; }
+    }
+
+    // ------------------------------------------------------------------
+    // 1. Network hooks (detection only - requests are never altered)
+    // ------------------------------------------------------------------
+    window.fetch = function (resource, init) {
+        const url = urlOf(resource);
+        if (url) report(url, 'fetch');
+        const p = origFetch.apply(this, arguments);
+        if (url && !MANIFEST_RE.test(url)) {
+            // Extension-less manifests: detect by response Content-Type.
+            p.then(res => {
+                try {
+                    const ct = res.headers.get('content-type');
+                    if (ct && MANIFEST_MIME.test(ct)) report(res.url || url, 'fetch', ct);
+                } catch (_) { /* opaque */ }
+            }, () => { });
+        }
+        return p;
+    };
+    try { Object.defineProperty(window.fetch, 'name', { value: 'fetch' }); } catch (_) { /* ignore */ }
+
+    OrigXHR.prototype.open = function (method, url) {
+        try {
+            const u = urlOf(url);
+            if (u) {
+                report(u, 'xhr');
+                if (!MANIFEST_RE.test(u)) {
+                    this.addEventListener('load', function onLoad() {
+                        try {
+                            const ct = this.getResponseHeader('content-type');
+                            if (ct && MANIFEST_MIME.test(ct)) report(this.responseURL || u, 'xhr', ct);
+                        } catch (_) { /* ignore */ }
+                    }, { once: true });
+                }
+            }
+        } catch (_) { /* never break the page */ }
+        return xhrOpen.apply(this, arguments);
     };
 
-    // Hook XHR
-    window.XMLHttpRequest.prototype.open = function (method, url) {
-        if (url && (typeof url === 'string')) {
-            if (url.includes('.m3u8') || url.includes('.mpd')) {
-                notify('STREAM_FOUND', { url, method: 'xhr', type: url.includes('.m3u8') ? 'hls' : 'dash' });
-            }
-        }
-        return originalXHR.apply(this, arguments);
-    };
-
-    // =========================================================================
-    // 2. MediaSource Hook (The "Netflix" Hook)
-    // =========================================================================
-    // Detects when the page is manually building a stream buffer
-    if (window.MediaSource) {
-        const originalAddSourceBuffer = window.MediaSource.prototype.addSourceBuffer;
-
+    // ------------------------------------------------------------------
+    // 2. MediaSource signal (URL-less - only marks this frame as an MSE player)
+    // ------------------------------------------------------------------
+    if (window.MediaSource && window.MediaSource.prototype.addSourceBuffer) {
+        const origAdd = window.MediaSource.prototype.addSourceBuffer;
+        let signalled = false;
         window.MediaSource.prototype.addSourceBuffer = function (mimeType) {
-            console.log('[FastStream] MediaSource initialized with:', mimeType);
-
-            // If the page is using MSE, it's definitely a stream we want to hijack/monitor
-            notify('MSE_INIT', { mimeType, timestamp: Date.now() });
-
-            // We can even trace where this buffer came from if we track SourceBuffers
-            const sourceBuffer = originalAddSourceBuffer.call(this, mimeType);
-
-            // Hook appendBuffer to see what's being pushed (advanced debugging)
-            // const originalAppend = sourceBuffer.appendBuffer;
-            // sourceBuffer.appendBuffer = function(data) {
-            //    return originalAppend.call(this, data);
-            // }
-
-            return sourceBuffer;
+            // Ignore FastStream's own player (its host element lives in the top document).
+            if (!signalled && !document.getElementById('faststream-host')) {
+                signalled = true;
+                emit('MSE_INIT', { payload: { mimeType: String(mimeType || '') } });
+            }
+            return origAdd.apply(this, arguments);
         };
     }
 
-    // =========================================================================
-    // 3. Video Element Hook
-    // =========================================================================
-    const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-    if (descriptor && descriptor.set) {
-        const originalSet = descriptor.set;
+    // ------------------------------------------------------------------
+    // 3. Media element src hook
+    // ------------------------------------------------------------------
+    const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    if (srcDesc && srcDesc.set) {
         Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-            set: function (value) {
-                if (value && (value.includes('.m3u8') || value.includes('.mpd'))) {
-                    notify('STREAM_FOUND', { url: value, method: 'video.src', type: value.includes('.m3u8') ? 'hls' : 'dash' });
-                }
-                return originalSet.call(this, value);
-            },
-            get: descriptor.get
+            configurable: true,
+            enumerable: srcDesc.enumerable,
+            get: srcDesc.get,
+            set(value) {
+                try { if (typeof value === 'string') report(value, 'video.src'); } catch (_) { /* ignore */ }
+                srcDesc.set.call(this, value);
+            }
         });
     }
 
-    // =========================================================================
-    // 4. Main World Fetch Proxy (Fix for Firefox / Protected Streams)
-    // This runs IN THE PAGE CONTEXT so it inherits cookies, session, TLS fingerprint.
-    // IMPORTANT: Use XHR, not fetch! Original players use XHR and CDNs may fingerprint.
-    // =========================================================================
-    window.addEventListener('message', (event) => {
-        if (event.data?.type === 'FETCH_PAGE') {
-            const requestId = event.data.id;
-            const url = event.data.url;
-            const customHeaders = event.data.headers || {};
+    // ------------------------------------------------------------------
+    // 4. Proxy fetch on behalf of the extension (page network identity)
+    // ------------------------------------------------------------------
+    const controllers = new Map();
 
-            const xhr = new XMLHttpRequest();
-            xhr.open('GET', url, true);
-            xhr.responseType = 'arraybuffer';
-            xhr.withCredentials = true; // Include cookies
+    function sameOrigin(url) {
+        try { return new URL(url).origin === location.origin; } catch (_) { return false; }
+    }
 
-            // Set custom headers (browser will ignore protected ones like Origin/Cookie)
-            const blockedHeaders = ['Host', 'Cookie', 'Origin', 'Content-Length', 'Connection'];
-            for (const [name, value] of Object.entries(customHeaders)) {
-                if (!blockedHeaders.includes(name)) {
-                    try {
-                        xhr.setRequestHeader(name, value);
-                    } catch (e) {
-                        // Some headers can't be set, ignore
-                    }
-                }
+    async function doFetch(url, method, headers, signal, credentials) {
+        const h = new OrigHeaders();
+        for (const [k, v] of Object.entries(headers || {})) {
+            if (/^(host|cookie|origin|referer|content-length|connection)$/i.test(k)) continue;
+            try { h.set(k, v); } catch (_) { /* forbidden header */ }
+        }
+        return origFetch.call(window, url, {
+            method: method || 'GET',
+            headers: h,
+            credentials,
+            signal,
+            cache: 'no-store',
+            redirect: 'follow',
+            referrerPolicy: 'strict-origin-when-cross-origin'
+        });
+    }
+
+    async function handleFetch(msg) {
+        const { id, url, method, headers } = msg;
+        const controller = new OrigAbortController();
+        controllers.set(id, controller);
+        try {
+            let res;
+            const firstCreds = sameOrigin(url) ? 'include' : 'same-origin';
+            try {
+                // Cross-origin CDNs typically answer with ACAO:* which forbids credentials,
+                // so try without cookies first and retry with them on a CORS failure.
+                res = await doFetch(url, method, headers, controller.signal, firstCreds);
+            } catch (err) {
+                if (err && err.name === 'AbortError') throw err;
+                if (firstCreds === 'include') throw err;
+                res = await doFetch(url, method, headers, controller.signal, 'include');
             }
+            const outHeaders = {};
+            res.headers.forEach((v, k) => { outHeaders[k] = v; });
+            const buffer = (method === 'HEAD') ? new ArrayBuffer(0) : await res.arrayBuffer();
+            emit('FETCH_RESULT', { id, ok: true, status: res.status, headers: outHeaders, url: res.url || url, buffer }, [buffer]);
+        } catch (err) {
+            emit('FETCH_RESULT', {
+                id,
+                ok: false,
+                aborted: !!(err && err.name === 'AbortError'),
+                status: 0,
+                error: `${(err && err.name) || 'Error'}: ${(err && err.message) || err}`
+            });
+        } finally {
+            controllers.delete(id);
+        }
+    }
 
-            xhr.onload = function () {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    const buf = xhr.response;
-                    window.postMessage({
-                        source: 'faststream-interceptor',
-                        type: 'FETCH_RESULT',
-                        id: requestId,
-                        buffer: Array.from(new Uint8Array(buf))
-                    }, '*');
-                } else {
-                    window.postMessage({
-                        source: 'faststream-interceptor',
-                        type: 'FETCH_ERROR',
-                        id: requestId,
-                        error: `HTTP ${xhr.status}: ${xhr.statusText}`
-                    }, '*');
-                }
-            };
-
-            xhr.onerror = function () {
-                window.postMessage({
-                    source: 'faststream-interceptor',
-                    type: 'FETCH_ERROR',
-                    id: requestId,
-                    error: `XHR NetworkError: CDN blocked request - ${url}`
-                }, '*');
-            };
-
-            xhr.ontimeout = function () {
-                window.postMessage({
-                    source: 'faststream-interceptor',
-                    type: 'FETCH_ERROR',
-                    id: requestId,
-                    error: 'XHR timeout'
-                }, '*');
-            };
-
-            xhr.send();
+    window.addEventListener('message', (event) => {
+        if (event.source !== window) return;
+        const msg = event.data;
+        if (!msg || msg.source !== TAG_IN || typeof msg.id !== 'string') return;
+        if (msg.type === 'FS_FETCH' && typeof msg.url === 'string' && /^https?:/i.test(msg.url)) {
+            handleFetch(msg);
+        } else if (msg.type === 'FS_ABORT') {
+            const c = controllers.get(msg.id);
+            if (c) c.abort();
         }
     });
 

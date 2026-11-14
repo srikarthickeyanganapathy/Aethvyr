@@ -1,0 +1,22 @@
+[
+    {
+        "id": 1,
+        "priority": 1,
+        "action": {
+            "type": "modifyHeaders",
+            "responseHeaders": [
+                {
+                    "header": "Access-Control-Expose-Headers",
+                    "operation": "append",
+                    "value": "Content-Length, Content-Range, Content-Type, Accept-Ranges"
+                }
+            ]
+        },
+        "condition": {
+            "regexFilter": "^https?://[^#]*\\.(m3u8|mpd|ts|m4s|m4v|m4a|mp4|aac|webm|vtt|key)([?#].*)?$",
+            "resourceTypes": [
+                "xmlhttprequest"
+            ]
+        }
+    }
+]

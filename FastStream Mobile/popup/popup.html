@@ -4,48 +4,185 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FastStream Manager</title>
+    <title>FastStream Mobile</title>
     <link rel="stylesheet" href="css/style.css">
 </head>
 
 <body>
-    <div id="app">
-        <header>
+    <a class="skip-link" href="#stream-section">Skip to detected streams</a>
+    <div id="app" data-theme="emerald">
+        <header class="app-header">
             <h1>FastStream Mobile</h1>
-            <span id="version" class="badge">v2.0</span>
+            <span id="version" class="badge" aria-label="Version">v2.0</span>
         </header>
 
-        <section id="active-streams">
-            <h2>Detected Streams</h2>
-            <ul id="stream-list">
-                <!-- Template -->
-                <!--
-                <li class="stream-item">
-                    <div class="stream-info">
-                        <span class="stream-type hls">HLS</span>
-                        <span class="stream-url">https://example.com/video.m3u8</span>
-                    </div>
-                    <button class="btn-launch">Play</button>
-                </li>
-                -->
-                <li id="empty-state">No streams detected on this tab.</li>
-            </ul>
+        <div id="announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+        <p id="message" class="message" role="alert" hidden></p>
+
+        <section id="permission-banner" class="card warn" hidden aria-labelledby="perm-title">
+            <h2 id="perm-title">⚠ Site access needed</h2>
+            <p>FastStream needs permission to read pages so it can detect and play videos.</p>
+            <button type="button" id="grant-permission" class="btn btn-primary">Allow access to websites</button>
         </section>
 
-        <section id="global-stats">
-            <h2>Network Engine</h2>
-            <div class="stats-grid">
-                <div class="stat">
-                    <label>Active DLs</label>
-                    <span id="stat-active">0</span>
-                </div>
-                <div class="stat">
-                    <label>Bandwidth</label>
-                    <span id="stat-bandwidth">0 Mbps</span>
-                </div>
+        <section id="player-section" class="card" hidden aria-labelledby="player-title">
+            <h2 id="player-title">✓ Player open on this tab</h2>
+            <p id="player-stream" class="muted"></p>
+            <div class="btn-row">
+                <button type="button" id="export-btn" class="btn">Export / download stream</button>
+                <button type="button" id="close-player-btn" class="btn btn-danger">Close player</button>
             </div>
         </section>
+
+        <section id="stream-section" class="card" aria-labelledby="streams-title" tabindex="-1">
+            <div class="section-head">
+                <h2 id="streams-title">Detected streams <span id="stream-count" class="badge">0</span></h2>
+                <div class="btn-row compact">
+                    <button type="button" id="rescan-btn" class="btn btn-small" aria-label="Rescan this page for videos">Rescan</button>
+                    <button type="button" id="clear-btn" class="btn btn-small" aria-label="Clear the detected stream list">Clear</button>
+                </div>
+            </div>
+            <ul id="stream-list" class="stream-list" aria-labelledby="streams-title"></ul>
+            <p id="empty-state" class="muted">Looking for videos… Start playing the video on the page if nothing appears.</p>
+        </section>
+
+        <section id="global-stats" class="card" aria-labelledby="stats-title">
+            <h2 id="stats-title">Network engine</h2>
+            <dl class="stats-grid">
+                <div class="stat"><dt>Active downloads</dt><dd id="stat-active">0</dd></div>
+                <div class="stat"><dt>Bandwidth</dt><dd id="stat-bandwidth">0 Mbps</dd></div>
+                <div class="stat"><dt>Prefetched ahead</dt><dd id="stat-ahead">—</dd></div>
+                <div class="stat"><dt>Segment cache</dt><dd id="stat-cache">—</dd></div>
+            </dl>
+        </section>
+
+        <details id="settings" class="card">
+            <summary><h2>Player settings</h2></summary>
+            <form id="settings-form" novalidate>
+                <fieldset>
+                    <legend>Appearance &amp; accessibility</legend>
+                    <div class="field">
+                        <label for="s-theme">Theme &amp; accent</label>
+                        <select id="s-theme" name="theme">
+                            <option value="emerald">Emerald</option>
+                            <option value="blue">Electric Blue</option>
+                            <option value="amethyst">Amethyst</option>
+                            <option value="crimson">Crimson</option>
+                            <option value="hc-yellow">High-contrast Yellow/Black</option>
+                            <option value="amoled">AMOLED Pitch Black</option>
+                            <option value="glass">Glassmorphic</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-uiScale">UI size</label>
+                        <select id="s-uiScale" name="uiScale" data-type="number">
+                            <option value="0.85">Small (85%)</option>
+                            <option value="1">Default (100%)</option>
+                            <option value="1.25">Large (125%)</option>
+                            <option value="1.5">Extra large (150%)</option>
+                        </select>
+                    </div>
+                    <label class="check"><input type="checkbox" id="s-highContrast" name="highContrast"> High-contrast mode</label>
+                    <div class="field">
+                        <label for="s-reducedMotion">Reduced motion</label>
+                        <select id="s-reducedMotion" name="reducedMotion">
+                            <option value="system">Follow system setting</option>
+                            <option value="on">Always reduce motion</option>
+                            <option value="off">Allow animations</option>
+                        </select>
+                    </div>
+                    <label class="check"><input type="checkbox" id="s-simpleMode" name="simpleMode"> Simple / clean controls</label>
+                    <div class="field">
+                        <label for="s-autoHideMs">Auto-hide controls</label>
+                        <select id="s-autoHideMs" name="autoHideMs" data-type="number">
+                            <option value="2000">After 2 seconds</option>
+                            <option value="3000">After 3 seconds</option>
+                            <option value="5000">After 5 seconds</option>
+                            <option value="0">Never (keep visible)</option>
+                        </select>
+                    </div>
+                    <label class="check"><input type="checkbox" id="s-showStats" name="showStats"> Show stats for nerds</label>
+                </fieldset>
+                <fieldset>
+                    <legend>Playback defaults</legend>
+                    <div class="field">
+                        <label for="s-defaultSpeed">Default speed</label>
+                        <select id="s-defaultSpeed" name="defaultSpeed" data-type="number">
+                            <option value="0.25">0.25×</option>
+                            <option value="0.5">0.5×</option>
+                            <option value="0.75">0.75×</option>
+                            <option value="1">1× (normal)</option>
+                            <option value="1.25">1.25×</option>
+                            <option value="1.5">1.5×</option>
+                            <option value="1.75">1.75×</option>
+                            <option value="2">2×</option>
+                            <option value="2.5">2.5×</option>
+                            <option value="3">3×</option>
+                            <option value="4">4×</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-qualityCap">Resolution cap</label>
+                        <select id="s-qualityCap" name="qualityCap" data-type="number">
+                            <option value="0">No limit</option>
+                            <option value="2160">2160p</option>
+                            <option value="1440">1440p</option>
+                            <option value="1080">1080p</option>
+                            <option value="720">720p (saves data)</option>
+                            <option value="480">480p</option>
+                            <option value="360">360p</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-seekStep">Seek step</label>
+                        <select id="s-seekStep" name="seekStep" data-type="number">
+                            <option value="5">5 seconds</option>
+                            <option value="10">10 seconds</option>
+                            <option value="15">15 seconds</option>
+                            <option value="30">30 seconds</option>
+                        </select>
+                    </div>
+                    <label class="check"><input type="checkbox" id="s-autoFullscreen" name="autoFullscreen"> Fullscreen on first tap</label>
+                    <label class="check"><input type="checkbox" id="s-gestures" name="gestures.enabled"> Touch gestures</label>
+                </fieldset>
+                <fieldset>
+                    <legend>Engine</legend>
+                    <div class="field">
+                        <label for="s-maxBufferSec">Prefetch ahead</label>
+                        <select id="s-maxBufferSec" name="maxBufferSec" data-type="number">
+                            <option value="30">30 seconds</option>
+                            <option value="60">1 minute</option>
+                            <option value="90">1.5 minutes</option>
+                            <option value="180">3 minutes</option>
+                            <option value="300">5 minutes</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-cacheSizeMB">Cache size per tab</label>
+                        <select id="s-cacheSizeMB" name="cacheSizeMB" data-type="number">
+                            <option value="100">100 MB</option>
+                            <option value="300">300 MB</option>
+                            <option value="500">500 MB</option>
+                            <option value="1000">1 GB</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-maxWorkers">Max parallel downloads</label>
+                        <select id="s-maxWorkers" name="maxWorkers" data-type="number">
+                            <option value="2">2 (battery saver)</option>
+                            <option value="4">4</option>
+                            <option value="6">6</option>
+                            <option value="8">8 (fastest)</option>
+                        </select>
+                    </div>
+                </fieldset>
+                <div class="btn-row">
+                    <button type="button" id="reset-settings" class="btn">Reset all settings</button>
+                </div>
+            </form>
+        </details>
     </div>
+    <script src="../common/shared.js"></script>
     <script src="js/popup.js"></script>
 </body>
 

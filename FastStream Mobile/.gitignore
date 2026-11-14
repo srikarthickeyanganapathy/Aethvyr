@@ -1,0 +1,10 @@
+# Dependencies (restore with `npm install`)
+node_modules/
+
+# Packaged store zips (rebuild with `npm run package`)
+dist/*.zip
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log

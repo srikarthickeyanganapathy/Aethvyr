@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "FastStream Mobile 2.0",
+  "short_name": "FastStream",
   "version": "2.0.0",
-  "description": "Production-grade MSE streaming optimizer for mobile.",
+  "description": "Accessible, customizable HLS/DASH/MP4 player with parallel prefetching for mobile and desktop browsers.",
   "permissions": [
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess",
@@ -25,29 +26,48 @@
         "<all_urls>"
       ],
       "js": [
+        "content/interceptor.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "common/shared.js",
         "content/sniffer.js"
       ],
       "run_at": "document_start",
-      "all_frames": true
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "content/interceptor.js",
-        "content/player-overlay.js"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
-    }
-  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "stream_rules",
+        "enabled": true,
+        "path": "rules/stream_rules.json"
+      }
+    ]
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "action": {
+    "default_title": "FastStream Mobile",
     "default_popup": "popup/popup.html",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
     }
-  }
+  },
+  "minimum_chrome_version": "111"
 }
