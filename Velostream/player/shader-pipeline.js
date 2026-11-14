@@ -23,8 +23,12 @@
     const VS = `#version 300 es
 in vec2 aPos;
 out vec2 vUv;
+// Video textures are uploaded top row first (v = 0 is the top of the picture), while a texture
+// rendered by an earlier pass stores the top of the picture at v = 1 (GL framebuffer origin is
+// bottom-left). uFbo selects the matching mapping so every pass keeps the picture upright.
+uniform float uFbo;
 void main() {
-    vUv = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+    vUv = vec2(aPos.x * 0.5 + 0.5, uFbo > 0.5 ? aPos.y * 0.5 + 0.5 : 0.5 - aPos.y * 0.5);
     gl_Position = vec4(aPos, 0.0, 1.0);
 }`;
 
@@ -198,7 +202,8 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
 
         init() {
             if (this.gl || this.failed) return !!this.gl;
-            const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance', desynchronized: true });
+            const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
+            // (No `desynchronized`: low-latency canvases bypass the compositor and can tear/flicker.)
             if (!gl) { this.fail('WebGL2 is not available'); return false; }
             this.gl = gl;
             this.canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); this.fail('GPU context lost'); });
@@ -248,7 +253,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.linkProgram(p);
             if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link error');
             const u = n => gl.getUniformLocation(p, n);
-            return { p, uTex: u('uTex'), uIn: u('uInSize'), uOut: u('uOutSize'), uStr: u('uStrength'), uFrame: u('uFrame') };
+            return { p, uTex: u('uTex'), uIn: u('uInSize'), uOut: u('uOutSize'), uStr: u('uStrength'), uFrame: u('uFrame'), uFbo: u('uFbo') };
         }
 
         fail(reason) {
@@ -264,8 +269,11 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             if (typeof maxRenderRes === 'number' && maxRenderRes > 0) this.maxRenderRes = maxRenderRes;
             const next = PRESETS.includes(preset) ? preset : 'off';
             if (next !== 'off' && !this.init()) { this.preset = 'off'; return false; }
+            const wasActive = this.active;
             this.preset = next;
-            this.canvas.hidden = !this.active;
+            // Stay hidden (the <video> shows through) until a real frame has been drawn: no black flash.
+            if (!this.active) { this.canvas.hidden = true; this.drawn = false; } else if (!wasActive) this.drawn = false;
+            this.canvas.hidden = !this.active || !this.drawn;
             this.resetGuard();
             if (this.active) { this.resize(); this.renderOnce(); } else this.stop();
             return this.active;
@@ -334,6 +342,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.uniform2f(prog.uIn, inW, inH);
             gl.uniform2f(prog.uOut, outW, outH);
             gl.uniform1f(prog.uStr, this.strength);
+            gl.uniform1f(prog.uFbo, tex === this.videoTex ? 0 : 1);
             if (prog.uFrame) gl.uniform1f(prog.uFrame, this.frame % 1000);
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         }
@@ -369,6 +378,12 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
                     break;
                 case 'fsr':
                 case 'anime4k': {
+                    // Displayed at or below the source size there is nothing to upscale: one
+                    // sharpening/line pass straight from the video (half the GPU work, no resampling).
+                    if (W <= vw * 1.05 && H <= vh * 1.05) {
+                        this.pass(this.preset === 'fsr' ? P.cas : P.a4k, this.videoTex, vw, vh, null, W, H);
+                        break;
+                    }
                     const up = this.ensureFbo(W, H);
                     this.pass(P.lanczos, this.videoTex, vw, vh, up, W, H);
                     this.pass(this.preset === 'fsr' ? P.rcas : P.a4k, up.tex, W, H, null, W, H);
@@ -377,6 +392,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
                 default:
                     break;
             }
+            if (!this.drawn) { this.drawn = true; this.canvas.hidden = false; }
         }
 
         renderOnce() {

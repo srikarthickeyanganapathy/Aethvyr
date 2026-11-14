@@ -121,6 +121,8 @@
     // Helpers
     // =====================================================================
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    /** True while a user gesture allows fullscreen/popup APIs (unknown -> assume yes). */
+    const hasActivation = () => !navigator.userActivation || navigator.userActivation.isActive;
 
     function icon(name, size = 20) {
         return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ''}</svg>`;
@@ -719,7 +721,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 /* ---------- stage ---------- */
 .stage { position: absolute; inset: 0; overflow: hidden; background: #000; }
-.vbox { position: absolute; transform-origin: 50% 50%; will-change: transform; }
+.vbox { position: absolute; transform-origin: 50% 50%; will-change: transform; overflow: hidden; }
 .vbox video { width: 100%; height: 100%; display: block; background: #000; object-fit: contain; }
 .root.audio-only .vbox video { visibility: hidden; }
 .vbox .gl-canvas { position: absolute; left: 0; top: 0; pointer-events: none; display: block; }
@@ -1371,6 +1373,16 @@ input[type="text"] { width: 100%; min-width: 0; }
             });
         }
 
+        /** Newest same-path stream URL the page requested after ours (fresh token), or null. */
+        findFreshUrl(url) {
+            return new Promise(resolve => {
+                const reqId = `n${++this.netSeq}`;
+                this.net.set(reqId, { resolve: (m) => resolve((m && m.url) || null), reject: () => resolve(null) });
+                this.port.send({ type: 'FIND_FRESH', reqId, url, since: this.stream.detectedAt || 0 });
+                this.later(5000, () => { if (this.net.has(reqId)) { this.net.delete(reqId); resolve(null); } });
+            });
+        }
+
         schemeRequest(uri, request, requestType, headersReceived) {
             const RT = shaka.net.NetworkingEngine.RequestType;
             const E = shaka.util.Error;
@@ -1478,7 +1490,8 @@ input[type="text"] { width: 100%; min-width: 0; }
         onMessage(msg) {
             if (this.closed) return;
             switch (msg.type) {
-                case 'RESPONSE': {
+                case 'RESPONSE':
+                case 'FRESH': {
                     const e = this.net.get(msg.reqId);
                     if (e) { this.net.delete(msg.reqId); e.resolve(msg); }
                     break;
@@ -1846,7 +1859,9 @@ input[type="text"] { width: 100%; min-width: 0; }
             const activation = () => {
                 if (!this.settings || this.closed) return;
                 if (this.audio.allowed() && this.audio.ensure()) this.audio.apply(this.settings.audio);
-                if (this.settings.autoFullscreen && !this.autoFsDone && !this.mini) {
+                // Only on an input the browser counts as a gesture (not Shift/Ctrl, not a drag that
+                // started outside the player); otherwise wait for the next one.
+                if (this.settings.autoFullscreen && !this.autoFsDone && !this.mini && hasActivation()) {
                     this.autoFsDone = true;
                     if (!document.fullscreenElement) this.toggleFullscreen();
                 }
@@ -2110,6 +2125,12 @@ input[type="text"] { width: 100%; min-width: 0; }
                 this.onFullscreenChange();
                 return;
             }
+            // requestFullscreen() needs a live user gesture; without one it fails (and Chrome logs
+            // "API can only be initiated by a user gesture"). That is not a reason to fill the window.
+            if (!document.fullscreenElement && !hasActivation()) {
+                this.announce('Press F or the full-screen button', 'fullscreen');
+                return;
+            }
             try {
                 if (document.fullscreenElement) {
                     await document.exitFullscreen();
@@ -2279,7 +2300,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             const data = Array.isArray(err.data) ? err.data : [];
             const netUrl = code >= 1000 && code < 2000 && typeof data[0] === 'string' ? data[0] : '';
             const reason = code === 1002 && data[1] ? String(data[1].message || data[1]) : '';
-            console.warn(`[Velostream] Shaka error ${code} (severity ${err.severity})${netUrl ? ` ${netUrl.slice(0, 300)}` : ''}${reason ? ` - ${reason}` : ''}`);
+            const httpStatus = code === 1001 && typeof data[1] === 'number' ? ` HTTP ${data[1]}` : '';
+            console.warn(`[Velostream] Shaka error ${code}${httpStatus} (severity ${err.severity})${netUrl ? ` ${netUrl.slice(0, 300)}` : ''}${reason ? ` - ${reason}` : ''}`);
             if (code === 3017) {
                 // QUOTA_EXCEEDED_ERROR: mobile SourceBuffer limits. Shrink buffers and keep going.
                 this.player.configure({ streaming: { bufferBehind: 8, bufferingGoal: 15 } });
@@ -2287,6 +2309,23 @@ input[type="text"] { width: 100%; min-width: 0; }
                 return;
             }
             if (err.severity !== 2 || code === 7000 || code === 7001 || code === 7002) return;
+            // Expired / single-use signed link: switch to a newer link for the same video if the
+            // page has requested one since; otherwise explain (below).
+            if (code === 1001 && (data[1] === 401 || data[1] === 403 || data[1] === 410) && this.mode === 'mse' && !this.freshTried) {
+                this.freshTried = true;
+                this.findFreshUrl(netUrl || this.stream.url).then(url => {
+                    if (this.closed) return;
+                    if (url) {
+                        this.stream = { ...this.stream, url, detectedAt: Date.now() };
+                        this.island('wave', 'Link expired · Switching to the page\'s new link');
+                        this.retry();
+                        this.later(30000, () => { this.freshTried = false; });
+                    } else {
+                        this.onShakaError(err);
+                    }
+                });
+                return;
+            }
             // Transient network failures (dropped connection, CDN hiccup, server 5xx): reload
             // silently from the current position a couple of times before showing an error.
             const status = code === 1001 ? data[1] : 0;
@@ -2306,8 +2345,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             const from = host ? ` from ${host}` : '';
             let msg = `Error code ${code}.`;
             if (code === 1001) {
-                msg = status === 403 || status === 401
-                    ? `The server${from} refused access (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Velostream again.`
+                msg = status === 403 || status === 401 || status === 410
+                    ? `The server${from} refused access (HTTP ${status}). Sites like this sign their video links and the signature expires after a while. Reload the page and open Velostream again to get a fresh link.`
                     : `The server${from} returned HTTP ${status}.`;
             } else if (code === 1002 || code === 1003) {
                 msg = `${code === 1003 ? 'Timed out' : 'Network error'} while loading the stream${from}${reason ? ` (${reason})` : ''}. Check your connection, or that an ad or content blocker is not blocking ${host || 'the video server'}, then retry.`;

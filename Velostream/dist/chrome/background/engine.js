@@ -1021,6 +1021,24 @@ api.runtime.onConnect.addListener((port) => {
                 session.post({ type: 'PURGED', time: +msg.time || 0 });
                 break;
             }
+            case 'FIND_FRESH': {
+                // Signed/expiring links: has the page requested the same video again since (new
+                // token in the query)? Same host + path, different URL, detected later.
+                const tab = await getTab(session.tabId);
+                let fresh = null;
+                try {
+                    const want = new URL(msg.url);
+                    for (const s of tab.streams.values()) {
+                        if (s.url === msg.url || s.isAd) continue;
+                        const u = new URL(s.url);
+                        if (u.host !== want.host || u.pathname !== want.pathname) continue;
+                        if (!fresh || s.detectedAt > fresh.detectedAt) fresh = s;
+                    }
+                } catch (_) { /* opaque URL */ }
+                if (fresh && fresh.detectedAt <= (msg.since || 0)) fresh = null;
+                session.post({ type: 'FRESH', reqId: msg.reqId, url: fresh ? fresh.url : null });
+                break;
+            }
             case 'EXPORT_START':
                 runExport(session);
                 break;
