@@ -51,6 +51,63 @@
         send({ action: 'STREAM_FOUND', payload: { ...payload, url: key, title: IS_TOP ? document.title : '' } });
     }
 
+    // Subtitles: sidecar files seen on the network or as <track>, and in-memory cues that a
+    // site player added with addTextTrack()/addCue() (serialized to WebVTT text, capped).
+    const reportedSubs = new Set();
+    let drmReported = false;
+    function reportSubtitle(sub) {
+        if (!sub) return;
+        const url = sub.url ? S.normalizeUrl(sub.url, location.href) : '';
+        // A <track> report may follow a network report of the same file: it carries the label,
+        // language and default flag, so it gets its own dedup slot (the engine merges them).
+        const key = url ? `${url}|${sub.method === 'track' ? 'track' : 'net'}` : `inline:${sub.label || ''}:${sub.language || ''}:${(sub.vtt || '').length}`;
+        if ((sub.url && !url) || reportedSubs.has(key) || reportedSubs.size >= 64) return;
+        reportedSubs.add(key);
+        send({ action: 'SUBTITLE_FOUND', payload: { ...sub, url } });
+    }
+
+    function vttTime(t) {
+        const ms = Math.max(0, Math.round(t * 1000));
+        const h = Math.floor(ms / 3600000);
+        const m = Math.floor(ms / 60000) % 60;
+        const s = Math.floor(ms / 1000) % 60;
+        return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms % 1000).padStart(3, '0')}`;
+    }
+
+    function scanSubtitleTracks(video) {
+        if (!video || video.tagName !== 'VIDEO') return;
+        video.querySelectorAll('track[src]').forEach(tr => {
+            const kind = (tr.getAttribute('kind') || 'subtitles').toLowerCase();
+            if (kind !== 'subtitles' && kind !== 'captions' && kind !== 'chapters') return;
+            reportSubtitle({ url: tr.src || tr.getAttribute('src'), label: tr.label || '', language: tr.srclang || '', isDefault: tr.default, kind: kind === 'chapters' ? 'chapters' : 'subtitles', method: 'track' });
+        });
+        // TextTracks that belong to a <track src> element were reported above by URL.
+        const backed = new Set(Array.from(video.querySelectorAll('track[src]')).map(tr => tr.track));
+        let tracks;
+        try { tracks = Array.from(video.textTracks || []); } catch (_) { return; }
+        for (const t of tracks) {
+            if (t.kind !== 'subtitles' && t.kind !== 'captions' && t.kind !== 'chapters') continue;
+            if (backed.has(t)) continue;
+            // Only in-memory cue lists (addTextTrack()/addCue()) are serialized.
+            let cues = null;
+            try {
+                if (t.mode === 'disabled') continue; // cues are not readable while disabled
+                cues = t.cues;
+            } catch (_) { continue; }
+            if (!cues || cues.length < (t.kind === 'chapters' ? 1 : 3)) continue;
+            let out = 'WEBVTT\n\n';
+            const n = Math.min(cues.length, 5000);
+            for (let i = 0; i < n; i++) {
+                const c = cues[i];
+                const text = typeof c.text === 'string' ? c.text : '';
+                if (!text) continue;
+                out += `${vttTime(c.startTime)} --> ${vttTime(c.endTime)}\n${text.replace(/\n{2,}/g, '\n')}\n\n`;
+                if (out.length > 1500000) break;
+            }
+            reportSubtitle({ vtt: out, label: t.label || '', language: t.language || '', kind: t.kind === 'chapters' ? 'chapters' : 'subtitles', method: 'textTracks' });
+        }
+    }
+
     // ------------------------------------------------------------------
     // 3. Proxy fetch bookkeeping (single listener, id -> pending map)
     // ------------------------------------------------------------------
@@ -68,6 +125,15 @@
                 if (!mseReported) {
                     mseReported = true;
                     send({ action: 'MSE_INIT', payload: { mimeType: msg.payload && msg.payload.mimeType } });
+                }
+                break;
+            case 'SUBTITLE_FOUND':
+                if (msg.payload && typeof msg.payload.url === 'string') reportSubtitle({ url: msg.payload.url, mime: msg.payload.mime || '', method: 'network' });
+                break;
+            case 'DRM_DETECTED':
+                if (!drmReported) {
+                    drmReported = true;
+                    send({ action: 'DRM_DETECTED', payload: { keySystem: String((msg.payload && msg.payload.keySystem) || '') } });
                 }
                 break;
             case 'FETCH_RESULT': {
@@ -146,6 +212,7 @@
                 videoReported = true;
                 send({ action: 'VIDEO_PRESENT' });
             }
+            if (el.tagName === 'VIDEO') scanSubtitleTracks(el);
             const candidates = [el.currentSrc, el.getAttribute('src')];
             el.querySelectorAll('source[src]').forEach(s => candidates.push(s.src || s.getAttribute('src')));
             for (const raw of candidates) {
@@ -195,6 +262,23 @@
         const t = e.target;
         if (t && (t.tagName === 'VIDEO' || t.tagName === 'AUDIO')) scheduleScan();
     }, true);
+    // A video that actually loads or starts playing is a strong signal even when it was
+    // created detached / inside a closed shadow root that the DOM scan cannot reach: report it
+    // (capture phase sees the event before the page can stop it) and move the badge to it.
+    let lastLiveVideo = null;
+    const onMediaLive = (e) => {
+        const t = e.target;
+        if (!t || t.tagName !== 'VIDEO') return;
+        if (!videoReported || e.type === 'playing') {
+            videoReported = true;
+            send({ action: 'VIDEO_PRESENT' });
+        }
+        lastLiveVideo = t;
+        scanSubtitleTracks(t);
+        scheduleScan();
+    };
+    document.addEventListener('loadedmetadata', onMediaLive, true);
+    document.addEventListener('playing', onMediaLive, true);
 
     // ------------------------------------------------------------------
     // 4. Native media suspension while Velostream plays
@@ -244,10 +328,17 @@
     };
     const FRAME_Z = '2147483647';
 
+    /** Every video in the frame, plus one seen playing inside a closed shadow root. */
+    function allVideos() {
+        const list = collectMedia(document, []);
+        if (lastLiveVideo && lastLiveVideo.isConnected && !list.includes(lastLiveVideo)) list.push(lastLiveVideo);
+        return list;
+    }
+
     function pickVideo(streamUrl) {
         let best = null;
         let bestScore = 0;
-        for (const v of collectMedia(document, [])) {
+        for (const v of allVideos()) {
             if (v.tagName !== 'VIDEO') continue;
             const r = v.getBoundingClientRect();
             if (r.width < 120 || r.height < 68) continue;
@@ -473,8 +564,8 @@
         const frame = document.createElement('iframe');
         frame.src = url.href;
         frame.title = 'Velostream player';
+        // `allow` covers fullscreen; adding `allowfullscreen` too only triggers a console warning.
         frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write');
-        frame.setAttribute('allowfullscreen', '');
         mount.frame = frame;
         mount.session = message.sessionId;
         setFrameStyle('position: absolute; width: 0; height: 0;');
@@ -546,7 +637,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
     function largestVideo() {
         let best = null;
         let bestArea = 0;
-        for (const el of collectMedia(document, [])) {
+        for (const el of allVideos()) {
             if (el.tagName !== 'VIDEO') continue;
             const r = el.getBoundingClientRect();
             const visW = Math.min(r.right, innerWidth) - Math.max(r.left, 0);

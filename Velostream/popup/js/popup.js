@@ -160,6 +160,15 @@
             $('export-btn').textContent = res.player.exporting ? 'Saving…' : live ? 'Record / save' : 'Download';
         }
         renderStreams(res.streams || []);
+        // Explain why nothing is playable on DRM / proprietary-protocol sites (YouTube, Netflix…).
+        const empty = $('empty-state');
+        if (!(res.streams || []).length) {
+            empty.textContent = res.drm
+                ? `This site uses DRM (${(res.drm.keySystem || 'encrypted media').replace(/^com\./, '')}). Protected video can only be decrypted by the site's own player.`
+                : res.proprietaryMse
+                    ? 'This site streams with its own protocol (no HLS/DASH link on the network), so only its own player can drive it. Try a site that serves .m3u8, .mpd or MP4.'
+                    : 'Looking for videos… Start the video on the page if nothing appears.';
+        }
     }
 
     function drawSpark(mbps) {

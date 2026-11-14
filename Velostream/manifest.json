@@ -5,6 +5,7 @@
     "version": "2.0.0",
     "description": "Accessible, customizable HLS/DASH/MP4 player with parallel prefetching for mobile and desktop browsers.",
     "permissions": [
+        "downloads",
         "declarativeNetRequest",
         "declarativeNetRequestWithHostAccess",
         "webRequest",
@@ -52,6 +53,8 @@
                 "player/player.html",
                 "player/player.js",
                 "player/player-ui.js",
+                "player/mp4-mux.js",
+                "player/shader-pipeline.js",
                 "lib/shaka-player.compiled.js",
                 "common/shared.js"
             ],

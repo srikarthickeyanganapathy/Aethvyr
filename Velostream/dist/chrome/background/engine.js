@@ -62,6 +62,8 @@ function newTabState(tabId) {
         children: new Set(),       // variant/rendition playlists of a known master (hidden in popup)
         mseFrames: new Map(),      // frameId -> last MSE_INIT timestamp
         videoFrames: new Set(),    // frames with a <video> element
+        subtitles: [],             // captured sidecar / in-memory subtitle tracks (bounded)
+        drm: null,                 // { keySystem, frameId } once a frame requested EME keys
         playerSessionId: null,
         probing: 0
     };
@@ -151,6 +153,43 @@ function notifyFrames(tabId) {
     }, 300));
 }
 
+/** Remember a subtitle track seen on the page (sidecar file or serialized in-memory cues). */
+async function addSubtitle(tabId, frameId, frameUrl, sub) {
+    if (!sub || (!sub.url && !sub.vtt)) return;
+    const tab = await getTab(tabId);
+    const url = sub.url ? S.normalizeUrl(sub.url, frameUrl) : '';
+    if (url && !/^https?:/i.test(url)) return;
+    const key = url || `inline:${sub.label || ''}:${sub.language || ''}:${String(sub.vtt).length}`;
+    const known = tab.subtitles.find(t => t.key === key);
+    if (known) {
+        // Seen on the network first, then as <track>: keep the richer metadata.
+        let changed = false;
+        if (!known.label && sub.label) { known.label = String(sub.label).slice(0, 80); changed = true; }
+        if (!known.language && sub.language) { known.language = String(sub.language).slice(0, 20); changed = true; }
+        if (!known.isDefault && sub.isDefault) { known.isDefault = true; changed = true; }
+        if (sub.kind === 'chapters' && known.kind !== 'chapters') { known.kind = 'chapters'; changed = true; }
+        const s0 = changed && tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
+        if (s0) s0.post({ type: 'SUBTITLES', subtitles: tab.subtitles });
+        return;
+    }
+    if (tab.subtitles.length >= 32) tab.subtitles.shift();
+    const mime = String(sub.mime || '');
+    const format = /\.srt(\?|#|$)/i.test(url) || /subrip/i.test(mime) ? 'srt'
+        : /\.(ass|ssa)(\?|#|$)/i.test(url) || /x-(ssa|ass)/i.test(mime) ? 'ass' : 'vtt';
+    tab.subtitles.push({
+        key, url, frameId, frameUrl, format,
+        vtt: sub.vtt ? String(sub.vtt).slice(0, 2000000) : '',
+        label: String(sub.label || '').slice(0, 80),
+        language: String(sub.language || '').slice(0, 20),
+        isDefault: !!sub.isDefault,
+        kind: sub.kind === 'chapters' ? 'chapters' : 'subtitles',
+        method: sub.method || 'network'
+    });
+    // Tell an open player about late arrivals.
+    const session = tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
+    if (session) session.post({ type: 'SUBTITLES', subtitles: tab.subtitles });
+}
+
 async function handleDetection(tabId, frameId, frameUrl, payload) {
     if (tabId === undefined || tabId < 0 || !payload) return null;
     const tab = await getTab(tabId);
@@ -212,7 +251,7 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
     updateIcon(tabId);
     notifyFrames(tabId);
     if (type !== 'progressive') probeStream(tab, stream);
-    if (!stream.isAd && payload.method !== 'manual') maybeAutoLaunch(tab);
+    if (!stream.isAd && payload.method !== 'manual') maybeAutoLaunch(tab, stream);
     return stream;
 }
 
@@ -221,20 +260,27 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
  * site opens in Velostream automatically, once per page load. Waits briefly so the master
  * playlist probe can win over its variant playlists.
  */
-async function maybeAutoLaunch(tab) {
+async function maybeAutoLaunch(tab, stream) {
     if (tab.autoLaunched || tab.playerSessionId || !settings.autoSites.length) return;
-    let host = '';
-    try { host = new URL((await api.tabs.get(tab.tabId)).url).hostname; } catch (_) { return; }
-    if (!settings.autoSites.includes(host)) return;
+    // Match the top page's host *and* the embedding frame's host: the stream is often found
+    // inside a third-party player iframe while the user enabled the outer site (or vice versa).
+    const hosts = new Set();
+    try { hosts.add(new URL((await api.tabs.get(tab.tabId)).url).hostname); } catch (_) { /* tab gone */ }
+    try { if (stream && stream.frameUrl) hosts.add(new URL(stream.frameUrl).hostname); } catch (_) { /* opaque */ }
+    const sites = settings.autoSites.map(h => String(h).toLowerCase());
+    const match = [...hosts].some(h => sites.some(s => h === s || h.endsWith(`.${s}`)));
+    if (!match) return;
     tab.autoLaunched = true;
     setTimeout(() => {
-        const best = visibleStreams(tab).find(s => !s.isAd);
+        const list = visibleStreams(tab).filter(s => !s.isAd);
+        // Prefer a probed master playlist over its variants when both exist already.
+        const best = list.find(s => s.probe && s.probe.isMaster) || list[0];
         if (!best || tab.playerSessionId) return;
         launchPlayer(tab.tabId, best.id).catch(err => {
             tab.autoLaunched = false;
             console.warn('[Engine] Auto-launch failed:', err && err.message);
         });
-    }, 1500);
+    }, 600);
 }
 
 /** Sniff the first bytes of an extension-less URL to decide hls / dash / progressive. */
@@ -421,10 +467,12 @@ function makeTransport(tabId, getStream) {
 
         if (!pageOnlyHosts.has(host)) {
             let direct = null;
+            let directErr = null;
             try {
                 direct = await directFetch(url, opts, frameUrl);
             } catch (err) {
                 if (err.name === 'AbortError') throw err;
+                directErr = err;
             }
             if (direct && (direct.status < 400 || ![401, 403, 407, 451].includes(direct.status))) return direct;
             // Refused or blocked outside the page: retry inside it.
@@ -435,6 +483,8 @@ function makeTransport(tabId, getStream) {
             } catch (err) {
                 if (err.name === 'AbortError') throw err;
                 if (direct) return direct;
+                // Both paths failed: report both reasons (shown in the player's error message).
+                if (directErr) err.message = `direct: ${directErr.message}; in page: ${err.message}`;
                 throw err;
             }
         }
@@ -542,6 +592,10 @@ try {
 api.webRequest.onHeadersReceived.addListener((details) => {
     if (details.tabId < 0 || details.statusCode >= 400) return;
     const ct = ((details.responseHeaders || []).find(h => h.name.toLowerCase() === 'content-type') || {}).value || '';
+    if (/text\/vtt|x-subrip/i.test(ct) && !/(seg|segment|chunk|frag)[-_]?\d+/i.test(details.url)) {
+        addSubtitle(details.tabId, details.frameId, details.documentUrl || details.initiator || '', { url: details.url, mime: ct, method: 'network' });
+        return;
+    }
     const type = S.classifyStream(details.url, ct);
     if (type !== 'hls' && type !== 'dash') return;
     handleDetection(details.tabId, details.frameId, details.documentUrl || details.initiator || '', {
@@ -775,7 +829,7 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
         return keyCache.get(uri);
     };
 
-    post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime });
+    post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime, container: isFmp4 ? 'fmp4' : (ext === 'aac' ? 'aac' : 'ts'), role: playlist.role || 'main' });
     let lastMap = null;
     const LOOKAHEAD = 4;
     const pending = new Map();
@@ -799,14 +853,14 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
             const headers = seg.map.byteRange ? { Range: `bytes=${seg.map.byteRange.offset}-${seg.map.byteRange.offset + seg.map.byteRange.length - 1}` } : {};
             const init = await transport(seg.map.uri, { method: 'GET', headers, signal });
             if (init.status >= 400) throw new Error(`Init segment HTTP ${init.status}`);
-            post({ type: 'EXPORT_CHUNK', fileIndex, data: S.packBinary(init.data) });
+            post({ type: 'EXPORT_CHUNK', fileIndex, kind: 'init', data: S.packBinary(init.data) });
             bytes += init.data.byteLength;
             lastMap = seg.map;
         }
         const data = await pending.get(i);
         pending.delete(i);
         bytes += data.byteLength;
-        post({ type: 'EXPORT_CHUNK', fileIndex, data: S.packBinary(data) });
+        post({ type: 'EXPORT_CHUNK', fileIndex, kind: 'seg', start: seg.start || 0, end: (seg.start || 0) + (seg.duration || 0), url: seg.uri, data: S.packBinary(data) });
         post({ type: 'EXPORT_PROGRESS', fileIndex, fileCount, done: i + 1, total: segs.length, bytes });
     }
     post({ type: 'EXPORT_FILE_DONE', fileIndex });
@@ -872,11 +926,22 @@ api.runtime.onConnect.addListener((port) => {
     if (port.name !== 'velostream-player') return;
     const tabId = port.sender && port.sender.tab ? port.sender.tab.id : -1;
     let session = null;
+    // Messages that arrive while HELLO is still attaching the session (the player resends its
+    // in-flight requests right after a reconnect) wait for it instead of being dropped.
+    let hello = null;
 
     port.onMessage.addListener(async (msg) => {
         if (!msg || typeof msg.type !== 'string') return;
-
         if (msg.type === 'HELLO') {
+            hello = attach(msg).catch(e => console.warn('[Engine] attach failed:', e && e.message));
+            return;
+        }
+        if (hello) await hello;
+        handle(msg);
+    });
+
+    async function attach(msg) {
+        {
             await settingsReady;
             const tab = await getTab(tabId);
             // Reattach (bridge reconnect after SW restart or transient disconnect).
@@ -897,10 +962,12 @@ api.runtime.onConnect.addListener((port) => {
             // Direct media files are loaded by the player page's <video>: give those requests
             // the site's Referer/Origin so hot-link protection accepts them.
             if (session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
-            session.post({ type: 'INIT', sessionId: session.id, tabId: session.tabId, stream: session.stream, resumed: !!msg.resumed });
-            return;
+            const pageUrl = await api.tabs.get(tabId).then(t => (t && t.url) || '', () => '');
+            session.post({ type: 'INIT', sessionId: session.id, tabId: session.tabId, stream: session.stream, resumed: !!msg.resumed, subtitles: tab.subtitles || [], drm: tab.drm || null, pageUrl });
         }
+    }
 
+    async function handle(msg) {
         if (!session || session.port !== port) return;
 
         switch (msg.type) {
@@ -946,6 +1013,14 @@ api.runtime.onConnect.addListener((port) => {
             case 'PREFETCH':
                 if (msg.enabled) session.downloader.resume(); else session.downloader.pause();
                 break;
+            case 'PURGE_CACHE': {
+                // Drop every cached segment of this stream and refill from the playhead.
+                session.downloader.reset();
+                await session.buffer.clearStream().catch(() => { });
+                session.downloader.seek(+msg.time || (session.telemetry && session.telemetry.currentTime) || 0);
+                session.post({ type: 'PURGED', time: +msg.time || 0 });
+                break;
+            }
             case 'EXPORT_START':
                 runExport(session);
                 break;
@@ -968,7 +1043,7 @@ api.runtime.onConnect.addListener((port) => {
             default:
                 break;
         }
-    });
+    }
 
     port.onDisconnect.addListener(() => {
         if (!session || session.closing || session.port !== port) return;
@@ -1106,6 +1181,15 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'VIDEO_PRESENT':
             handleDetection(fromTab, sender.frameId ?? 0, sender.url || '', { type: 'video-present' });
             return false;
+        case 'SUBTITLE_FOUND':
+            if (fromTab !== undefined) addSubtitle(fromTab, sender.frameId ?? 0, sender.url || '', message.payload);
+            return false;
+        case 'DRM_DETECTED':
+            if (fromTab !== undefined) getTab(fromTab).then(tab => {
+                tab.drm = { keySystem: String((message.payload && message.payload.keySystem) || '').slice(0, 80), frameId: sender.frameId ?? 0 };
+                notifyFrames(fromTab);
+            });
+            return false;
 
         // ---- From popup -------------------------------------------------------
         case 'GET_STREAMS':
@@ -1118,6 +1202,11 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 return {
                     ok: true,
                     streams: list,
+                    drm: tab.drm || null,
+                    // MSE playback with no manifest on the wire: a proprietary protocol (YouTube's
+                    // SABR/UMP, Netflix, ...) that only the site's own player can drive.
+                    proprietaryMse: tab.mseFrames.size > 0 && !list.some(s => !s.isAd),
+                    subtitles: (tab.subtitles || []).length,
                     player: session ? { sessionId: session.id, streamId: session.stream.id, exporting: !!session.exportJob } : null
                 };
             })(), sendResponse);

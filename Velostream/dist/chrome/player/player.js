@@ -27,6 +27,7 @@
             this.port = null;
             this.closed = false;
             this.reconnects = 0;
+            this.pending = new Map(); // reqId -> REQUEST message awaiting its RESPONSE
             this.storageListener = (changes, area) => {
                 if (area === 'local' && changes[S.SETTINGS_KEY]) {
                     this.deliver({ type: 'SETTINGS_CHANGED', settings: S.mergeSettings(changes[S.SETTINGS_KEY].newValue) });
@@ -55,6 +56,12 @@
             port.onMessage.addListener((msg) => {
                 if (!msg) return;
                 this.reconnects = 0;
+                if (msg.type === 'RESPONSE') this.pending.delete(msg.reqId);
+                if (msg.type === 'FATAL') this.failPending(msg.error);
+                if (msg.type === 'INIT' && resumed) {
+                    // The engine has the session again: resend what was in flight when it went away.
+                    for (const m of this.pending.values()) { try { port.postMessage(m); } catch (_) { /* gone again */ } }
+                }
                 if (msg.data && (msg.data.kind === 'b64' || msg.data.kind === 'ab')) {
                     this.deliver({ ...msg, data: S.unpackBinary(msg.data) });
                 } else {
@@ -64,12 +71,14 @@
             port.onDisconnect.addListener(() => {
                 if (this.port === port) this.port = null;
                 if (this.closed) return;
-                // Engine restarted: fail in-flight requests (the player retries them) and
-                // reconnect with the same session id so the segment cache is reused.
-                this.deliver({ type: 'ENGINE_RESET' });
+                // Engine restarted (MV3 service workers are stopped by the browser): keep the
+                // in-flight requests and resend them once the session is back, instead of failing
+                // them (that surfaced as Shaka HTTP_ERROR 1002). Reconnect with the same session id
+                // so the segment cache is reused.
                 if (this.reconnects++ < 8) {
                     setTimeout(() => this.connect(true), Math.min(4000, 250 * Math.pow(2, this.reconnects)));
                 } else {
+                    this.failPending('Lost connection to the Velostream engine');
                     this.deliver({ type: 'FATAL', error: 'Lost connection to the Velostream engine.' });
                 }
             });
@@ -127,11 +136,18 @@
             if (this.closed || !msg) return;
             this.handleLocal(msg).then(handled => {
                 if (handled) return;
+                if (msg.type === 'REQUEST') this.pending.set(msg.reqId, msg);
+                else if (msg.type === 'ABORT') this.pending.delete(msg.reqId);
                 if (this.port) {
                     try { this.port.postMessage(msg); return; } catch (_) { /* reconnecting */ }
                 }
-                if (msg.type === 'REQUEST') this.deliver({ type: 'RESPONSE', reqId: msg.reqId, ok: false, status: 0, error: 'Engine reconnecting' });
+                // Disconnected: REQUESTs stay pending and are resent after the reconnect.
             });
+        }
+
+        failPending(error) {
+            for (const reqId of this.pending.keys()) this.deliver({ type: 'RESPONSE', reqId, ok: false, status: 0, error: error || 'Engine unavailable' });
+            this.pending.clear();
         }
 
         close() {

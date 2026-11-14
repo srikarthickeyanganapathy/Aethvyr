@@ -658,11 +658,11 @@ export class SegmentDownloader {
             }
             return { status: 200, headers: outHeaders, url: first.url, data: concatBuffers(buffers) };
         } catch (err) {
-            if (err && err.rangeUnsupported) {
-                this.noRangeHosts.add(host);
-                return this.transport(url, { method: 'GET', headers, signal });
-            }
-            throw err;
+            if (err && err.name === 'AbortError') throw err;
+            // Range unsupported, or a parallel part failed (CORS-preflighted Range through the page,
+            // a CDN that rejects out-of-range chunks, ...): this host gets plain whole-file requests.
+            this.noRangeHosts.add(host);
+            return this.transport(url, { method: 'GET', headers, signal });
         }
     }
 

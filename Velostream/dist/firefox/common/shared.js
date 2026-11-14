@@ -74,10 +74,31 @@
         maxWorkers: 6,               // parallel segment downloads (2-8)
         rangeAccel: true,            // split large downloads into parallel Range sub-requests
         dvrMinutes: 30,              // live rewind window kept in the ring buffer (0 = off)
+        // Player (Shaka) RAM buffer - separate from the IndexedDB pre-buffer above
+        mseBufferAhead: 45,          // forward MSE buffer goal, seconds (15-300)
+        mseBufferBehind: 30,         // back-buffer kept in RAM, seconds (10-300)
+        rebufferingGoal: 0.5,        // media needed before (re)starting, seconds (0.5-5)
+        // GPU video pipeline (WebGL2): off | cas | fsr | anime4k | deband
+        exportFormat: 'mp4',          // 'mp4' (remux, one file) | 'original'
+        shader: 'off',
+        shaderStrength: 50,          // 0-100
+        maxRenderRes: 2160,          // cap for the canvas' longest side, px
+        // Mouse
+        mouse: {
+            wheel: 'volume',         // volume | seek | speed | zoom
+            middleClick: 'playPause' // playPause | fullscreen | pip | mute | resetZoom | none
+        },
+        // Per-site profiles: [{host, defaultSpeed, shader, fit, audioPreset, skipSeconds}]
+        siteProfiles: [],
         // Gestures
         gestures: {
             enabled: true,
+            allowMouseDrag: false,   // mouse drag = swipe gestures (panning while zoomed always works)
             doubleTapSeek: true,
+            doubleTapZoneWidth: 0.35, // left/right zone width (0.20-0.45); centre = the rest
+            doubleTapLeft: 'seekBack',   // seekBack | seekFwd | playPause | fullscreen | pip | none
+            doubleTapCenter: 'playPause',
+            doubleTapRight: 'seekFwd',
             longPressSpeed: true,
             brightnessSwipe: true,
             volumeSwipe: true,
@@ -91,18 +112,22 @@
             color: '#ffffff',
             bgOpacity: 75,           // percent
             edge: 'shadow',          // none | shadow | outline
-            position: 8              // % from bottom
+            position: 8,             // % from bottom
+            pauseOnHover: false,     // pause while the pointer is over a subtitle line
+            clickToCopy: true        // click a subtitle line to copy its text
         },
         // Audio
         audio: {
             boost: 100,              // percent, 100-300
             preset: 'normal',        // normal | voice | bass | night | custom
             eq: [0, 0, 0, 0, 0],     // custom 5-band gains in dB (60Hz, 230Hz, 910Hz, 3.6kHz, 14kHz)
-            delayMs: 0               // 0-1000ms, delays audio relative to video
+            delayMs: 0,              // 0-1000ms, delays audio relative to video
+            preservesPitch: true,    // keep voice pitch when changing speed
+            channels: 'stereo'       // stereo | mono | left | right
         },
         filterPresets: [],
         keymap: DEFAULT_KEYMAP,
-        settingsVersion: 2
+        settingsVersion: 3
     });
 
     function isPlainObject(v) {
@@ -138,7 +163,16 @@
             }
             out.settingsVersion = 2;
         }
+        out.settingsVersion = 3; // v3 only adds keys; defaults fill them in
         out.maxBufferSec = Math.min(86400, Math.max(10, out.maxBufferSec));
+        out.mseBufferAhead = Math.min(300, Math.max(15, out.mseBufferAhead));
+        out.mseBufferBehind = Math.min(300, Math.max(10, out.mseBufferBehind));
+        out.rebufferingGoal = Math.min(5, Math.max(0.5, out.rebufferingGoal));
+        out.shaderStrength = Math.min(100, Math.max(0, out.shaderStrength));
+        if (!['off', 'cas', 'fsr', 'anime4k', 'deband'].includes(out.shader)) out.shader = 'off';
+        if (!['mp4', 'original'].includes(out.exportFormat)) out.exportFormat = 'mp4';
+        out.gestures.doubleTapZoneWidth = Math.min(0.45, Math.max(0.2, out.gestures.doubleTapZoneWidth));
+        out.siteProfiles = out.siteProfiles.filter(p => isPlainObject(p) && typeof p.host === 'string').slice(0, 200);
         out.cacheSizeMB = Math.min(8192, Math.max(32, out.cacheSizeMB));
         out.memory.volume = Math.min(1, Math.max(0, out.memory.volume));
         out.autoSites = out.autoSites.filter(h => typeof h === 'string' && h.length < 256).slice(0, 500);
@@ -208,8 +242,10 @@
     }
 
     const MANIFEST_MIME = /mpegurl|dash\+xml|vnd\.apple\.mpegurl/i;
-    const HLS_RE = /\.m3u8(\?|#|$)/i;
-    const DASH_RE = /\.mpd(\?|#|$)/i;
+    // .m3u8/.mpd anywhere in the path or query, plus common format/mime query hints.
+    const HLS_RE = /\.m3u8(\?|#|&|\/|$)|[?&](format|type|ext|output)=(m3u8|hls)\b|[?&]mime(type)?=(application|audio)(%2f|\/)(x-mpegurl|vnd\.apple\.mpegurl|mpegurl)/i;
+    const DASH_RE = /\.mpd(\?|#|&|\/|$)|[?&](format|type|ext|output)=(mpd|dash)\b|[?&]mime(type)?=application(%2f|\/)dash(%2b|\+)xml/i;
+    const SEGMENT_RE = /\.(ts|m4s|m4f|cmfv|cmfa|aac|vtt|webvtt|key|jpe?g|png|js|css)$/i;
     const PROGRESSIVE_RE = /\.(mp4|m4v|webm|mkv|mov|ogv)(\?|#|$)/i;
     const AD_RE = /(^|[/._-])(ads?|adserver|adservice|advert|preroll|midroll|vast|vmap|ima3?|imasdk|doubleclick|googlesyndication|freewheel|springserve|spotx)([/._?-]|$)/i;
 
@@ -217,11 +253,14 @@
     function classifyStream(url, mime) {
         if (!url || typeof url !== 'string' || url.startsWith('blob:') || url.startsWith('data:')) return null;
         if (mime) {
+            // application/x-mpegurl, application/vnd.apple.mpegurl, audio/mpegurl, audio/x-mpegurl
             if (/mpegurl/i.test(mime)) return 'hls';
-            if (/dash\+xml/i.test(mime)) return 'dash';
+            if (/dash\+xml|vnd\.mpeg\.dash\.mpd/i.test(mime)) return 'dash';
         }
         let path = url;
         try { path = new URL(url).pathname; } catch (_) { /* relative/invalid */ }
+        // A segment that merely lives under a .m3u8/.mpd directory is not a manifest.
+        if (SEGMENT_RE.test(path)) return null;
         if (HLS_RE.test(path) || HLS_RE.test(url)) return 'hls';
         if (DASH_RE.test(path) || DASH_RE.test(url)) return 'dash';
         if (PROGRESSIVE_RE.test(path)) return 'progressive';

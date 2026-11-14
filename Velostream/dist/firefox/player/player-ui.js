@@ -35,6 +35,11 @@
     };
     const UI_SCALES = [[0.85, '85%'], [1, '100%'], [1.25, '125%'], [1.5, '150%']];
     const AUTOHIDE = [[2000, '2 seconds'], [3000, '3 seconds'], [5000, '5 seconds'], [0, 'Never']];
+    const EXTERNAL_APPS = [['potplayer', 'PotPlayer', 'Windows'], ['vlc', 'VLC', 'needs vlc:// handler on desktop'], ['mpv', 'mpv', 'needs mpv:// handler'], ['iina', 'IINA', 'macOS'], ['android', 'Android video app', 'MX Player, VLC…']];
+    const GPU_PRESETS = [['off', 'Off'], ['cas', 'Fast Sharpen (CAS)'], ['fsr', 'Upscale + sharpen (FSR-style)'], ['anime4k', 'Anime line reconstruction'], ['deband', 'Deband (smooth gradients)']];
+    const PREBUFFER_WINDOWS = [[30, '30 seconds'], [60, '1 minute'], [300, '5 minutes'], [900, '15 minutes'], [1800, '30 minutes'], [86400, 'Whole video']];
+    const CACHE_CAPS = [[256, '256 MB'], [512, '512 MB'], [1024, '1 GB'], [2048, '2 GB'], [4096, '4 GB']];
+    const TAP_ACTIONS = [['seekBack', 'Seek back'], ['seekFwd', 'Seek forward'], ['playPause', 'Play / pause'], ['fullscreen', 'Full screen'], ['pip', 'Picture in Picture'], ['none', 'Nothing']];
     const QUALITY_CAPS = [[0, 'No limit'], [2160, '2160p'], [1440, '1440p'], [1080, '1080p'], [720, '720p'], [480, '480p'], [360, '360p']];
     const FONTS = {
         system: { label: 'San Francisco / System', css: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, system-ui, sans-serif' },
@@ -107,7 +112,9 @@
         trash: '<path d="M5 7h14M10 7V5h4v2M7 7l1 12.5h8L17 7"/>',
         upload: '<path d="M12 19.5V9M7.6 13.4 12 9l4.4 4.4M5.5 4.5h13"/>',
         bolt: '<path fill="currentColor" stroke="none" d="M13 2 4.5 13.2a.6.6 0 0 0 .5 1H11l-1 7.8 8.5-11.2a.6.6 0 0 0-.5-1H12z"/>',
-        warn: '<path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17v.1"/>'
+        warn: '<path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17v.1"/>',
+        external: '<path d="M13.5 4.5h6v6"/><path d="M19.5 4.5 11 13"/><path d="M17.5 13.5v4.5a1.5 1.5 0 0 1-1.5 1.5H6a1.5 1.5 0 0 1-1.5-1.5V8A1.5 1.5 0 0 1 6 6.5h4.5"/>',
+        copy: '<rect x="8" y="8" width="11.5" height="11.5" rx="2.5"/><path d="M16 8V6.5A2 2 0 0 0 14 4.5H6.5a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2H8"/>'
     };
 
     // =====================================================================
@@ -194,7 +201,32 @@
     }
 
     /** Parse SRT or WebVTT text into [{start, end, text}]. */
+    /** SubStation Alpha (.ass/.ssa): "Dialogue:" lines of the [Events] section; styling is dropped. */
+    function parseAss(text) {
+        const cues = [];
+        let fields = null;
+        for (const raw of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+            const line = raw.trim();
+            if (/^Format:/i.test(line) && !fields) {
+                const f = line.slice(7).split(',').map(x => x.trim().toLowerCase());
+                if (f.includes('text')) fields = f;
+                continue;
+            }
+            if (!/^Dialogue:/i.test(line)) continue;
+            const f = fields || ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text'];
+            const parts = line.slice(9).split(',');
+            const textIdx = f.indexOf('text');
+            const val = k => (parts[f.indexOf(k)] || '').trim();
+            const body = parts.slice(textIdx).join(',').replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, '\n').replace(/\\h/g, ' ');
+            const start = parseTimestamp(val('start'));
+            const end = parseTimestamp(val('end'));
+            if (Number.isFinite(start) && Number.isFinite(end) && body.trim()) cues.push({ start, end, text: body.trim() });
+        }
+        return cues.sort((x, y) => x.start - y.start);
+    }
+
     function parseSubtitleFile(text) {
+        if (/^\s*\[Script Info\]/i.test(text.replace(/^\uFEFF/, '')) || /\n\[Events\]/i.test(text)) return parseAss(text);
         const cues = [];
         const blocks = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split(/\n{2,}/);
         for (const block of blocks) {
@@ -218,16 +250,106 @@
         return cue.payload || '';
     }
 
-    function downloadBlob(container, blob, filename) {
+    const extApi = (window.VelostreamShared && window.VelostreamShared.api) || null;
+
+    function safeFilename(name) {
+        // eslint-disable-next-line no-control-regex -- control characters are invalid in file names
+        return String(name || 'video').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').replace(/^[.\s]+|[.\s]+$/g, '').slice(0, 180) || 'video';
+    }
+
+    /**
+     * Save a Blob. Uses chrome.downloads (Save As dialog) when available and revokes the object
+     * URL only once the download completes or is interrupted; falls back to an <a download>.
+     */
+    function downloadBlob(container, blob, filename, saveAs = true) {
         const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        a.style.display = 'none';
-        container.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        const name = safeFilename(filename);
+        const viaAnchor = () => {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            a.style.display = 'none';
+            container.appendChild(a);
+            a.click();
+            a.remove();
+            // An <a download> gives no completion signal: keep the URL alive long enough.
+            setTimeout(() => URL.revokeObjectURL(url), 10 * 60000);
+        };
+        if (!extApi || !extApi.downloads || !extApi.downloads.download) { viaAnchor(); return Promise.resolve(); }
+        return new Promise(resolve => {
+            let id = null;
+            const done = () => {
+                try { extApi.downloads.onChanged.removeListener(onChanged); } catch (_) { /* ignore */ }
+                URL.revokeObjectURL(url);
+                resolve();
+            };
+            const onChanged = (delta) => {
+                if (delta.id !== id || !delta.state) return;
+                if (delta.state.current === 'complete' || delta.state.current === 'interrupted') done();
+            };
+            extApi.downloads.onChanged.addListener(onChanged);
+            Promise.resolve(extApi.downloads.download({ url, filename: name, saveAs })).then((dlId) => {
+                id = dlId;
+                if (id == null) done(); // cancelled before it started
+            }, () => {
+                try { extApi.downloads.onChanged.removeListener(onChanged); } catch (_) { /* ignore */ }
+                viaAnchor();
+                resolve();
+            });
+        });
+    }
+
+    /**
+     * Destination of an export. Prefers File System Access (streams straight to disk, no RAM
+     * growth); Chrome only allows its picker in top-level / same-origin frames and with a user
+     * gesture, so most in-page sessions fall back to collecting Blob parts (which the browser
+     * may back with disk) and handing them to downloadBlob() at the end.
+     */
+    class ExportSink {
+        constructor(container, filename, mime) {
+            this.container = container;
+            this.filename = safeFilename(filename);
+            this.mime = mime;
+            this.parts = [];
+            this.writable = null;
+            this.bytes = 0;
+        }
+
+        static async pick(container, filename, mime) {
+            const sink = new ExportSink(container, filename, mime);
+            if (typeof window.showSaveFilePicker === 'function') {
+                try {
+                    const ext = (/\.([a-z0-9]+)$/i.exec(sink.filename) || ['', 'mp4'])[1];
+                    const handle = await window.showSaveFilePicker({
+                        suggestedName: sink.filename,
+                        types: [{ description: 'Video', accept: { [mime || 'video/mp4']: [`.${ext}`] } }]
+                    });
+                    sink.writable = await handle.createWritable();
+                } catch (err) {
+                    if (err && err.name === 'AbortError') return null; // the user cancelled the picker
+                    sink.writable = null;                              // SecurityError in a cross-origin frame etc.
+                }
+            }
+            return sink;
+        }
+
+        async write(chunk) {
+            this.bytes += chunk.byteLength || chunk.size || 0;
+            if (this.writable) await this.writable.write(chunk);
+            else this.parts.push(chunk instanceof Blob ? chunk : new Blob([chunk]));
+        }
+
+        async close() {
+            if (this.writable) { await this.writable.close(); this.writable = null; return; }
+            const blob = new Blob(this.parts, { type: this.mime });
+            this.parts = [];
+            await downloadBlob(this.container, blob, this.filename);
+        }
+
+        async abort() {
+            this.parts = [];
+            if (this.writable) { try { await this.writable.abort(); } catch (_) { /* ignore */ } this.writable = null; }
+        }
     }
 
     const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
@@ -322,8 +444,9 @@
                 source.connect(delay);
                 delay.connect(eq[0]);
                 for (let i = 0; i < eq.length - 1; i++) eq[i].connect(eq[i + 1]);
-                gain.connect(ctx.destination);
                 gain.connect(analyser);
+                this.channels = null;
+                this._routeChannels('stereo');
                 this._route(false);
                 if (ctx.state === 'suspended') ctx.resume().catch(() => { });
                 return true;
@@ -344,8 +467,40 @@
             n.compressing = compress;
         }
 
+        /** Output channel mode: stereo (as is), mono (downmix), left / right only (on both speakers). */
+        _routeChannels(mode) {
+            const n = this.nodes;
+            if (!n || this.channels === mode) return;
+            const ctx = this.ctx;
+            try { n.gain.disconnect(ctx.destination); } catch (_) { /* not connected */ }
+            if (n.chan) { for (const node of Object.values(n.chan)) { try { node.disconnect(); } catch (_) { /* ignore */ } } }
+            n.chan = null;
+            if (mode === 'mono') {
+                const down = ctx.createGain();
+                down.channelCount = 1;
+                down.channelCountMode = 'explicit';
+                down.channelInterpretation = 'speakers';
+                n.gain.connect(down);
+                down.connect(ctx.destination);
+                n.chan = { down };
+            } else if (mode === 'left' || mode === 'right') {
+                const split = ctx.createChannelSplitter(2);
+                const merge = ctx.createChannelMerger(2);
+                const ch = mode === 'left' ? 0 : 1;
+                n.gain.connect(split);
+                split.connect(merge, ch, 0);
+                split.connect(merge, ch, 1);
+                merge.connect(ctx.destination);
+                n.chan = { split, merge };
+            } else {
+                n.gain.connect(ctx.destination);
+            }
+            this.channels = mode;
+        }
+
         apply(audio) {
             if (!this.ctx) return;
+            this._routeChannels(audio.channels || 'stereo');
             const preset = AUDIO_PRESETS[audio.preset] || AUDIO_PRESETS.normal;
             const gains = audio.preset === 'custom' ? (audio.eq || [0, 0, 0, 0, 0]) : preset.eq;
             const n = this.nodes;
@@ -387,16 +542,52 @@
     // Subtitle engine (Shaka text displayer + external SRT/VTT)
     // =====================================================================
     class SubtitleEngine {
-        constructor(layer) {
+        constructor(layer, topLayer) {
             this.layer = layer;
+            this.topLayer = topLayer;     // secondary (dual) subtitles, shown at the top
             this.shakaCues = [];
             this.shakaKeys = new Set();
             this.externalCues = null;
             this.externalName = '';
+            this.secondaryCues = null;
+            this.secondaryName = '';
+            this.secondaryIndex = null;
             this.source = 'off';  // off | shaka | external
             this.offset = 0;
+            this.speed = 1;       // cue timing scale (0.9-1.1) for frame-rate mismatched files
             this.shakaVisible = false;
             this.lastHtml = '';
+            this.lastTopHtml = '';
+        }
+
+        activeCues() {
+            return this.source === 'external' ? this.externalCues : this.source === 'shaka' ? this.shakaCues : null;
+        }
+
+        /** Media time -> subtitle file time. */
+        cueTime(time) { return (time - this.offset) / (this.speed || 1); }
+
+        /** The next cue that has not started yet (for "sync to current voice"). */
+        nextCueStart(time) {
+            const cues = this.activeCues();
+            if (!cues || !cues.length) return null;
+            const t = this.cueTime(time);
+            for (const c of cues) if (c.start > t - 0.2) return c.start;
+            return null;
+        }
+
+        static linesHtml(texts) {
+            return texts.join('\n').split('\n').map(line => `<span class="cue-line">${esc(line)}</span>`).join('');
+        }
+
+        static activeAt(cues, t) {
+            const active = [];
+            if (!cues) return active;
+            for (const c of cues) {
+                if (c.start > t) break;
+                if (t < c.end) active.push(c.text);
+            }
+            return active;
         }
 
         createDisplayer() {
@@ -439,22 +630,20 @@
         }
 
         render(time) {
-            const cues = this.source === 'external' ? this.externalCues : this.source === 'shaka' ? this.shakaCues : null;
-            let html = '';
-            if (cues && cues.length) {
-                const t = time - this.offset;
-                const active = [];
-                for (const c of cues) {
-                    if (c.start > t) break;
-                    if (t < c.end) active.push(c.text);
-                }
-                if (active.length) {
-                    html = active.join('\n').split('\n').map(line => `<span class="cue-line">${esc(line)}</span>`).join('');
-                }
-            }
+            const t = this.cueTime(time);
+            const active = SubtitleEngine.activeAt(this.activeCues(), t);
+            const html = active.length ? SubtitleEngine.linesHtml(active) : '';
             if (html !== this.lastHtml) {
                 this.lastHtml = html;
                 this.layer.innerHTML = html;
+            }
+            if (this.topLayer) {
+                const top = this.secondaryCues ? SubtitleEngine.activeAt(this.secondaryCues, t) : [];
+                const topHtml = top.length ? SubtitleEngine.linesHtml(top) : '';
+                if (topHtml !== this.lastTopHtml) {
+                    this.lastTopHtml = topHtml;
+                    this.topLayer.innerHTML = topHtml;
+                }
             }
         }
     }
@@ -533,11 +722,18 @@ button:disabled { opacity: 0.4; cursor: default; }
 .vbox { position: absolute; transform-origin: 50% 50%; will-change: transform; }
 .vbox video { width: 100%; height: 100%; display: block; background: #000; object-fit: contain; }
 .root.audio-only .vbox video { visibility: hidden; }
+.vbox .gl-canvas { position: absolute; left: 0; top: 0; pointer-events: none; display: block; }
+.vbox .gl-canvas[hidden], .root.audio-only .vbox .gl-canvas { display: none; }
+.vbox.gl-on { overflow: hidden; }
 .audio-poster { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px; color: var(--fs-text-2); }
 .audio-poster svg { width: 64px; height: 64px; color: var(--fs-accent); }
 .root.audio-only .audio-poster { display: flex; }
 .gesture { position: absolute; inset: 0; touch-action: none; }
 .subs { position: absolute; left: 6%; right: 6%; display: flex; flex-direction: column; align-items: center; gap: 4px; pointer-events: none; text-align: center; z-index: 4; transition: transform 300ms var(--fs-spring); }
+.subs.subs-top { top: max(56px, 9%); bottom: auto !important; transform: none !important; }
+.subs.subs-top .cue-line { opacity: 0.92; font-size: 0.86em; }
+.root.subs-interactive .subs .cue-line { pointer-events: auto; cursor: copy; }
+.root.subs-interactive .subs .cue-line:hover { outline: 2px solid rgba(255, 255, 255, 0.35); outline-offset: 2px; }
 .root:not(.controls-hidden):not(.locked):not(.mini) .subs { transform: translateY(calc(-1 * var(--deck-h, 0px))); }
 .cue-line { display: inline-block; padding: 2px 10px; border-radius: 8px; white-space: pre-wrap; max-width: 100%; }
 
@@ -612,6 +808,12 @@ button:disabled { opacity: 0.4; cursor: default; }
   font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; opacity: 0; transition: opacity 160ms;
 }
 .timeline:hover .tip, .timeline.dragging .tip { opacity: 1; }
+.tip { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.tip:has(.tip-thumb:not([hidden])) { border-radius: 14px; padding: 6px; }
+.tip-thumb { border-radius: 8px; background-repeat: no-repeat; background-color: #000; }
+.tip-thumb[hidden], .tip-chapter[hidden] { display: none; }
+.tip-chapter { max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-weight: 600; opacity: 0.9; }
+.mark.chapter { background: rgba(255, 255, 255, 0.7); width: 3px; top: 0; bottom: 0; }
 .row2 { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; margin-top: calc(var(--u) * 8); gap: 8px; }
 .zone-left { justify-self: start; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .zone-center { justify-self: center; display: flex; align-items: center; gap: calc(var(--u) * 16); }
@@ -815,8 +1017,10 @@ input[type="text"] { width: 100%; min-width: 0; }
         async start() {
             this.setStatus('loading');
             const [settingsMsg, init] = await Promise.all([this.port.request('SETTINGS_GET'), this.initPromise]);
-            this.settings = settingsMsg.settings;
+            this.pageUrl = init.pageUrl || '';
             this.stream = init.stream;
+            this.settings = this.withProfile(settingsMsg.settings);
+            if (this.profile) this.island('studio', `Site profile · ${this.profile.host}`, null, 2500);
             this.tabId = init.tabId;
             this.sessionId = init.sessionId;
             this.cacheReady = typeof init.tabId === 'number' && !!init.sessionId;
@@ -831,9 +1035,176 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.applySettings();
             await this.loadBookmarks();
             // Continue from where the site's own player was (handed over by the content script).
+            this.setCaptured(init.subtitles);
+            this.drmInfo = init.drm || null;
             await this.load(this.hostApi.startTime || undefined);
             // Position (unless the site's own player handed one over) + per-video subtitle offset / loop.
             this.checkResume();
+            this.autoSelectCaptured();
+            this.loadChapters();
+        }
+
+        /** Splits captured site tracks into subtitles and chapters; true when chapters changed. */
+        setCaptured(list) {
+            const all = Array.isArray(list) ? list : [];
+            this.subs.capturedTracks = all.filter(t => t.kind !== 'chapters');
+            const ch = all.filter(t => t.kind === 'chapters');
+            const changed = ch.length !== (this.capturedChapters || []).length;
+            this.capturedChapters = ch;
+            return changed;
+        }
+
+        // -----------------------------------------------------------------
+        // Captured subtitles (the site's own sidecar files / in-memory cues)
+        // -----------------------------------------------------------------
+        capturedLabel(t, i) {
+            if (t.label) return t.label;
+            if (t.language) return t.language.toUpperCase();
+            let name = '';
+            try { name = decodeURIComponent(new URL(t.url).pathname.split('/').pop() || ''); } catch (_) { /* inline */ }
+            return name || `Site track ${i + 1}`;
+        }
+
+        /** Fetches text through the engine (site cookies / Referer); resolves '' on failure. */
+        fetchText(url) {
+            return new Promise(resolve => {
+                const reqId = `n${++this.netSeq}`;
+                this.net.set(reqId, {
+                    resolve: (res) => {
+                        if (!res || !res.ok || !res.data) { resolve(''); return; }
+                        try { resolve(new TextDecoder().decode(res.data)); } catch (_) { resolve(''); }
+                    },
+                    reject: () => resolve('')
+                });
+                this.port.send({ type: 'REQUEST', reqId, url, method: 'GET', headers: {}, kind: 'other' });
+                this.later(20000, () => { if (this.net.has(reqId)) { this.net.delete(reqId); resolve(''); } });
+            });
+        }
+
+        async loadCapturedTrack(i, announce = true) {
+            const t = (this.subs.capturedTracks || [])[i];
+            if (!t) return false;
+            const text = t.vtt || (t.url ? await this.fetchText(t.url) : '');
+            const cues = text ? parseSubtitleFile(text) : [];
+            if (!cues.length) {
+                if (announce) this.announce('Could not load that subtitle track', 'warn');
+                return false;
+            }
+            this.subs.externalCues = cues;
+            this.subs.externalName = this.capturedLabel(t, i);
+            this.subs.capturedIndex = i;
+            this.selectSubtitle('external', undefined, announce);
+            if (announce) this.remember({ subsOn: true, subLang: t.language || '' });
+            return true;
+        }
+
+        /** Pick the site's default (or the remembered language) when the stream has no own tracks. */
+        async autoSelectCaptured() {
+            const list = this.subs.capturedTracks || [];
+            if (!list.length || this.subs.source !== 'off' || this.textTracks().length) return;
+            const m = (this.settings && this.settings.memory) || {};
+            let i = m.subLang ? list.findIndex(t => t.language === m.subLang) : -1;
+            if (i < 0 && m.subsOn) i = 0;
+            if (i < 0) i = list.findIndex(t => t.isDefault);
+            if (i >= 0) await this.loadCapturedTrack(i, false);
+        }
+
+        // -----------------------------------------------------------------
+        // Per-site profiles and external player hand-off
+        // -----------------------------------------------------------------
+        siteHost() {
+            for (const u of [this.pageUrl, this.stream && this.stream.frameUrl]) {
+                try { const h = new URL(u).hostname; if (h) return h.replace(/^www\./, ''); } catch (_) { /* opaque */ }
+            }
+            return '';
+        }
+
+        /** Overlay the matching site profile (speed, quality cap, shader, EQ, subtitle size) on settings. */
+        withProfile(settings) {
+            const host = this.stream ? this.siteHost() : '';
+            const list = (settings && settings.siteProfiles) || [];
+            const p = host ? list.find(x => host === x.host || host.endsWith(`.${x.host}`)) : null;
+            this.profile = p || null;
+            if (!p) return settings;
+            const out = { ...settings };
+            if (Number.isFinite(p.defaultSpeed)) out.defaultSpeed = p.defaultSpeed;
+            if (Number.isFinite(p.qualityCap)) out.qualityCap = p.qualityCap;
+            if (typeof p.shader === 'string') out.shader = p.shader;
+            if (Number.isFinite(p.shaderStrength)) out.shaderStrength = p.shaderStrength;
+            if (typeof p.audioPreset === 'string') out.audio = { ...out.audio, preset: p.audioPreset };
+            if (Number.isFinite(p.subSize)) out.subtitles = { ...out.subtitles, size: p.subSize };
+            return out;
+        }
+
+        saveSiteProfile() {
+            const host = this.siteHost();
+            if (!host) { this.announce('This page has no site address to attach a profile to', 'warn'); return; }
+            const p = {
+                host, defaultSpeed: this.rate(), qualityCap: this.qualityCap || 0,
+                shader: this.settings.shader || 'off', shaderStrength: this.settings.shaderStrength,
+                audioPreset: this.settings.audio.preset, subSize: this.settings.subtitles.size, savedAt: Date.now()
+            };
+            const list = (this.settings.siteProfiles || []).filter(x => x.host !== host).concat([p]).slice(-200);
+            this.saveSettings({ siteProfiles: list });
+            this.profile = p;
+            this.announce(`Saved profile for ${host}`, 'check');
+            this.refreshPopover();
+        }
+
+        removeSiteProfile() {
+            const host = this.profile ? this.profile.host : this.siteHost();
+            this.saveSettings({ siteProfiles: (this.settings.siteProfiles || []).filter(x => x.host !== host) });
+            this.profile = null;
+            this.announce(`Removed profile for ${host}`, 'check');
+            this.refreshPopover();
+        }
+
+        handoffInfo() {
+            const url = this.stream.url;
+            const referer = this.stream.frameUrl || this.pageUrl || '';
+            let origin = '';
+            try { origin = new URL(referer).origin; } catch (_) { /* none */ }
+            const title = safeFilename(this.$('.title').textContent || 'video').replace(/\.(m3u8|mpd|mp4|ts)$/i, '');
+            return { url, referer, origin, ua: navigator.userAgent, title };
+        }
+
+        externalUrl(app) {
+            const { url, title } = this.handoffInfo();
+            switch (app) {
+                case 'potplayer': return `potplayer://${url}`;
+                case 'vlc': return `vlc://${url}`;
+                case 'mpv': return `mpv://${url}`;
+                case 'iina': return `iina://weblink?url=${encodeURIComponent(url)}`;
+                case 'android': return `intent:${url}#Intent;action=android.intent.action.VIEW;type=${this.stream.type === 'hls' ? 'application/x-mpegURL' : this.stream.type === 'dash' ? 'application/dash+xml' : 'video/*'};S.title=${encodeURIComponent(title)};end`;
+                default: return url;
+            }
+        }
+
+        openExternal(app) {
+            if (this.drmInfo) this.announce('DRM-protected streams will not play in other apps either', 'warn');
+            const a = document.createElement('a');
+            a.href = this.externalUrl(app);
+            a.rel = 'noopener';
+            a.style.display = 'none';
+            this.shadow.appendChild(a);
+            a.click();
+            a.remove();
+            this.island('external', `Opening in ${EXTERNAL_APPS.find(x => x[0] === app)[1]}…`, null, 2500);
+            this.announceOnly('If nothing happens, that app is not installed or has no link handler. Use Copy command instead.');
+        }
+
+        copyCommand(tool) {
+            const { url, referer, origin, ua, title } = this.handoffInfo();
+            const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`;
+            let cmd;
+            if (tool === 'ytdlp') {
+                cmd = ['yt-dlp', referer && `--referer ${q(referer)}`, origin && `--add-header ${q(`Origin: ${origin}`)}`, `--user-agent ${q(ua)}`, `-o ${q(`${title}.%(ext)s`)}`, q(url)].filter(Boolean).join(' ');
+            } else if (tool === 'ffmpeg') {
+                cmd = ['ffmpeg', `-user_agent ${q(ua)}`, referer && `-referer ${q(referer)}`, origin && `-headers ${q(`Origin: ${origin}\r\n`)}`, `-i ${q(url)}`, '-c copy', `${q(`${title}.mp4`)}`].filter(Boolean).join(' ');
+            } else {
+                cmd = url;
+            }
+            this.copyText(cmd, tool === 'link' ? 'Stream link copied' : `${tool === 'ytdlp' ? 'yt-dlp' : 'ffmpeg'} command copied`);
         }
 
         titleFromUrl(url) {
@@ -866,6 +1237,8 @@ input[type="text"] { width: 100%; min-width: 0; }
                     this.player.addEventListener('variantchanged', () => this.onTracksChanged(true));
                     this.player.addEventListener('adaptation', () => this.onTracksChanged(true));
                     this.player.addEventListener('textchanged', () => this.onTracksChanged());
+                    // HLS EXT-X-DATERANGE attributes arrive as metadata frames (chapter titles).
+                    this.player.addEventListener('metadata', e => this.onDateRangeMetadata(e));
                 }
                 this.configureShaka();
                 const mime = type === 'hls' ? 'application/x-mpegurl' : type === 'dash' ? 'application/dash+xml' : null;
@@ -881,15 +1254,57 @@ input[type="text"] { width: 100%; min-width: 0; }
             v.playbackRate = this.settings.defaultSpeed || 1;
             this.restoreRememberedState();
             this.setupMediaSession();
+            await this.startPlayback();
+        }
+
+        /**
+         * Autoplay: try with sound; if the browser's policy refuses (NotAllowedError), retry muted
+         * without overwriting the remembered mute state, and unmute on the first tap or key press.
+         * Only when muted playback also fails does the player wait paused for a press on Play.
+         */
+        async startPlayback() {
+            const v = this.video;
+            try {
+                await v.play();
+                return;
+            } catch (e) {
+                if (!e || e.name !== 'NotAllowedError' || v.muted) { this.waitForPlay(); return; }
+            }
+            this.autoMuted = true;          // volumechange must not remember this mute
+            v.muted = true;
             try {
                 await v.play();
             } catch (_) {
-                // Autoplay policy: the launch click may have happened outside this page.
-                this.setStatus('paused');
-                this.showControls(true);
-                this.announce('Ready. Press play to start.', 'play');
-                this.$('.btn-play').focus();
+                this.autoMuted = false;
+                this.restoreRememberedState();
+                this.waitForPlay();
+                return;
             }
+            this.showMutedNotice();
+            this.announceOnly('Autoplaying muted. Tap or press any key to unmute.');
+            const unmute = (e) => {
+                // The unmuting tap on the video is consumed: it must not also pause playback.
+                if (e && e.type === 'pointerdown' && e.target && e.target.classList && e.target.classList.contains('gesture')) e.stopPropagation();
+                this.root.removeEventListener('pointerdown', unmute, true);
+                this.root.removeEventListener('keydown', unmute, true);
+                if (!this.autoMuted) return;
+                const m = (this.settings && this.settings.memory) || {};
+                v.muted = !!m.muted;
+                if (!m.muted && !v.volume) v.volume = 1;
+                // Let the resulting volumechange pass before memory tracking resumes.
+                setTimeout(() => { this.autoMuted = false; }, 0);
+                this.island(v.muted ? 'mute' : 'volume', v.muted ? 'Muted' : `Sound on · ${Math.round(v.volume * 100)}%`);
+            };
+            this.root.addEventListener('pointerdown', unmute, true);
+            this.root.addEventListener('keydown', unmute, true);
+        }
+
+        waitForPlay() {
+            // Autoplay policy: the launch click may have happened outside this page.
+            this.setStatus('paused');
+            this.showControls(true);
+            this.announce('Ready. Press play to start.', 'play');
+            this.$('.btn-play').focus();
         }
 
         configureShaka() {
@@ -900,9 +1315,9 @@ input[type="text"] { width: 100%; min-width: 0; }
                 streaming: {
                     // Segments come from the local pre-buffer, so start/resume after 0.5 s of
                     // media instead of 2 s, and keep a modest MSE buffer (mobile memory limits).
-                    bufferingGoal: 45,
-                    rebufferingGoal: 0.5,
-                    bufferBehind: 30,                   // continuous SourceBuffer.remove() of played media
+                    bufferingGoal: this.settings.mseBufferAhead || 45,
+                    rebufferingGoal: this.settings.rebufferingGoal || 0.5,
+                    bufferBehind: this.settings.mseBufferBehind || 30,                  // continuous SourceBuffer.remove() of played media
                     retryParameters: retry,
                     segmentPrefetchLimit: 0,            // prefetching is done by the engine workers
                     ignoreTextStreamFailures: true
@@ -1022,6 +1437,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             for (const e of this.net.values()) { try { e.reject(new Error('closed')); } catch (_) { /* ignore */ } }
             this.net.clear();
             if (this.resizeObserver) this.resizeObserver.disconnect();
+            if (this.gpu) { this.gpu.destroy(); this.gpu = null; }
             try { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => { }); } catch (_) { /* ignore */ }
             try { if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); } catch (_) { /* ignore */ }
             try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (_) { /* ignore */ }
@@ -1073,16 +1489,18 @@ input[type="text"] { width: 100%; min-width: 0; }
                 case 'STATS':
                     this.engineStats = msg.stats;
                     break;
+                case 'SUBTITLES':
+                    if (this.setCaptured(msg.subtitles)) this.loadChapters();
+                    this.refreshPopover();
+                    this.autoSelectCaptured();
+                    break;
                 case 'ABR_SWITCH':
                     this.applyAbrSwitch(msg.variantId);
                     break;
                 case 'SETTINGS_CHANGED':
-                    this.settings = msg.settings;
+                    this.settings = this.withProfile(msg.settings);
                     this.applySettings();
                     this.refreshPopover();
-                    break;
-                case 'ENGINE_RESET':
-                    for (const [id, e] of this.net) { this.net.delete(id); e.resolve({ ok: false, status: 0, error: 'Engine restarted' }); }
                     break;
                 case 'FATAL':
                     this.showError('Connection problem', msg.error);
@@ -1124,9 +1542,10 @@ input[type="text"] { width: 100%; min-width: 0; }
 </svg>
 <div class="root" role="dialog" aria-modal="true" aria-label="Velostream player" tabindex="-1" data-rm="system">
   <div class="stage">
-    <div class="vbox"><video playsinline webkit-playsinline preload="auto" aria-label="Video"></video></div>
+    <div class="vbox"><video playsinline webkit-playsinline preload="auto" aria-label="Video"></video><canvas class="gl-canvas" hidden aria-hidden="true"></canvas></div>
     <div class="audio-poster" aria-hidden="true">${icon('headphones', 64)}<span>Audio-only mode</span></div>
     <div class="subs" aria-hidden="true"></div>
+    <div class="subs subs-top" aria-hidden="true"></div>
     <div class="gesture" aria-hidden="true"></div>
   </div>
   <div class="ripple left" aria-hidden="true"></div>
@@ -1173,7 +1592,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             <div class="marks"></div>
             <div class="thumb"></div>
           </div>
-          <div class="tip glass elevated" aria-hidden="true">00:00</div>
+          <div class="tip glass elevated" aria-hidden="true"><div class="tip-thumb" hidden></div><span class="tip-chapter" hidden></span><span class="tip-text">00:00</span></div>
         </div>
         <button type="button" class="t-right num" aria-label="Show remaining time">00:00</button>
       </div>
@@ -1219,10 +1638,11 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.root = this.$('.root');
             this.video = this.$('video');
             this.vbox = this.$('.vbox');
+            this.glCanvas = this.$('.gl-canvas');
             this.stage = this.$('.stage');
             this.deck = this.$('.deck');
             this.pop = this.$('.popover');
-            this.subs = new SubtitleEngine(this.$('.subs'));
+            this.subs = new SubtitleEngine(this.$('.subs:not(.subs-top)'), this.$('.subs-top'));
             this.audio = new AudioFx(this.video);
             this.live = this.$('#fs-live');
             this.root.focus({ preventScroll: true });
@@ -1244,10 +1664,22 @@ input[type="text"] { width: 100%; min-width: 0; }
         // -----------------------------------------------------------------
         // Settings
         // -----------------------------------------------------------------
+        applyPitch(on) {
+            const v = this.video;
+            v.preservesPitch = on;
+            if ('mozPreservesPitch' in v) v.mozPreservesPitch = on;
+            if ('webkitPreservesPitch' in v) v.webkitPreservesPitch = on;
+        }
+
         applySettings() {
             const s = this.settings;
             if (!s) return;
             const r = this.root;
+            this.applyPitch(!s.audio || s.audio.preservesPitch !== false);
+            // GPU shader / colour filters follow the saved settings from the first frame on.
+            if (this.filters && this.video) this.applyFilters();
+            const st0 = s.subtitles || {};
+            r.classList.toggle('subs-interactive', !!(st0.pauseOnHover || st0.clickToCopy));
             const accent = ACCENTS[s.theme] || ACCENTS.blue;
             r.style.setProperty('--fs-accent', accent.fill);
             r.style.setProperty('--fs-accent-strong', accent.strong);
@@ -1282,7 +1714,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             const st = this.settings.subtitles;
             const font = (FONTS[st.font] || FONTS.system).css;
             const size = clamp(st.size, 50, 300);
-            this.$('.subs').style.bottom = `${clamp(st.position, 0, 80)}%`;
+            this.$('.subs:not(.subs-top)').style.bottom = `${clamp(st.position, 0, 80)}%`;
             const edge = st.edge === 'outline'
                 ? '-1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000'
                 : st.edge === 'shadow' ? '0 2px 6px rgba(0,0,0,.9), 0 0 2px #000' : 'none';
@@ -1347,6 +1779,8 @@ input[type="text"] { width: 100%; min-width: 0; }
                 if (this.audio.active) this.audio.ensure();
                 if (this.sleepPausedPrefetch) { this.sleepPausedPrefetch = false; this.port.send({ type: 'PREFETCH', enabled: true }); }
             });
+            media('playing', () => { if (this.gpu && this.gpu.active && !this.audioOnly) this.gpu.start(); });
+            media('pause', () => { if (this.gpu) { this.gpu.stop(); this.gpu.renderOnce(); } });
             media('playing', () => { this.setBuffering(false); this.setStatus('playing'); this.scheduleHide(); });
             media('pause', () => { this.updatePlayButtons(); if (!v.ended) this.setStatus('paused'); this.showControls(true); this.saveHistory(true); });
             media('waiting', () => this.setBuffering(true));
@@ -1362,12 +1796,14 @@ input[type="text"] { width: 100%; min-width: 0; }
             media('volumechange', () => {
                 this.updateVolumeUi();
                 // Remember volume/mute, but not the sleep timer's fade-out or a restore in progress.
-                if (!this.restoring && !(this.sleep && this.sleep.fading)) this.remember({ volume: v.volume, muted: v.muted });
+                if (!this.restoring && !this.autoMuted && !(this.sleep && this.sleep.fading)) this.remember({ volume: v.volume, muted: v.muted });
             });
             media('loadedmetadata', () => { this.layoutVideo(); this.updateQualityBadge(); this.renderMarks(); });
             media('durationchange', () => this.renderMarks());
             media('resize', () => { this.layoutVideo(); this.updateQualityBadge(); });
-            media('seeked', () => this.subs.render(v.currentTime));
+            media('seeked', () => { this.subs.render(v.currentTime); if (this.gpu) this.gpu.renderOnce(); });
+            media('loadeddata', () => { if (this.gpu) this.gpu.renderOnce(); });
+            this.listen(document, 'visibilitychange', () => { if (!document.hidden && this.gpu && this.gpu.active && !v.paused && !this.audioOnly) this.gpu.start(); });
             media('enterpictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'true'));
             media('leavepictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'false'));
             media('error', () => {
@@ -1391,6 +1827,7 @@ input[type="text"] { width: 100%; min-width: 0; }
 
             this.bindTimeline();
             this.bindGestures();
+            this.bindSubtitleInteraction();
             this.bindKeyboard();
             this.bindMiniResize();
 
@@ -1447,6 +1884,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (holdMs > 0) {
                 this.islandTimer = setTimeout(() => {
                     if (this.statusPersistent) this.showPersistentStatus();
+                    else if (this.autoMuted) this.showMutedNotice();
                     else el.classList.remove('show');
                 }, holdMs);
             }
@@ -1455,7 +1893,13 @@ input[type="text"] { width: 100%; min-width: 0; }
         hideIsland() {
             clearTimeout(this.islandTimer);
             if (this.statusPersistent) this.showPersistentStatus();
+            else if (this.autoMuted) this.showMutedNotice();
             else this.$('.island').classList.remove('show', 'pulse');
+        }
+
+        /** Stays up (after other notices) until the first tap or key press unmutes. */
+        showMutedNotice() {
+            this.island('mute', 'Autoplaying muted · Tap or press any key to unmute', null, 0);
         }
 
         showPersistentStatus() {
@@ -1723,6 +2167,7 @@ input[type="text"] { width: 100%; min-width: 0; }
         setAudioOnly(on) {
             this.audioOnly = on;
             this.root.classList.toggle('audio-only', on);
+            if (this.gpu) { if (on) this.gpu.stop(); else if (this.gpu.active && !this.video.paused) this.gpu.start(); }
             this.$('.btn-audio-only').setAttribute('aria-pressed', String(on));
             if (this.player && this.mode === 'mse') {
                 if (on) {
@@ -1831,7 +2276,10 @@ input[type="text"] { width: 100%; min-width: 0; }
         onShakaError(err) {
             if (!err) return;
             const code = err.code;
-            console.warn('[Velostream] Shaka error', code, err);
+            const data = Array.isArray(err.data) ? err.data : [];
+            const netUrl = code >= 1000 && code < 2000 && typeof data[0] === 'string' ? data[0] : '';
+            const reason = code === 1002 && data[1] ? String(data[1].message || data[1]) : '';
+            console.warn(`[Velostream] Shaka error ${code} (severity ${err.severity})${netUrl ? ` ${netUrl.slice(0, 300)}` : ''}${reason ? ` - ${reason}` : ''}`);
             if (code === 3017) {
                 // QUOTA_EXCEEDED_ERROR: mobile SourceBuffer limits. Shrink buffers and keep going.
                 this.player.configure({ streaming: { bufferBehind: 8, bufferingGoal: 15 } });
@@ -1839,16 +2287,33 @@ input[type="text"] { width: 100%; min-width: 0; }
                 return;
             }
             if (err.severity !== 2 || code === 7000 || code === 7001 || code === 7002) return;
+            // Transient network failures (dropped connection, CDN hiccup, server 5xx): reload
+            // silently from the current position a couple of times before showing an error.
+            const status = code === 1001 ? data[1] : 0;
+            const transient = code === 1002 || code === 1003 || (code === 1001 && (status >= 500 || status === 408 || status === 429));
+            if (transient && this.mode === 'mse' && !this.closed) {
+                const now = Date.now();
+                this.netRecoveries = (this.netRecoveries || []).filter(t => now - t < 60000);
+                if (this.netRecoveries.length < 2) {
+                    this.netRecoveries.push(now);
+                    this.island('wave', 'Connection hiccup · reconnecting…');
+                    this.later(1500 * this.netRecoveries.length, () => { if (!this.closed && !this.errorShown) this.retry(); });
+                    return;
+                }
+            }
+            let host = '';
+            try { host = netUrl ? new URL(netUrl).hostname : ''; } catch (_) { /* opaque */ }
+            const from = host ? ` from ${host}` : '';
             let msg = `Error code ${code}.`;
             if (code === 1001) {
-                const status = err.data && err.data[1];
                 msg = status === 403 || status === 401
-                    ? `The server refused access (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Velostream again.`
-                    : `The server returned HTTP ${status}.`;
-            } else if (code === 1002) {
-                msg = 'Network error while loading the stream. Check your connection and retry.';
-            } else if (code >= 6000 && code < 7000) {
-                msg = 'This stream is protected by DRM and can only be played by the website\'s own player.';
+                    ? `The server${from} refused access (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Velostream again.`
+                    : `The server${from} returned HTTP ${status}.`;
+            } else if (code === 1002 || code === 1003) {
+                msg = `${code === 1003 ? 'Timed out' : 'Network error'} while loading the stream${from}${reason ? ` (${reason})` : ''}. Check your connection, or that an ad or content blocker is not blocking ${host || 'the video server'}, then retry.`;
+            } else if (code >= 6000 && code < 7000 || (this.drmInfo && (code === 3016 || code === 4032))) {
+                const ks = this.drmInfo && this.drmInfo.keySystem ? ` (${this.drmInfo.keySystem.replace(/^com\./, '')})` : '';
+                msg = `This stream is protected by DRM${ks} and can only be decrypted by the website's own player. Close Velostream to keep watching there, or use Studio › Tools › Open in external player for non-DRM copies.`;
             } else if (code === 4032 || code === 4012 || code === 3016 || code === 4001) {
                 msg = 'This browser cannot decode the stream\'s format or codecs.';
             } else if (code === 4000 || code === 4030) {
@@ -2020,7 +2485,110 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (!cues.length) { this.announce('No subtitles found in that file', 'warn'); return; }
             this.subs.externalCues = cues;
             this.subs.externalName = file.name;
+            this.subs.capturedIndex = null;
             this.selectSubtitle('external');
+        }
+
+        // -----------------------------------------------------------------
+        // Subtitle extras: hover pause, click-to-copy, voice sync, speed, dual subtitles
+        // -----------------------------------------------------------------
+        bindSubtitleInteraction() {
+            let pausedByHover = false;
+            for (const layer of this.$$('.subs')) {
+                this.listen(layer, 'pointerover', (e) => {
+                    const st = this.settings && this.settings.subtitles;
+                    if (!st || !st.pauseOnHover || e.pointerType !== 'mouse' || !e.target.classList.contains('cue-line')) return;
+                    if (!this.video.paused) { pausedByHover = true; this.video.pause(); }
+                });
+                this.listen(layer, 'pointerout', (e) => {
+                    if (!pausedByHover || (e.relatedTarget && layer.contains(e.relatedTarget))) return;
+                    pausedByHover = false;
+                    this.video.play().catch(() => { });
+                });
+                this.listen(layer, 'pointerdown', (e) => { if (e.target.classList.contains('cue-line')) e.stopPropagation(); });
+                this.listen(layer, 'click', (e) => {
+                    const st = this.settings && this.settings.subtitles;
+                    if (!st || !st.clickToCopy || !e.target.classList.contains('cue-line')) return;
+                    e.stopPropagation();
+                    const text = Array.from(layer.querySelectorAll('.cue-line')).map(n => n.textContent).join('\n');
+                    this.copyText(text, 'Subtitle copied');
+                });
+            }
+        }
+
+        async copyText(text, done) {
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch (_) {
+                // Clipboard API refused (no focus / permission): legacy copy through a textarea.
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
+                this.shadow.appendChild(ta);
+                ta.select();
+                try { document.execCommand('copy'); } catch (__) { /* ignore */ }
+                ta.remove();
+            }
+            this.island('check', done);
+        }
+
+        /** "Sync to current voice": the next subtitle line starts right now. */
+        syncSubsToVoice() {
+            const next = this.subs.nextCueStart(this.video.currentTime);
+            if (next == null) { this.announce('No upcoming subtitle line to sync', 'warn'); return; }
+            this.setSubOffset(this.video.currentTime - next * (this.subs.speed || 1));
+        }
+
+        setSubSpeed(v) {
+            this.subs.speed = Math.round(clamp(v, 0.9, 1.1) * 1000) / 1000;
+            this.subs.lastHtml = null;
+            this.subs.lastTopHtml = null;
+            this.subs.render(this.video.currentTime);
+            this.island('captions', `Subtitle speed ${this.subs.speed.toFixed(3)}×`);
+            this.refreshPopover();
+        }
+
+        async loadSecondary(kind, value) {
+            if (kind === 'off') {
+                this.subs.secondaryCues = null;
+                this.subs.secondaryIndex = null;
+                this.announce('Secondary subtitles off', 'captions');
+            } else {
+                let cues = [];
+                let name = '';
+                if (kind === 'cap') {
+                    const t = (this.subs.capturedTracks || [])[value];
+                    if (!t) return;
+                    const text = t.vtt || (t.url ? await this.fetchText(t.url) : '');
+                    cues = text ? parseSubtitleFile(text) : [];
+                    name = this.capturedLabel(t, value);
+                    this.subs.secondaryIndex = value;
+                } else if (kind === 'file' && value) {
+                    if (value.size > 5 * 1024 * 1024) { this.announce('Subtitle file is too large', 'warn'); return; }
+                    cues = parseSubtitleFile(await value.text());
+                    name = value.name;
+                    this.subs.secondaryIndex = -1;
+                }
+                if (!cues.length) { this.announce('No subtitles found for the secondary track', 'warn'); return; }
+                this.subs.secondaryCues = cues;
+                this.subs.secondaryName = name;
+                this.announce(`Secondary subtitles: ${name}`, 'captions');
+            }
+            this.subs.lastTopHtml = null;
+            this.subs.render(this.video.currentTime);
+            this.refreshPopover();
+        }
+
+        /** Drops the engine's disk cache for this stream and rebuilds it from the playhead. */
+        purgeBuffer() {
+            const t = this.video.currentTime;
+            this.port.send({ type: 'PURGE_CACHE', time: t });
+            if (this.player && this.mode === 'mse') {
+                // Flush decoded media ahead too, so Shaka refetches from the fresh cache.
+                try { this.video.currentTime = t; } catch (_) { /* ignore */ }
+            }
+            this.island('rotate', 'Buffer purged · Rebuilding from here');
+            this.announceOnly('Buffer purged, rebuilding');
         }
 
         setSubOffset(value) {
@@ -2064,6 +2632,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.video.style.objectFit = fit;
             const { zoom, panX, panY, rotate, flip } = this.xf;
             vb.style.transform = `translate(${panX}px, ${panY}px) rotate(${rotate}deg) scale(${zoom * (flip ? -1 : 1)}, ${zoom})`;
+            if (this.gpu && this.gpu.active) this.gpu.layout(bw, bh, fit);
         }
 
         setZoom(z, announce) {
@@ -2083,14 +2652,60 @@ input[type="text"] { width: 100%; min-width: 0; }
 
         applyFilters() {
             const f = this.filters;
+            this.applyGpu();
+            const gpuOn = !!(this.gpu && this.gpu.active);
             const parts = [`brightness(${f.brightness}%)`, `contrast(${f.contrast}%)`, `saturate(${f.saturate}%)`, `hue-rotate(${f.hue}deg)`, `sepia(${f.warmth}%)`];
-            if (f.sharpness > 0) {
+            // Sharpness: GPU CAS when WebGL2 works (applyGpu), CPU SVG convolution otherwise.
+            if (f.sharpness > 0 && !gpuOn) {
                 const a = (f.sharpness / 100) * 0.9;
                 this.shadow.getElementById('fs-kernel').setAttribute('kernelMatrix', `0 ${-a} 0 ${-a} ${1 + 4 * a} ${-a} 0 ${-a} 0`);
                 parts.push('url(#fs-sharpen)');
             }
-            const isDefault = Object.keys(DEFAULT_FILTERS).every(k => f[k] === DEFAULT_FILTERS[k]);
-            this.video.style.filter = isDefault ? '' : parts.join(' ');
+            const isDefault = Object.keys(DEFAULT_FILTERS).every(k => k === 'sharpness' ? (gpuOn || !f.sharpness) : f[k] === DEFAULT_FILTERS[k]);
+            const css = isDefault ? '' : parts.join(' ');
+            // Colour filters go on whatever is visible: the GPU canvas or the video element.
+            this.video.style.filter = gpuOn ? '' : css;
+            if (this.glCanvas) this.glCanvas.style.filter = gpuOn ? css : '';
+        }
+
+        /** The GPU preset in effect: the Studio choice, or CAS when only the sharpness slider is used. */
+        effectiveShader() {
+            if (!this.settings || this.gpuBlocked) return { preset: 'off', strength: 0 };
+            const chosen = this.gpuOverride || this.settings.shader || 'off';
+            if (chosen !== 'off') return { preset: chosen, strength: this.settings.shaderStrength };
+            if (this.filters.sharpness > 0) return { preset: 'cas', strength: this.filters.sharpness };
+            return { preset: 'off', strength: 0 };
+        }
+
+        applyGpu() {
+            const want = this.effectiveShader();
+            if (want.preset === 'off' && !this.gpu) return;
+            if (!this.gpu) {
+                if (!window.VelostreamShaders || !this.glCanvas) { this.gpuBlocked = 'unavailable'; return; }
+                this.gpu = new window.VelostreamShaders.VideoShaderPipeline(this.video, this.glCanvas, {
+                    onStepDown: (to) => {
+                        const names = { cas: 'Fast Sharpen', off: 'Off' };
+                        this.gpuOverride = to;   // this session only; the saved choice is kept
+                        this.island('studio', `GPU load high · Stepped down to ${names[to] || to}`, null, 3500);
+                        this.applyFilters();
+                        this.refreshPopover();
+                    },
+                    onUnavailable: (reason) => {
+                        this.gpuBlocked = reason;
+                        this.island('warn', 'GPU enhancement unavailable', null, 3000);
+                        this.announceOnly(`GPU enhancement unavailable: ${reason}`);
+                        this.vbox.classList.remove('gl-on');
+                        this.applyFilters();
+                        this.refreshPopover();
+                    }
+                });
+            }
+            const on = this.gpu.configure({ preset: want.preset, strength: want.strength, maxRenderRes: this.settings.maxRenderRes || 2160 });
+            this.vbox.classList.toggle('gl-on', on);
+            if (on) {
+                this.layoutVideo();
+                if (!this.video.paused && !this.audioOnly) this.gpu.start();
+            }
         }
 
         // -----------------------------------------------------------------
@@ -2384,7 +2999,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 c.getContext('2d').drawImage(v, 0, 0);
                 c.toBlob(blob => {
                     if (!blob) { this.announce('Screenshot failed', 'warn'); return; }
-                    downloadBlob(this.shadow, blob, `velostream-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`);
+                    downloadBlob(this.shadow, blob, `velostream-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`, false);
                     this.announce('Screenshot saved', 'camera');
                 }, 'image/png');
             } catch (e) {
@@ -2437,7 +3052,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 }
                 const blob = await new Promise(res => c.toBlob(res, 'image/png'));
                 if (!blob) throw new Error('encode failed');
-                downloadBlob(this.shadow, blob, `velostream-burst-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`);
+                downloadBlob(this.shadow, blob, `velostream-burst-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`, false);
                 this.announce('Burst contact sheet saved', 'burst');
             } catch (e) {
                 this.announce('Burst blocked: cross-origin video without CORS', 'warn');
@@ -2455,7 +3070,9 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (this.isLive()) {
                 if (this.recordingSince) {
                     this.recordingSince = 0;
-                    this.exportState = { running: true, files: {}, status: 'Saving recording…', pct: 0 };
+                    const toMp4 = (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
+                    const name = `${safeFilename(this.$('.title').textContent || 'live')}-recording.mp4`;
+                    this.exportState = { running: true, files: {}, status: 'Saving recording…', pct: 0, toMp4, sink: toMp4 ? new ExportSink(this.shadow, name, 'video/mp4') : null, outName: name, chain: Promise.resolve() };
                     this.port.send({ type: 'RECORD_STOP' });
                     this.updateDownloadButton();
                     this.refreshPopover();
@@ -2467,10 +3084,21 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.startExport();
         }
 
-        startExport() {
+        async startExport() {
             if (this.exportState && this.exportState.running) return;
             if (this.stream.type === 'dash') { this.announce('DASH export is not supported', 'warn'); return; }
-            this.exportState = { running: true, files: {}, status: 'Starting…', pct: 0 };
+            const hls = this.stream.type === 'hls';
+            const toMp4 = hls && (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
+            const title = safeFilename(this.$('.title').textContent || 'video').replace(/\.(m3u8|mpd|mp4|ts)$/i, '');
+            const st = { running: true, files: {}, status: 'Starting…', pct: 0, toMp4, sink: null, muxer: null, chain: Promise.resolve() };
+            this.exportState = st;
+            // Ask for the destination while the click's user activation is still valid.
+            if (toMp4 || !hls) {
+                const ext = toMp4 ? 'mp4' : ((/\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(this.stream.url) || ['', 'mp4'])[1]);
+                st.sink = await ExportSink.pick(this.shadow, `${title}.${ext}`, toMp4 ? 'video/mp4' : '');
+                if (!st.sink) { this.exportState = null; this.announce('Download cancelled', 'download'); return; }
+                st.outName = st.sink.filename;
+            }
             this.port.send({ type: 'EXPORT_START' });
             this.announce(this.isLive() ? 'Saving live DVR buffer' : 'Download started', 'download');
             this.updateDownloadButton();
@@ -2495,17 +3123,68 @@ input[type="text"] { width: 100%; min-width: 0; }
             }
         }
 
+        /** Export messages are handled strictly in order (muxing and disk writes are async). */
         onExportMessage(msg) {
             const st = this.exportState || (this.exportState = { running: true, files: {}, status: '', pct: 0 });
+            if (!st.chain) st.chain = Promise.resolve();
+            st.chain = st.chain.then(() => this.handleExportMessage(st, msg)).catch((err) => {
+                console.warn('[Velostream] Export failed', err);
+                this.handleExportMessage(st, { type: 'EXPORT_ERROR', error: `Saving failed: ${(err && err.message) || err}` });
+                this.port.send({ type: 'EXPORT_CANCEL' });
+            });
+        }
+
+        /** MP4 conversion failed on the first segment: save the original segments instead. */
+        async exportFallbackToRaw(st, err) {
+            console.warn('[Velostream] MP4 remux unavailable, saving original format', err);
+            st.toMp4 = false;
+            st.muxer = null;
+            if (st.sink) { await st.sink.abort(); st.sink = null; }
+            for (const f of Object.values(st.files)) {
+                f.sink = new ExportSink(this.shadow, f.filename, f.mime);
+                for (const chunk of f.raw || []) await f.sink.write(chunk);
+                f.raw = null;
+            }
+            this.announce('MP4 conversion is not possible for this stream; saving the original format', 'warn');
+        }
+
+        async handleExportMessage(st, msg) {
+            if (this.exportState !== st && msg.type !== 'EXPORT_ERROR') return;
             switch (msg.type) {
-                case 'EXPORT_BEGIN':
+                case 'EXPORT_BEGIN': {
                     st.running = true;
-                    st.files[msg.fileIndex] = { parts: [], filename: msg.filename, mime: msg.mime };
-                    st.status = `Saving ${msg.filename}`;
+                    const f = { filename: msg.filename, mime: msg.mime, raw: [], muxOk: false, sink: null };
+                    st.files[msg.fileIndex] = f;
+                    if (st.toMp4) {
+                        if (!st.muxer) st.muxer = new window.VelostreamMux.ExportMuxer(st.sink, msg.fileCount || 1);
+                    } else if (st.sink && (msg.fileCount || 1) === 1) {
+                        f.sink = st.sink;                 // direct file: the destination picked on click
+                    } else {
+                        f.sink = new ExportSink(this.shadow, msg.filename, msg.mime);
+                    }
+                    st.status = `Saving ${st.toMp4 ? st.outName : msg.filename}`;
                     break;
+                }
                 case 'EXPORT_CHUNK': {
                     const f = st.files[msg.fileIndex];
-                    if (f && msg.data) f.parts.push(new Blob([msg.data]));
+                    if (!f || !msg.data) return;
+                    if (st.toMp4 && st.muxer) {
+                        // Keep the raw bytes until this file's first segment converted, for the fallback.
+                        if (!f.muxOk) f.raw.push(new Uint8Array(msg.data).slice());
+                        try {
+                            if (msg.kind === 'init') await st.muxer.addInit(msg.fileIndex, msg.data);
+                            else {
+                                await st.muxer.addSegment(msg.fileIndex, msg.data, { start: msg.start, end: msg.end, url: msg.url });
+                                f.muxOk = true;
+                                f.raw = null;
+                            }
+                        } catch (err) {
+                            if (f.muxOk) throw err;
+                            await this.exportFallbackToRaw(st, err);
+                        }
+                        return;
+                    }
+                    if (f.sink) await f.sink.write(new Uint8Array(msg.data));
                     return;
                 }
                 case 'EXPORT_PROGRESS': {
@@ -2517,14 +3196,23 @@ input[type="text"] { width: 100%; min-width: 0; }
                 }
                 case 'EXPORT_FILE_DONE': {
                     const f = st.files[msg.fileIndex];
-                    if (f) {
-                        downloadBlob(this.shadow, new Blob(f.parts, { type: f.mime }), f.filename);
-                        f.parts = [];
+                    if (f && f.sink) {
+                        st.status = `Finishing ${f.filename}…`;
+                        this.updateDownloadButton();
+                        await f.sink.close();
+                        f.sink = null;
                         this.announce(`Saved ${f.filename}`, 'check');
                     }
                     break;
                 }
                 case 'EXPORT_COMPLETE':
+                    if (st.toMp4 && st.muxer) {
+                        st.status = 'Writing MP4…';
+                        this.updateDownloadButton();
+                        await st.muxer.finish();
+                        const skipped = st.muxer.failedSegments;
+                        this.announce(`Saved ${st.outName}${skipped ? ` (${skipped} damaged segment${skipped === 1 ? '' : 's'} skipped)` : ''}`, 'check');
+                    }
                     st.running = false;
                     st.pct = 100;
                     st.status = 'Saved';
@@ -2532,7 +3220,10 @@ input[type="text"] { width: 100%; min-width: 0; }
                 case 'EXPORT_ERROR':
                     st.running = false;
                     st.status = msg.error;
+                    for (const f of Object.values(st.files)) { if (f.sink && f.sink !== st.sink) await f.sink.abort(); }
+                    if (st.sink) await st.sink.abort();
                     st.files = {};
+                    st.muxer = null;
                     this.announce(msg.error, 'warn');
                     break;
                 default:
@@ -2651,11 +3342,118 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (cacheHtml !== this.lastCacheHtml) { this.lastCacheHtml = cacheHtml; this.$('.layers-cache').innerHTML = cacheHtml; }
         }
 
+        // -----------------------------------------------------------------
+        // Chapters (HLS DATERANGE, Shaka chapter tracks, site WebVTT chapters) & thumbnails
+        // -----------------------------------------------------------------
+        addChapters(list) {
+            const map = new Map((this.chapters || []).map(c => [Math.round(c.start * 10), c]));
+            for (const c of list) {
+                if (!c || !Number.isFinite(c.start) || !c.title) continue;
+                map.set(Math.round(c.start * 10), { start: c.start, title: String(c.title).slice(0, 120) });
+            }
+            this.chapters = [...map.values()].sort((a, b) => a.start - b.start);
+            this.renderMarks();
+        }
+
+        chapterAt(t) {
+            const list = this.chapters;
+            if (!list || !list.length) return null;
+            let cur = null;
+            for (const c of list) { if (c.start <= t + 0.05) cur = c; else break; }
+            return cur;
+        }
+
+        onDateRangeMetadata(e) {
+            const p = e && e.payload;
+            if (!p || typeof p.key !== 'string' || typeof p.data !== 'string') return;
+            if (!/^(X-)?(TITLE|CHAPTER|COM-[A-Z-]*TITLE|NAME)$/i.test(p.key) && !/chapter/i.test(e.metadataType || '')) return;
+            if (/^ID$/i.test(p.key)) return;
+            this.addChapters([{ start: e.startTime, title: p.data }]);
+        }
+
+        async loadChapters() {
+            // Shaka chapter tracks (DASH/HLS manifests that declare them).
+            if (this.player && this.mode === 'mse' && this.player.getChaptersTracks) {
+                try {
+                    const tracks = this.player.getChaptersTracks();
+                    if (tracks.length) {
+                        const lang = (tracks.find(t => t.language) || tracks[0]).language;
+                        const chs = await this.player.getChaptersAsync(lang);
+                        this.addChapters(chs.map(c => ({ start: c.startTime, title: c.title })));
+                    }
+                } catch (_) { /* no chapters */ }
+            }
+            // Captured site <track kind="chapters">.
+            for (const t of this.capturedChapters || []) {
+                const text = t.vtt || (t.url ? await this.fetchText(t.url) : '');
+                const cues = text ? parseSubtitleFile(text) : [];
+                this.addChapters(cues.map(c => ({ start: c.start, title: c.text.replace(/\n/g, ' ') })));
+            }
+        }
+
+        /** Thumbnail preview from an image track (EXT-X-IMAGE-STREAM-INF / DASH thumbnails). */
+        updateTipThumb(t) {
+            const box = this.$('.tip-thumb');
+            if (!this.player || this.mode !== 'mse' || !this.player.getImageTracks) { box.hidden = true; return; }
+            if (this.imageTrackId === undefined) {
+                try {
+                    const tracks = this.player.getImageTracks();
+                    const best = tracks.sort((a, b) => (b.width || 0) - (a.width || 0)).find(x => (x.width || 0) <= 480) || tracks[0];
+                    this.imageTrackId = best ? best.id : null;
+                } catch (_) { this.imageTrackId = null; }
+            }
+            if (this.imageTrackId == null) { box.hidden = true; return; }
+            const key = Math.floor(t);
+            if (this.thumbKey === key) return;
+            this.thumbKey = key;
+            clearTimeout(this.thumbTimer);
+            this.thumbTimer = setTimeout(async () => {
+                try {
+                    const th = await this.player.getThumbnails(this.imageTrackId, t);
+                    if (!th || !th.uris || !th.uris.length || this.thumbKey !== key) return;
+                    const url = await this.thumbImage(th.uris[0], th.startByte, th.endByte);
+                    if (!url || this.thumbKey !== key) return;
+                    const w = Math.min(160, th.width || 160);
+                    const scale = w / (th.width || w);
+                    box.style.width = `${w}px`;
+                    box.style.height = `${Math.round((th.height || 90) * scale)}px`;
+                    box.style.backgroundImage = `url("${url}")`;
+                    box.style.backgroundSize = th.imageWidth ? `${th.imageWidth * scale}px ${th.imageHeight * scale}px` : 'cover';
+                    box.style.backgroundPosition = `-${(th.positionX || 0) * scale}px -${(th.positionY || 0) * scale}px`;
+                    box.hidden = false;
+                } catch (_) { box.hidden = true; }
+            }, 60);
+        }
+
+        /** Thumbnail sprites are fetched through the engine (site Referer) and cached as blob URLs. */
+        async thumbImage(uri, startByte, endByte) {
+            if (!this.thumbCache) this.thumbCache = new Map();
+            const key = `${uri}|${startByte || 0}`;
+            if (this.thumbCache.has(key)) return this.thumbCache.get(key);
+            const p = new Promise(resolve => {
+                const reqId = `n${++this.netSeq}`;
+                const headers = endByte ? { Range: `bytes=${startByte || 0}-${endByte}` } : {};
+                this.net.set(reqId, {
+                    resolve: (res) => resolve(res && res.ok && res.data ? URL.createObjectURL(new Blob([res.data])) : null),
+                    reject: () => resolve(null)
+                });
+                this.port.send({ type: 'REQUEST', reqId, url: uri, method: 'GET', headers, kind: 'other' });
+            });
+            this.thumbCache.set(key, p);
+            if (this.thumbCache.size > 60) {
+                const [firstKey, firstVal] = this.thumbCache.entries().next().value;
+                this.thumbCache.delete(firstKey);
+                Promise.resolve(firstVal).then(u => { if (u) URL.revokeObjectURL(u); });
+            }
+            return p;
+        }
+
         renderMarks() {
             const r = this.seekRange();
             const span = Math.max(0.001, r.end - r.start);
             const pos = t => clamp((t - r.start) / span * 100, 0, 100);
             let html = '';
+            for (const c of this.chapters || []) if (c.start > r.start + 0.5) html += `<div class="mark chapter" style="left:${pos(c.start)}%"></div>`;
             for (const b of this.bookmarks) html += `<div class="mark" style="left:${pos(b.t)}%"></div>`;
             if (this.loop.a != null) html += `<div class="mark" style="left:${pos(this.loop.a)}%"></div>`;
             if (this.loop.b != null) html += `<div class="mark" style="left:${pos(this.loop.b)}%"></div>`;
@@ -2718,10 +3516,16 @@ input[type="text"] { width: 100%; min-width: 0; }
                 const r = this.seekRange();
                 return { t: r.start + ratio * (r.end - r.start), ratio, r };
             };
+            const tipText = tip.querySelector('.tip-text');
+            const tipChapter = tip.querySelector('.tip-chapter');
             const showTip = (clientX) => {
                 const { t, ratio, r } = timeAt(clientX);
-                tip.textContent = `${fmtTime(t - r.start)} • ${fmtDelta(t - this.video.currentTime)}`;
+                tipText.textContent = `${fmtTime(t - r.start)} • ${fmtDelta(t - this.video.currentTime)}`;
+                const ch = this.chapterAt(t);
+                tipChapter.hidden = !ch;
+                if (ch) tipChapter.textContent = ch.title;
                 tip.style.left = `${clamp(ratio * 100, 8, 92)}%`;
+                this.updateTipThumb(t);
                 return t;
             };
             this.listen(tl, 'pointermove', (e) => { if (!this.dragging) showTip(e.clientX); });
@@ -2788,7 +3592,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             const side = (x) => {
                 const rect = layer.getBoundingClientRect();
                 const rel = (x - rect.left) / rect.width;
-                return rel < 0.38 ? 'left' : rel > 0.62 ? 'right' : 'center';
+                const zone = clamp(Number(gs().doubleTapZoneWidth) || 0.35, 0.2, 0.45);
+                return rel < zone ? 'left' : rel > 1 - zone ? 'right' : 'center';
             };
 
             this.listen(layer, 'pointerdown', (e) => {
@@ -2859,8 +3664,9 @@ input[type="text"] { width: 100%; min-width: 0; }
                 if (!g.mode) {
                     if (Math.abs(dx) < 14 && Math.abs(dy) < 14) return;
                     clearTimeout(g.longTimer);
-                    if (g.type === 'mouse') { g.mode = 'none'; return; }
+                    // Mouse: panning a zoomed picture always works; swipe gestures only when opted in.
                     if (this.xf.zoom > 1) g.mode = 'pan';
+                    else if (g.type === 'mouse' && !settings.allowMouseDrag) g.mode = 'none';
                     else if (!settings.enabled) g.mode = 'none';
                     else if (Math.abs(dy) > Math.abs(dx)) {
                         const left = g.x - rect.left < rect.width / 2;
@@ -2957,14 +3763,63 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.listen(layer, 'pointerup', finish);
             this.listen(layer, 'pointercancel', finish);
             this.listen(layer, 'contextmenu', (e) => e.preventDefault());
-            this.listen(layer, 'dblclick', () => { if (!this.locked && !this.mini && this.lastPointerType === 'mouse') this.toggleFullscreen(); });
+            // Double-click / double-tap is handled by handleTap for both mouse and touch.
             this.listen(layer, 'wheel', (e) => {
-                if (this.locked || this.mini) return;
+                if (this.locked || this.mini || !this.settings) return;
                 e.preventDefault();
-                if (e.ctrlKey) this.setZoom(this.xf.zoom * (e.deltaY < 0 ? 1.1 : 0.9), false);
-                else this.setVolume(this.video.volume + (e.deltaY < 0 ? 0.05 : -0.05), true);
+                const up = e.deltaY < 0;
+                const mouse = this.settings.mouse || {};
+                if (e.ctrlKey) this.setZoom(this.xf.zoom * (up ? 1.1 : 0.9), false);
+                else if (e.shiftKey) {
+                    if (this.video.paused) this.stepFrame(up ? 1 : -1);
+                    else this.seekBy(up ? 1 : -1, true);
+                } else if (e.altKey) this.setSubOffset(this.subs.offset + (up ? 0.1 : -0.1));
+                else this.wheelAction(mouse.wheel || 'volume', up);
                 this.showControls();
             }, { passive: false });
+            // Middle click (auxclick button 1) runs the configured action.
+            this.listen(layer, 'mousedown', (e) => { if (e.button === 1) e.preventDefault(); });
+            this.listen(layer, 'auxclick', (e) => {
+                if (e.button !== 1 || this.locked || this.mini || !this.settings) return;
+                e.preventDefault();
+                this.runAction((this.settings.mouse || {}).middleClick || 'playPause', 'center');
+            });
+        }
+
+        wheelAction(kind, up) {
+            switch (kind) {
+                case 'seek': this.seekBy(up ? this.settings.seekStep : -this.settings.seekStep, true); break;
+                case 'speed': this.setRate(this.rate() + (up ? 0.25 : -0.25)); break;
+                case 'zoom': this.setZoom(this.xf.zoom * (up ? 1.1 : 0.9), false); break;
+                case 'none': break;
+                default: this.setVolume(this.video.volume + (up ? 0.05 : -0.05), true);
+            }
+        }
+
+        /** Runs a configurable tap / click action. Seeks show the ripple on their side. */
+        runAction(action, side) {
+            switch (action) {
+                case 'seekBack':
+                case 'seekFwd': {
+                    const step = this.settings.seekStep;
+                    const delta = action === 'seekBack' ? -step : step;
+                    this.seekBy(delta, true);
+                    const rip = this.$(`.ripple.${delta < 0 ? 'left' : 'right'}`);
+                    if (rip) {
+                        rip.innerHTML = `${skipIcon(delta < 0 ? -1 : 1, step)}<span>${delta < 0 ? '−' : '+'}${step}s</span>`;
+                        rip.classList.remove('show');
+                        void rip.offsetWidth;
+                        rip.classList.add('show');
+                    }
+                    break;
+                }
+                case 'fullscreen': this.toggleFullscreen(); break;
+                case 'pip': this.togglePip(); break;
+                case 'mute': this.toggleMute(); break;
+                case 'none': break;
+                default: this.togglePlay(); this.showControls();
+            }
+            void side;
         }
 
         handleTap(g, side, getLast, setLast, getTimer, setTimer) {
@@ -2975,16 +3830,11 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (last && now - last.t < 300 && last.side === side) {
                 clearTimeout(getTimer());
                 setLast(null);
-                if (!isTouch) return; // mouse double-click -> full screen (dblclick listener)
-                if (side === 'center' || !settings.enabled || !settings.doubleTapSeek) { this.togglePlay(); return; }
-                const step = this.settings.seekStep;
-                const delta = side === 'left' ? -step : step;
-                this.seekBy(delta, true);
-                const rip = this.$(`.ripple.${side}`);
-                rip.innerHTML = `${skipIcon(delta < 0 ? -1 : 1, step)}<span>${delta < 0 ? '−' : '+'}${step}s</span>`;
-                rip.classList.remove('show');
-                void rip.offsetWidth;
-                rip.classList.add('show');
+                // Unified double-click / double-tap: one action per zone, same for mouse and touch.
+                const key = side === 'left' ? 'doubleTapLeft' : side === 'right' ? 'doubleTapRight' : 'doubleTapCenter';
+                let action = settings[key] || (side === 'center' ? 'playPause' : side === 'left' ? 'seekBack' : 'seekFwd');
+                if ((action === 'seekBack' || action === 'seekFwd') && (!settings.enabled || !settings.doubleTapSeek)) action = 'playPause';
+                this.runAction(action, side);
                 return;
             }
             setLast({ t: now, side });
@@ -3219,11 +4069,25 @@ input[type="text"] { width: 100%; min-width: 0; }
             tracks.forEach(t => {
                 html += this.row({ id: `cc-${t.id}`, label: t.label || t.language || `Track ${t.id}`, meta: `${t.language || ''}${t.kind === 'caption' ? ' · CC' : ''}`, checked: this.subs.source === 'shaka' && t.active, data: `data-sub="shaka:${t.id}"` });
             });
-            if (this.subs.externalCues) html += this.row({ id: 'cc-ext', label: this.subs.externalName, meta: 'File', checked: this.subs.source === 'external', data: 'data-sub="external"' });
+            const captured = this.subs.capturedTracks || [];
+            captured.forEach((t, i) => {
+                html += this.row({ id: `cc-cap-${i}`, label: this.capturedLabel(t, i), meta: `${t.language || ''}${t.language ? ' · ' : ''}Site`, checked: this.subs.source === 'external' && this.subs.capturedIndex === i, data: `data-sub="cap:${i}"` });
+            });
+            if (this.subs.externalCues && this.subs.capturedIndex == null) html += this.row({ id: 'cc-ext', label: this.subs.externalName, meta: 'File', checked: this.subs.source === 'external', data: 'data-sub="external"' });
             html += this.row({ id: 'cc-load', label: 'Load .srt or .vtt file…', role: 'menuitem', lead: 'upload' });
             html += '</div><input type="file" id="cc-file" accept=".srt,.vtt,text/vtt,application/x-subrip" hidden>';
             const off = this.subs.offset;
             html += `<div class="section-label">Sync offset</div><div class="stepper"><button type="button" class="ib" id="cc-off-minus" aria-label="Subtitles earlier by 0.1 seconds">${icon('frameBack', 18)}</button><output class="num">${off >= 0 ? '+' : ''}${off.toFixed(1)} s</output><button type="button" class="ib" id="cc-off-plus" aria-label="Subtitles later by 0.1 seconds">${icon('frameFwd', 18)}</button></div>`;
+            html += `<div role="menu" aria-label="Subtitle sync">${this.row({ id: 'cc-sync-voice', label: 'Sync next line to now', meta: 'when you hear it', role: 'menuitem', lead: 'captions' })}</div>`;
+            html += this.rangeField('cc-speed', 'Subtitle speed', 900, 1100, 1, Math.round(this.subs.speed * 1000), `${this.subs.speed.toFixed(3)}×`);
+            const captured2 = this.subs.capturedTracks || [];
+            html += '<div class="section-label" id="lbl-subs2">Secondary subtitles (top)</div><div role="menu" aria-labelledby="lbl-subs2">';
+            html += this.row({ id: 'cc2-off', label: 'Off', checked: !this.subs.secondaryCues, data: 'data-sub2="off"' });
+            captured2.forEach((t, i) => { html += this.row({ id: `cc2-cap-${i}`, label: this.capturedLabel(t, i), meta: t.language || 'Site', checked: !!this.subs.secondaryCues && this.subs.secondaryIndex === i, data: `data-sub2="cap:${i}"` }); });
+            if (this.subs.secondaryCues && this.subs.secondaryIndex === -1) html += this.row({ id: 'cc2-file-cur', label: this.subs.secondaryName, meta: 'File', checked: true, data: 'data-sub2="keep"' });
+            html += this.row({ id: 'cc2-load', label: 'Load secondary file…', role: 'menuitem', lead: 'upload' });
+            html += '</div><input type="file" id="cc2-file" accept=".srt,.vtt,.ass,.ssa,text/vtt,application/x-subrip" hidden>';
+            html += `${this.switchField('cc-hover', 'Pause while pointing at a subtitle', !!st.pauseOnHover)}${this.switchField('cc-copy', 'Click a subtitle to copy it', st.clickToCopy !== false)}`;
             const audio = this.audioTracks();
             if (audio.length > 1) {
                 html += '<div class="section-label" id="lbl-audio">Audio track</div><div role="menu" aria-labelledby="lbl-audio">';
@@ -3251,7 +4115,27 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
         }
 
         tabQuality() {
-            if (this.mode !== 'mse') return '<p class="hint">Quality selection is available for HLS and DASH streams. This is a direct media file.</p>';
+            if (this.mode !== 'mse') return `<p class="hint">Quality selection is available for HLS and DASH streams. This is a direct media file.</p>${this.bufferSection()}`;
+            return this.qualitySection() + this.bufferSection();
+        }
+
+        bufferSection() {
+            const s = this.settings;
+            const st = this.engineStats || {};
+            const ahead = st.cachedAhead != null ? fmtTime(st.cachedAhead) : '—';
+            return `<div class="section-label">Buffer &amp; network</div>
+${this.selectField('bf-window', 'Pre-buffer window', PREBUFFER_WINDOWS, PREBUFFER_WINDOWS.some(([v]) => v === s.maxBufferSec) ? s.maxBufferSec : 86400)}
+${this.rangeField('bf-ahead', 'RAM buffer ahead', 15, 180, 5, s.mseBufferAhead, `${s.mseBufferAhead} s`)}
+${this.rangeField('bf-behind', 'Back-buffer kept', 10, 180, 5, s.mseBufferBehind, `${s.mseBufferBehind} s`)}
+${this.rangeField('bf-workers', 'Parallel workers', 2, 8, 1, s.maxWorkers, `${s.maxWorkers}`)}
+${this.selectField('bf-cache', 'Disk cache cap', CACHE_CAPS, CACHE_CAPS.some(([v]) => v === s.cacheSizeMB) ? s.cacheSizeMB : 2048)}
+${this.switchField('bf-range', 'Range accelerator (parallel chunks)', s.rangeAccel !== false)}
+${this.switchField('bf-pause', 'Pause background prefetch', !!this.prefetchPaused)}
+<div role="menu" aria-label="Buffer actions">${this.row({ id: 'bf-purge', label: 'Purge & rebuild buffer', meta: `${ahead} ahead`, role: 'menuitem', lead: 'rotate' })}</div>
+<p class="hint">The pre-buffer lives on disk (IndexedDB); RAM ahead/behind is what the video element keeps decoded.</p>`;
+        }
+
+        qualitySection() {
             const est = this.engineStats ? fmtBitrate(this.engineStats.bandwidth) : '—';
             let html = `<div role="menu" aria-label="Quality">${this.row({ id: 'q-auto', label: 'Auto (Smart ABR)', meta: this.abrAuto && this.video.videoHeight ? `${this.video.videoHeight}p` : '', checked: this.abrAuto, data: 'data-q="auto"' })}`;
             for (const t of this.uniqueQualities()) {
@@ -3280,6 +4164,9 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
                 }).join('')}</div>`;
             }
             html += `<div class="section-label">Audio delay (lip sync)</div><div class="stepper"><button type="button" class="ib" id="au-d-minus" aria-label="Less audio delay, 50 milliseconds"${allowed ? '' : ' disabled'}>${icon('frameBack', 18)}</button><output class="num">${a.delayMs} ms</output><button type="button" class="ib" id="au-d-plus" aria-label="More audio delay, 50 milliseconds"${allowed ? '' : ' disabled'}>${icon('frameFwd', 18)}</button></div><p class="hint">Delays sound when it arrives before the picture (0–1000 ms).</p>`;
+            html += `<div class="section-label">Output</div>
+${this.selectField('au-ch', 'Channels', [['stereo', 'Stereo'], ['mono', 'Mono (downmix)'], ['left', 'Left channel only'], ['right', 'Right channel only']], a.channels || 'stereo')}
+${this.switchField('au-pitch', 'Keep voice pitch when speeding up', a.preservesPitch !== false)}`;
             return html;
         }
 
@@ -3291,6 +4178,16 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
                 + this.rangeField('dp-sharpness', 'Sharpness', 0, 100, 5, f.sharpness, `${f.sharpness}%`)
                 + this.rangeField('dp-hue', 'Hue', -180, 180, 5, f.hue, `${f.hue}°`)
                 + this.rangeField('dp-warmth', 'Eye-care warmth', 0, 100, 5, f.warmth, `${f.warmth}%`);
+            const s = this.settings;
+            const eff = this.effectiveShader();
+            const gpuState = this.gpuBlocked ? `Unavailable: ${this.gpuBlocked}.`
+                : this.gpu && this.gpu.active ? `Active: ${GPU_PRESETS.find(p => p[0] === eff.preset)[1]} at ${this.glCanvas.width}×${this.glCanvas.height}${this.gpuOverride ? ' (stepped down for GPU load)' : ''}.`
+                    : 'Off.';
+            html += `<div class="section-label">GPU enhancement</div>
+${this.selectField('dp-shader', 'Shader', GPU_PRESETS, s.shader)}
+${this.rangeField('dp-shader-str', 'Strength', 0, 100, 5, s.shaderStrength, `${s.shaderStrength}%`)}
+${this.selectField('dp-maxres', 'Max render resolution', [[1080, '1080p'], [1440, '1440p'], [2160, '2160p (4K)']], s.maxRenderRes)}
+<p class="hint">${esc(gpuState)} WebGL2 shaders run on the graphics chip and pause while the video is paused or hidden. Heavy presets step down automatically if the device cannot keep up.</p>`;
             html += '<div class="inline"><label class="sr-only" for="dp-preset-name">Preset name</label><input type="text" id="dp-preset-name" placeholder="Preset name" maxlength="40"><button type="button" class="pillbtn primary" id="dp-preset-save">Save</button><button type="button" class="pillbtn" id="dp-reset">Reset</button></div>';
             (this.settings.filterPresets || []).forEach((p, i) => {
                 html += `<div class="list-row"><span>${esc(p.name)}</span><button type="button" class="pillbtn" id="dp-apply-${i}" data-fp-apply="${i}">Apply</button><button type="button" class="ib" id="dp-del-${i}" data-fp-del="${i}" aria-label="Delete preset ${esc(p.name)}">${icon('trash', 18)}</button></div>`;
@@ -3332,12 +4229,24 @@ ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead
                 html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
                 html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
             } else if (this.stream.type !== 'dash') {
-                html += this.row({ id: 'tl-export', label: this.stream.type === 'hls' ? 'Save as .ts / .mp4' : 'Save file', role: 'menuitem', lead: 'download' });
+                html += this.row({ id: 'tl-export', label: this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
             }
             html += '</div>';
             if (this.stream.type === 'dash') html += '<p class="hint">DASH export is not supported.</p>';
+            if (this.stream.type === 'hls' || live) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             const sleepMode = this.sleep ? this.sleep.mode : 0;
             html += `<div class="section-label" id="lbl-sleep">Sleep timer</div><div role="menu" aria-labelledby="lbl-sleep">${SLEEP_OPTIONS.map(([m, l]) => this.row({ id: `sl-${m}`, label: l, meta: m && sleepMode === m && this.sleep.endsAt ? `${Math.max(0, Math.ceil((this.sleep.endsAt - Date.now()) / 60000))}m left` : '', checked: sleepMode === m, data: `data-sleep="${m}"` })).join('')}</div>`;
+            const android = /Android/i.test(navigator.userAgent);
+            const mac = /Mac OS X/i.test(navigator.userAgent) && !/Mobile/i.test(navigator.userAgent);
+            html += '<div class="section-label" id="lbl-ext">Open in external player</div><div role="menu" aria-labelledby="lbl-ext">';
+            for (const [k, l, m] of EXTERNAL_APPS) {
+                if ((k === 'android' && !android) || (k === 'iina' && !mac) || ((k === 'potplayer') && (android || mac))) continue;
+                html += this.row({ id: `ex-${k}`, label: l, meta: m, role: 'menuitem', lead: 'external', data: `data-ext="${k}"` });
+            }
+            html += this.row({ id: 'ex-ytdlp', label: 'Copy yt-dlp command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
+            html += this.row({ id: 'ex-ffmpeg', label: 'Copy ffmpeg command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
+            html += this.row({ id: 'ex-link', label: 'Copy stream link', role: 'menuitem', lead: 'copy' });
+            html += '</div>';
             html += `<div class="section-label">Skip</div>${this.selectField('tl-skip', 'Skip intro button', SKIP_STEPS.map(s => [s, `+${s} s`]), this.settings.skipSeconds)}${this.switchField('tl-smart', 'Smart skip black & silence', this.settings.smartSkip)}`;
             html += `<div class="section-label">Modes</div><div role="menu" aria-label="Modes">
 ${this.row({ id: 'tl-mini', label: 'Mini player', role: 'menuitem', lead: 'mini' })}
@@ -3349,6 +4258,7 @@ ${this.row({ id: 'tl-lock', label: 'Lock touch controls', role: 'menuitem', lead
 
         tabPrefs() {
             const s = this.settings;
+            const host = this.siteHost();
             const g = s.gestures;
             const swatches = Object.entries(ACCENTS).map(([k, a]) => `<button type="button" class="swatch" role="radio" id="pf-acc-${k}" aria-checked="${s.theme === k}" aria-label="${a.label} accent" data-accent="${k}"><span style="background:${a.fill}"></span></button>`).join('');
             const scaleIdx = Math.max(0, UI_SCALES.findIndex(([v]) => v === s.uiScale));
@@ -3378,6 +4288,18 @@ ${this.switchField('pf-g-brightnessSwipe', 'Swipe left side: brightness', g.brig
 ${this.switchField('pf-g-volumeSwipe', 'Swipe right side: volume', g.volumeSwipe)}
 ${this.switchField('pf-g-scrubSwipe', 'Swipe across: scrub', g.scrubSwipe)}
 ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
+${this.switchField('pf-g-allowMouseDrag', 'Mouse drag uses swipe gestures', g.allowMouseDrag)}
+${this.selectField('pf-dt-zone', 'Double-tap side zones', [[0.25, 'Narrow (25%)'], [0.35, 'Normal (35%)'], [0.45, 'Wide (45%)']], [0.25, 0.35, 0.45].reduce((a, b) => (Math.abs(b - g.doubleTapZoneWidth) < Math.abs(a - g.doubleTapZoneWidth) ? b : a)))}
+${this.selectField('pf-dt-left', 'Double-tap left', TAP_ACTIONS, g.doubleTapLeft)}
+${this.selectField('pf-dt-center', 'Double-tap centre', TAP_ACTIONS, g.doubleTapCenter)}
+${this.selectField('pf-dt-right', 'Double-tap right', TAP_ACTIONS, g.doubleTapRight)}
+<div class="section-label">Mouse</div>
+${this.selectField('pf-wheel', 'Scroll wheel', [['volume', 'Volume'], ['seek', 'Seek'], ['speed', 'Speed'], ['zoom', 'Zoom'], ['none', 'Nothing']], (s.mouse || {}).wheel || 'volume')}
+${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mute']]), (s.mouse || {}).middleClick || 'playPause')}
+<p class="hint">Ctrl + wheel zooms, Shift + wheel fine-seeks (frame steps when paused), Alt + wheel shifts subtitles.</p>
+<div class="section-label">Site profile${host ? ` · ${esc(host)}` : ''}</div>
+<p class="hint">${this.profile ? `Active: ${esc(fmtRate(this.profile.defaultSpeed || 1))}, ${this.profile.qualityCap ? `${this.profile.qualityCap}p cap` : 'no quality cap'}, GPU ${esc(this.profile.shader || 'off')}, EQ ${esc(this.profile.audioPreset || 'normal')}.` : 'Remember the current speed, quality cap, GPU shader, EQ preset and subtitle size for this site only.'}</p>
+<div role="menu" aria-label="Site profile">${this.row({ id: 'pf-site-save', label: this.profile ? 'Update profile with current setup' : 'Save current setup for this site', role: 'menuitem', lead: 'bookmark' })}${this.profile ? this.row({ id: 'pf-site-del', label: 'Remove site profile', role: 'menuitem', lead: 'trash' }) : ''}</div>
 <div class="section-label">Keyboard</div>${keys}
 <div role="menu" aria-label="Keyboard actions">${this.row({ id: 'pf-keys-reset', label: 'Reset shortcuts', role: 'menuitem', lead: 'rotate' })}${this.row({ id: 'pf-help', label: 'Show all shortcuts', meta: '?', role: 'menuitem', lead: 'help' })}</div>`;
         }
@@ -3437,13 +4359,27 @@ ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
             } else if (kind === 'captions') {
                 each('[data-sub]', el => {
                     const v = el.dataset.sub;
-                    if (v === 'off' || v === 'external') this.selectSubtitle(v); else this.selectSubtitle('shaka', +v.split(':')[1]);
+                    if (v === 'off' || v === 'external') this.selectSubtitle(v);
+                    else if (v.startsWith('cap:')) this.loadCapturedTrack(+v.split(':')[1]);
+                    else this.selectSubtitle('shaka', +v.split(':')[1]);
                 });
                 const file = byId('cc-file');
                 click('cc-load', () => file.click());
                 file.addEventListener('change', () => this.loadSubtitleFile(file.files[0]));
                 click('cc-off-minus', () => this.setSubOffset(this.subs.offset - 0.1));
                 click('cc-off-plus', () => this.setSubOffset(this.subs.offset + 0.1));
+                click('cc-sync-voice', () => this.syncSubsToVoice());
+                range('cc-speed', v => this.setSubSpeed(v / 1000), v => `${(v / 1000).toFixed(3)}×`);
+                each('[data-sub2]', el => {
+                    const v = el.dataset.sub2;
+                    if (v === 'off') this.loadSecondary('off');
+                    else if (v.startsWith('cap:')) this.loadSecondary('cap', +v.split(':')[1]);
+                });
+                const file2 = byId('cc2-file');
+                click('cc2-load', () => file2.click());
+                if (file2) file2.addEventListener('change', () => this.loadSecondary('file', file2.files[0]));
+                sw('cc-hover', v => sub({ pauseOnHover: v }));
+                sw('cc-copy', v => sub({ clickToCopy: v }));
                 each('[data-atrack]', el => this.selectAudioTrack(+el.dataset.atrack));
                 const sub = patch => this.saveSettings({ subtitles: { ...this.settings.subtitles, ...patch } });
                 select('cc-font', v => sub({ font: v }));
@@ -3477,6 +4413,19 @@ ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
             if (tab === 'quality') {
                 each('[data-q]', el => this.selectQuality(el.dataset.q === 'auto' ? 'auto' : +el.dataset.q));
                 select('q-cap', v => { this.setQualityCap(+v); this.announce(`Resolution cap ${+v ? `${v}p` : 'off'}`, 'studio'); });
+                const shakaBuf = () => { if (this.player) { try { this.configureShaka(); } catch (_) { /* player gone */ } } };
+                select('bf-window', v => { this.saveSettings({ maxBufferSec: +v }); this.announce(`Pre-buffer ${PREBUFFER_WINDOWS.find(w => w[0] === +v)[1]}`, 'studio'); });
+                range('bf-ahead', v => { this.saveSettings({ mseBufferAhead: v }); this.settings.mseBufferAhead = v; shakaBuf(); }, v => `${v} s`);
+                range('bf-behind', v => { this.saveSettings({ mseBufferBehind: v }); this.settings.mseBufferBehind = v; shakaBuf(); }, v => `${v} s`);
+                range('bf-workers', v => this.saveSettings({ maxWorkers: v }), v => `${v}`);
+                select('bf-cache', v => this.saveSettings({ cacheSizeMB: +v }));
+                sw('bf-range', v => this.saveSettings({ rangeAccel: v }));
+                sw('bf-pause', v => {
+                    this.prefetchPaused = v;
+                    this.port.send({ type: 'PREFETCH', enabled: !v });
+                    this.announce(v ? 'Background prefetch paused' : 'Background prefetch resumed', 'studio');
+                });
+                click('bf-purge', () => this.purgeBuffer());
             } else if (tab === 'audio') {
                 const audio = patch => {
                     const next = { ...this.settings.audio, ...patch };
@@ -3494,11 +4443,25 @@ ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
                     if (lbl) lbl.textContent = `${v > 0 ? '+' : ''}${v} dB`;
                 }, v => `${v} decibels`));
                 const delay = d => { const val = clamp(this.settings.audio.delayMs + d, 0, 1000); audio({ delayMs: val }); this.island('wave', `Audio delay ${val} ms`); this.refreshPopover(); };
+                select('au-ch', v => { audio({ channels: v }); this.announce({ stereo: 'Stereo', mono: 'Mono', left: 'Left channel', right: 'Right channel' }[v], 'wave'); });
+                sw('au-pitch', v => { audio({ preservesPitch: v }); this.applyPitch(v); });
                 click('au-d-minus', () => delay(-50));
                 click('au-d-plus', () => delay(50));
             } else if (tab === 'display') {
                 const filt = (key, suffix) => range(`dp-${key}`, v => { this.filters[key] = v; this.applyFilters(); }, v => `${v}${suffix}`);
                 filt('brightness', '%'); filt('contrast', '%'); filt('saturate', '%'); filt('sharpness', '%'); filt('hue', '°'); filt('warmth', '%');
+                select('dp-shader', v => {
+                    this.gpuOverride = null;
+                    this.gpuBlocked = null;
+                    if (this.gpu && this.gpu.failed) { this.gpu.destroy(); this.gpu = null; }
+                    this.settings.shader = v;
+                    this.saveSettings({ shader: v });
+                    this.applyFilters();
+                    this.announce(`GPU: ${GPU_PRESETS.find(p => p[0] === v)[1]}`, 'studio');
+                    this.refreshPopover();
+                });
+                range('dp-shader-str', v => { this.settings.shaderStrength = v; this.saveSettings({ shaderStrength: v }); this.applyFilters(); }, v => `${v}%`);
+                select('dp-maxres', v => { this.settings.maxRenderRes = +v; this.saveSettings({ maxRenderRes: +v }); this.applyFilters(); });
                 click('dp-reset', () => { this.filters = { ...DEFAULT_FILTERS }; this.applyFilters(); this.refreshPopover(); this.announce('Display reset', 'sun'); });
                 click('dp-preset-save', () => {
                     const name = byId('dp-preset-name').value.trim() || `Preset ${(this.settings.filterPresets || []).length + 1}`;
@@ -3535,6 +4498,7 @@ ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
                 click('tl-cancel', () => this.port.send({ type: 'EXPORT_CANCEL' }));
                 click('tl-rec', () => this.onDownloadButton());
                 click('tl-export', () => this.startExport());
+                select('tl-format', v => { this.saveSettings({ exportFormat: v }); this.refreshPopover(); });
                 each('[data-sleep]', el => { const m = el.dataset.sleep; this.setSleep(m === 'eov' ? 'eov' : +m); });
                 select('tl-skip', v => this.saveSettings({ skipSeconds: +v }));
                 sw('tl-smart', v => { this.smart.blocked = false; this.saveSettings({ smartSkip: v }); this.announce(v ? 'Smart skip on' : 'Smart skip off', 'skip'); });
@@ -3542,6 +4506,10 @@ ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
                 click('tl-audio', () => this.setAudioOnly(!this.audioOnly));
                 click('tl-pip', () => this.togglePip());
                 click('tl-lock', () => this.setLocked(true));
+                each('[data-ext]', el => this.openExternal(el.dataset.ext));
+                click('ex-ytdlp', () => this.copyCommand('ytdlp'));
+                click('ex-ffmpeg', () => this.copyCommand('ffmpeg'));
+                click('ex-link', () => this.copyCommand('link'));
             } else if (tab === 'prefs') {
                 each('[data-accent]', el => { this.saveSettings({ theme: el.dataset.accent }); this.refreshPopover(); });
                 each('[data-scale]', el => { this.saveSettings({ uiScale: +el.dataset.scale }); this.refreshPopover(); });
@@ -3557,9 +4525,17 @@ ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
                 sw('pf-autofs', v => this.saveSettings({ autoFullscreen: v }));
                 sw('pf-badge', v => this.saveSettings({ quickLaunchBadge: v }));
                 select('pf-lprate', v => this.saveSettings({ longPressRate: +v }));
-                for (const k of ['enabled', 'doubleTapSeek', 'longPressSpeed', 'brightnessSwipe', 'volumeSwipe', 'scrubSwipe', 'pinchZoom']) {
+                for (const k of ['enabled', 'doubleTapSeek', 'longPressSpeed', 'brightnessSwipe', 'volumeSwipe', 'scrubSwipe', 'pinchZoom', 'allowMouseDrag']) {
                     sw(`pf-g-${k}`, v => this.saveSettings({ gestures: { ...this.settings.gestures, [k]: v } }));
                 }
+                const gest = patch => this.saveSettings({ gestures: { ...this.settings.gestures, ...patch } });
+                select('pf-dt-zone', v => gest({ doubleTapZoneWidth: +v }));
+                select('pf-dt-left', v => gest({ doubleTapLeft: v }));
+                select('pf-dt-center', v => gest({ doubleTapCenter: v }));
+                select('pf-dt-right', v => gest({ doubleTapRight: v }));
+                const mouse = patch => this.saveSettings({ mouse: { ...this.settings.mouse, ...patch } });
+                select('pf-wheel', v => mouse({ wheel: v }));
+                select('pf-middle', v => mouse({ middleClick: v }));
                 each('[data-key]', el => {
                     this.capturingKey = el.dataset.key;
                     this.refreshPopover();
@@ -3568,6 +4544,8 @@ ${this.switchField('pf-g-pinchZoom', 'Pinch to zoom', g.pinchZoom)}
                 // keymap:null makes the bridge restore defaults; SETTINGS_CHANGED re-renders.
                 click('pf-keys-reset', () => { this.port.send({ type: 'SETTINGS_SET', patch: { keymap: null } }); this.announce('Shortcuts reset', 'check'); });
                 click('pf-help', () => this.openPopover('help', this.$('.btn-studio')));
+                click('pf-site-save', () => this.saveSiteProfile());
+                click('pf-site-del', () => this.removeSiteProfile());
             }
         }
 
