@@ -25,8 +25,9 @@ const api = S.api;
 const MAX_STREAMS_PER_TAB = 40;
 const PROXY_TIMEOUT_MS = 60000;
 const RECONNECT_GRACE_MS = 20000;
-const ICONS_IDLE = { 16: '/icons/icon-16.png', 48: '/icons/icon-48.png', 128: '/icons/icon-128.png' };
-const ICONS_ACTIVE = { 16: '/icons/icon-active-16.png', 48: '/icons/icon-active-48.png', 128: '/icons/icon-active-128.png' };
+// 16/32 px use a heavier variant of the mark (see assets/brand/*-small.svg) so it stays legible.
+const ICONS_IDLE = { 16: '/icons/icon-16.png', 32: '/icons/icon-32.png', 48: '/icons/icon-48.png', 128: '/icons/icon-128.png' };
+const ICONS_ACTIVE = { 16: '/icons/icon-active-16.png', 32: '/icons/icon-active-32.png', 48: '/icons/icon-active-48.png', 128: '/icons/icon-active-128.png' };
 
 // ============================================================================
 // SETTINGS
