@@ -4,8 +4,7 @@ An accessible, customizable HLS / DASH / MP4 player and streaming optimizer for 
 
 Velostream plays a site's video in its own player, mounted exactly over the site's player, pre-buffers the whole
 video in the background with parallel downloads, and remembers your volume, speed, quality, audio language,
-subtitles and position. Inspired by [FastStream](https://github.com/Andrews54757/FastStream) (an independent,
-unrelated project); Velostream focuses on mobile, a premium player UI and download/recording tools.
+subtitles and position. Velostream focuses on mobile, a premium player UI and download/recording tools.
 
 ## Target browsers
 
