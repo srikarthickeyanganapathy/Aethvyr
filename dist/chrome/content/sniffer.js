@@ -654,7 +654,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         const host = document.createElement('velostream-badge');
         host.style.cssText = 'all: initial; position: fixed; top: 0; left: 0; width: 0; height: 0; z-index: 2147483646;';
         const shadow = host.attachShadow({ mode: 'closed' });
-        shadow.innerHTML = `<style>${BADGE_CSS}</style>
+        S.setHTML(shadow, `<style>${BADGE_CSS}</style>
 <div class="pill" role="group" aria-label="Velostream" hidden>
   <button type="button" class="play" aria-label="Play this video in Velostream">
     <svg class="bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4.5 13.2a.6.6 0 0 0 .5 1H11l-1 7.8 8.5-11.2a.6.6 0 0 0-.5-1H12z"/></svg>
@@ -664,7 +664,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
   <button type="button" class="close" aria-label="Hide the Velostream button on this page">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
   </button>
-</div>`;
+</div>`);
         badge.host = host;
         badge.shadow = shadow;
         const pill = shadow.querySelector('.pill');

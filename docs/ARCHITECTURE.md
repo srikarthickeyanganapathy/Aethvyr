@@ -233,7 +233,7 @@ rotation and mirroring apply identically.
 | | Chromium | Firefox |
 |---|---|---|
 | Background | `service_worker` (module) | event page (`background.scripts`, module) |
-| Manifest | `minimum_chrome_version: 111` (MAIN-world content scripts) | `browser_specific_settings.gecko` (min 128, Android 128) |
+| Manifest | `minimum_chrome_version: 111` (MAIN-world content scripts) | `browser_specific_settings.gecko` (min 140, Android 142) |
 | Site access | granted at install | opt-in: popup shows **Allow access to websites** |
 | API namespace | `chrome.*` | `browser.*` (`common/shared.js` exports whichever exists as `api`) |
 
@@ -241,6 +241,12 @@ The build generates both manifests from `manifest.json` (see `scripts/build.js`)
 
 ## Security model
 
+- **No direct `innerHTML`.** Markup is inserted with `setHTML`/`replaceWithHTML` from
+  `common/shared.js`. They parse in an inert `DOMParser` document, then remove `script`, `iframe`,
+  `object`, `embed`, `link`, `meta`, `base`, `foreignObject` and `noscript` elements, every `on*`
+  attribute, and `href`/`src`-style attributes whose URL is not http(s), blob, relative, a
+  fragment or a raster `data:image`. Text from sites (titles, subtitle lines, labels) is also
+  escaped with `esc()` inside the templates.
 - The interceptor only executes `FS_FETCH` for `http(s)` URLs and only answers its own tagged
   messages. Pages can talk to it, but it only ever performs requests the page itself could make,
   with the page's own identity.

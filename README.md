@@ -9,7 +9,7 @@ player, pre-buffers it in the background, enhances it on the GPU and saves it as
 
 ![Manifest V3](https://img.shields.io/badge/manifest-v3-4c8bf5)
 ![Chrome 111+](https://img.shields.io/badge/Chrome%20%2F%20Edge%20%2F%20Kiwi-111%2B-34a853)
-![Firefox 128+](https://img.shields.io/badge/Firefox%20%2B%20Android-128%2B-ff7139)
+![Firefox 140+ / Android 142+](https://img.shields.io/badge/Firefox-140%2B%20%C2%B7%20Android%20142%2B-ff7139)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
 [Features](#features) · [Install](#install) · [Usage](#usage) · [Docs](#documentation) ·
@@ -58,7 +58,7 @@ The full tour is in **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)**.
 | Browser | How |
 |---------|-----|
 | Chrome, Edge, Brave, Kiwi (Chromium 111+) | Chrome Web Store *(link added on release)*, or load `dist/chrome` unpacked (see below) |
-| Firefox desktop and Firefox for Android 128+ | addons.mozilla.org *(link added on release)*, or load `dist/firefox` as a temporary add-on |
+| Firefox desktop 140+ and Firefox for Android 142+ | addons.mozilla.org *(link added on release)*, or load `dist/firefox` as a temporary add-on |
 
 **Load unpacked (Chromium):** `chrome://extensions` → enable *Developer mode* → *Load unpacked* →
 choose `dist/chrome`.

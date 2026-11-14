@@ -291,7 +291,52 @@
         return `${(bps / 1e6).toFixed(bps >= 1e7 ? 0 : 1)} Mbps`;
     }
 
+    // ---------------------------------------------------------------------
+    // Safe markup insertion. All UI markup (popup rows, the on-page pill, the player's controls,
+    // menus and subtitle lines - which can contain text from the site) goes through here instead of
+    // innerHTML: it is parsed in an inert document (scripts never run, images never load there),
+    // stripped of anything executable, then moved into place.
+    // ---------------------------------------------------------------------
+    const BLOCKED_TAGS = new Set(['script', 'iframe', 'frame', 'frameset', 'object', 'embed', 'link', 'meta', 'base', 'foreignobject', 'noscript']);
+    const URL_ATTRS = new Set(['href', 'src', 'xlink:href', 'action', 'formaction', 'srcdoc', 'poster', 'data']);
+    const SAFE_URL = /^(?:\s*(?:https?:|blob:|data:image\/(?:png|jpe?g|gif|webp);|#|\/|\.{0,2}\/|[\w-]+\.))/i;
+
+    function sanitizeTree(node) {
+        const walker = node.ownerDocument.createTreeWalker(node, 1 /* NodeFilter.SHOW_ELEMENT */);
+        const remove = [];
+        for (let el = walker.nextNode(); el; el = walker.nextNode()) {
+            if (BLOCKED_TAGS.has(el.localName.toLowerCase())) { remove.push(el); continue; }
+            for (const attr of [...el.attributes]) {
+                const name = attr.name.toLowerCase();
+                if (name.startsWith('on') || name === 'srcdoc') el.removeAttribute(attr.name);
+                else if (URL_ATTRS.has(name) && attr.value && !SAFE_URL.test(attr.value)) el.removeAttribute(attr.name);
+            }
+        }
+        remove.forEach(el => el.remove());
+    }
+
+    function parseHTML(markup) {
+        const doc = new DOMParser().parseFromString(String(markup == null ? '' : markup), 'text/html');
+        const frag = doc.createDocumentFragment();
+        // A leading <style> is parsed into <head>; keep it, in order, ahead of the body content.
+        for (const n of [...doc.head.childNodes, ...doc.body.childNodes]) frag.appendChild(n);
+        sanitizeTree(frag);
+        return frag;
+    }
+
+    /** Replace el's children (element or shadow root) with sanitized markup. */
+    function setHTML(el, markup) {
+        el.replaceChildren(parseHTML(markup));
+    }
+
+    /** Replace el itself with sanitized markup. */
+    function replaceWithHTML(el, markup) {
+        el.replaceWith(parseHTML(markup));
+    }
+
     root.VelostreamShared = Object.freeze({
+        setHTML,
+        replaceWithHTML,
         api,
         IS_FIREFOX,
         DEFAULT_SETTINGS,

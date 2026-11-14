@@ -2,7 +2,7 @@
 
 ## Setup
 
-Requirements: **Node.js 18+** and npm. Development uses Chromium 111+ or Firefox 128+.
+Requirements: **Node.js 18+** and npm. Development uses Chromium 111+ or Firefox 140+ (Firefox for Android 142+).
 
 ```bash
 git clone https://github.com/srikarthickeyanganapathy/playerstreamextension.git
@@ -28,7 +28,7 @@ to `lib/shaka-player.compiled.js` with its license. It then writes the browser-s
 `manifest.json`, with the version taken from `package.json`:
 
 - **Chrome:** `minimum_chrome_version: "111"`.
-- **Firefox:** `browser_specific_settings.gecko` (id, `strict_min_version` 128, Android 128), and
+- **Firefox:** `browser_specific_settings.gecko` (id, `strict_min_version` 140, Android 142, `data_collection_permissions`), and
   the background becomes an event page (`background.scripts`).
 
 Finally it verifies that every file the manifest references exists and that the DNR rules parse.
@@ -75,6 +75,11 @@ for (const s of VelostreamEngine.sessions.values()) { const p = s.port; s.port =
 - ESLint config in `.eslintrc.json`. Keep `npm run lint` clean.
 - **Never load remote code.** No CDN, no `eval`/`new Function`, no remote config. Both stores
   reject it and it breaks the privacy promise.
+- **Never assign `innerHTML`/`outerHTML`.** Insert markup with `S.setHTML(el, markup)` (popup,
+  content scripts) or `setHTML(el, markup)` (player), and `replaceWithHTML` instead of
+  `outerHTML`. They parse in an inert document and strip scripts, frames, event-handler
+  attributes and unsafe URLs. Still escape dynamic text with `esc()` inside templates. AMO's
+  linter flags any direct assignment.
 - UI changes keep the existing glass design language and stay keyboard and screen-reader
   accessible (labels, focus order, `announce()` for state changes).
 - New settings: see [SETTINGS.md](SETTINGS.md#migrations).
@@ -149,9 +154,26 @@ re-check before a release.
 ### Firefox Add-ons (AMO)
 
 - Upload `dist/velostream-firefox-<version>.zip`; mark it compatible with Firefox for Android.
+- **Data collection:** the build writes
+  `browser_specific_settings.gecko.data_collection_permissions = { "required": ["none"] }`
+  (Firefox's built-in data consent; AMO rejects new add-ons without it). Keep it at `none` unless
+  a future feature sends data off the device; then declare the categories and update
+  [PRIVACY.md](../PRIVACY.md).
 - **Source code:** AMO asks for sources when a package contains minified code. Shaka Player is a
   third-party library: state *"lib/shaka-player.compiled.js is the unmodified
   shaka-player@5.3.3 dist/shaka-player.compiled-es2021.js from npm"* in the reviewer notes. Your
   own code is not minified, so no other source upload is needed.
 - Reviewer notes: explain the MAIN-world content script (stream detection in the page's own
   `fetch`/XHR) and that no remote code is loaded.
+- **Expected linter result:** 0 errors and 8 warnings, all `UNSUPPORTED_API` inside
+  `lib/shaka-player.compiled.js` (`cast.*` and `webview.hostObjects`). These are Shaka's
+  feature-detection checks for Chromecast and Windows WebView2: they test whether the API exists
+  and are skipped when it does not, so they never run in Firefox. They cannot be removed without
+  modifying the library, which would break source verification. Paste this into the reviewer
+  notes:
+
+  > The remaining UNSUPPORTED_API warnings (cast.*, webview.hostObjects) come from the
+  > unmodified Shaka Player 5.3.3 library. They are guarded feature checks for Chromecast and
+  > WebView2 and are never executed in Firefox.
+
+  Check locally with `npx addons-linter dist/firefox` before uploading.

@@ -253,6 +253,8 @@
     }
 
     const extApi = (window.VelostreamShared && window.VelostreamShared.api) || null;
+    /** Sanitized markup insertion (common/shared.js); never assign innerHTML directly. */
+    const setHTML = (el, markup) => window.VelostreamShared.setHTML(el, markup);
 
     function safeFilename(name) {
         // eslint-disable-next-line no-control-regex -- control characters are invalid in file names
@@ -637,14 +639,14 @@
             const html = active.length ? SubtitleEngine.linesHtml(active) : '';
             if (html !== this.lastHtml) {
                 this.lastHtml = html;
-                this.layer.innerHTML = html;
+                setHTML(this.layer, html);
             }
             if (this.topLayer) {
                 const top = this.secondaryCues ? SubtitleEngine.activeAt(this.secondaryCues, t) : [];
                 const topHtml = top.length ? SubtitleEngine.linesHtml(top) : '';
                 if (topHtml !== this.lastTopHtml) {
                     this.lastTopHtml = topHtml;
-                    this.topLayer.innerHTML = topHtml;
+                    setHTML(this.topLayer, topHtml);
                 }
             }
         }
@@ -1548,7 +1550,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.applyHostRect();
             this.shadow = host.attachShadow({ mode: 'open' });
             const spinner = '<svg viewBox="0 0 44 44" aria-hidden="true"><circle cx="22" cy="22" r="18" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="3.5"/><path d="M22 4a18 18 0 0 1 18 18" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/></svg>';
-            this.shadow.innerHTML = `
+            setHTML(this.shadow, `
 <style>${CSS}</style>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <filter id="fs-sharpen"><feConvolveMatrix id="fs-kernel" order="3" kernelMatrix="0 0 0 0 1 0 0 0 0" preserveAlpha="true"/></filter>
@@ -1646,7 +1648,7 @@ input[type="text"] { width: 100%; min-width: 0; }
     <p id="fs-err-msg"></p>
     <div class="btns"><button type="button" class="pillbtn primary btn-retry">Retry</button><button type="button" class="pillbtn btn-err-close">Close player</button></div>
   </div>
-</div>`;
+</div>`);
             document.body.appendChild(host);
             this.root = this.$('.root');
             this.video = this.$('video');
@@ -1702,8 +1704,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             r.style.setProperty('--fs-scale', String(s.uiScale || 1));
             this.$('.stats').classList.toggle('show', !!s.showStats);
             this.$('.btn-info').setAttribute('aria-pressed', String(!!s.showStats));
-            this.$('.btn-back').innerHTML = skipIcon(-1, s.seekStep);
-            this.$('.btn-fwd').innerHTML = skipIcon(1, s.seekStep);
+            setHTML(this.$('.btn-back'), skipIcon(-1, s.seekStep));
+            setHTML(this.$('.btn-fwd'), skipIcon(1, s.seekStep));
             this.$('.btn-back').setAttribute('aria-label', `Seek back ${s.seekStep} seconds`);
             this.$('.btn-fwd').setAttribute('aria-label', `Seek forward ${s.seekStep} seconds`);
             const skip = this.$('.skip-intro');
@@ -1888,7 +1890,7 @@ input[type="text"] { width: 100%; min-width: 0; }
         /** Morph the island open with an icon, text and optional level bar, then collapse. */
         island(iconName, text, ratio = null, holdMs = 1200) {
             const el = this.$('.island');
-            this.$('.i-icon').innerHTML = iconName ? icon(iconName, 18) : '';
+            setHTML(this.$('.i-icon'), iconName ? icon(iconName, 18) : '');
             this.$('.i-text').textContent = text;
             const bar = this.$('.i-bar');
             bar.style.display = ratio == null ? 'none' : '';
@@ -1994,7 +1996,7 @@ input[type="text"] { width: 100%; min-width: 0; }
         updatePlayButtons() {
             const paused = this.video.paused;
             for (const b of this.$$('.btn-play, .mini-play')) {
-                b.innerHTML = icon(paused ? 'play' : 'pause');
+                setHTML(b, icon(paused ? 'play' : 'pause'));
                 b.setAttribute('aria-label', paused ? 'Play' : 'Pause');
             }
         }
@@ -2098,7 +2100,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             s.style.setProperty('--p', `${pct}%`);
             s.setAttribute('aria-valuetext', `${pct}%${v.muted ? ', muted' : ''}`);
             const b = this.$('.btn-mute');
-            b.innerHTML = icon(v.muted || v.volume === 0 ? 'mute' : v.volume < 0.5 ? 'volumeLow' : 'volume');
+            setHTML(b, icon(v.muted || v.volume === 0 ? 'mute' : v.volume < 0.5 ? 'volumeLow' : 'volume'));
             b.setAttribute('aria-label', v.muted ? 'Unmute' : 'Mute');
         }
 
@@ -2153,7 +2155,7 @@ input[type="text"] { width: 100%; min-width: 0; }
         onFullscreenChange() {
             const fs = !!document.fullscreenElement || !!this.viewportFill;
             const b = this.$('.btn-fs');
-            b.innerHTML = icon(fs ? 'exitFullscreen' : 'fullscreen');
+            setHTML(b, icon(fs ? 'exitFullscreen' : 'fullscreen'));
             b.setAttribute('aria-label', fs ? 'Exit full screen' : 'Enter full screen');
             if (!fs) { try { screen.orientation.unlock(); } catch (_) { /* ignore */ } }
         }
@@ -3151,7 +3153,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             const live = this.isLive();
             b.classList.toggle('recording', !!this.recordingSince);
             const glyph = st && st.running ? 'stop' : live ? (this.recordingSince ? 'stop' : 'record') : 'download';
-            b.firstElementChild.outerHTML = icon(glyph);
+            window.VelostreamShared.replaceWithHTML(b.firstElementChild, icon(glyph));
             if (st && st.running) {
                 ring.hidden = false;
                 ring.querySelector('.prog').style.strokeDashoffset = String(119.38 * (1 - (st.pct || 0) / 100));
@@ -3367,7 +3369,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 mse.push(`<div class="layer buf-mse" style="left:${s}%;width:${e - s}%"></div>`);
             }
             const mseHtml = mse.join('');
-            if (mseHtml !== this.lastMseHtml) { this.lastMseHtml = mseHtml; this.$('.layers-mse').innerHTML = mseHtml; }
+            if (mseHtml !== this.lastMseHtml) { this.lastMseHtml = mseHtml; setHTML(this.$('.layers-mse'), mseHtml); }
 
             // Velostream IndexedDB prefetch (engine timeline == presentation time for VOD HLS)
             let cacheHtml = '';
@@ -3378,7 +3380,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                     return `<div class="layer buf-cache" style="left:${s}%;width:${e - s}%"></div>`;
                 }).join('');
             }
-            if (cacheHtml !== this.lastCacheHtml) { this.lastCacheHtml = cacheHtml; this.$('.layers-cache').innerHTML = cacheHtml; }
+            if (cacheHtml !== this.lastCacheHtml) { this.lastCacheHtml = cacheHtml; setHTML(this.$('.layers-cache'), cacheHtml); }
         }
 
         // -----------------------------------------------------------------
@@ -3496,7 +3498,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             for (const b of this.bookmarks) html += `<div class="mark" style="left:${pos(b.t)}%"></div>`;
             if (this.loop.a != null) html += `<div class="mark" style="left:${pos(this.loop.a)}%"></div>`;
             if (this.loop.b != null) html += `<div class="mark" style="left:${pos(this.loop.b)}%"></div>`;
-            this.$('.marks').innerHTML = html;
+            setHTML(this.$('.marks'), html);
             const lr = this.$('.loop-range');
             if (this.loop.a != null && this.loop.b != null) {
                 lr.hidden = false;
@@ -3540,7 +3542,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 ['Hits / misses', `${e.cacheHits || 0} / ${e.cacheMisses || 0}`]
             ];
             if (this.isLive()) rows.push(['Live DVR', fmtTime(e.dvrSeconds || 0)]);
-            this.$('.stats dl').innerHTML = rows.map(([k, val]) => `<dt>${esc(k)}</dt><dd>${esc(val)}</dd>`).join('');
+            setHTML(this.$('.stats dl'), rows.map(([k, val]) => `<dt>${esc(k)}</dt><dd>${esc(val)}</dd>`).join(''));
         }
 
         // -----------------------------------------------------------------
@@ -3845,7 +3847,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                     this.seekBy(delta, true);
                     const rip = this.$(`.ripple.${delta < 0 ? 'left' : 'right'}`);
                     if (rip) {
-                        rip.innerHTML = `${skipIcon(delta < 0 ? -1 : 1, step)}<span>${delta < 0 ? '−' : '+'}${step}s</span>`;
+                        setHTML(rip, `${skipIcon(delta < 0 ? -1 : 1, step)}<span>${delta < 0 ? '−' : '+'}${step}s</span>`);
                         rip.classList.remove('show');
                         void rip.offsetWidth;
                         rip.classList.add('show');
@@ -4021,7 +4023,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.capturingKey = null;
             this.pop.className = 'popover glass elevated';
             this.pop.setAttribute('aria-hidden', 'true');
-            this.pop.innerHTML = '';
+            this.pop.replaceChildren();
             if (btn) {
                 btn.setAttribute('aria-expanded', 'false');
                 if (returnFocus) btn.focus({ preventScroll: true });
@@ -4086,7 +4088,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             const role = kind === 'speed' ? 'menu' : 'dialog';
             this.pop.setAttribute('role', role);
             this.pop.setAttribute('aria-labelledby', 'fs-pop-title');
-            this.pop.innerHTML = `<div class="pop-head"><h2 id="fs-pop-title">${titles[kind]}</h2><button type="button" class="ib pop-close" aria-label="Close ${titles[kind]}">${icon('close', 18)}</button></div><div class="pop-body">${body}</div>`;
+            setHTML(this.pop, `<div class="pop-head"><h2 id="fs-pop-title">${titles[kind]}</h2><button type="button" class="ib pop-close" aria-label="Close ${titles[kind]}">${icon('close', 18)}</button></div><div class="pop-body">${body}</div>`);
             this.pop.querySelector('.pop-close').addEventListener('click', () => this.closePopover(true));
             this.bindPopover(kind);
         }

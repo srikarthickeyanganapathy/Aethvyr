@@ -110,7 +110,7 @@
 
         const active = document.activeElement;
         const focusKey = active && active.dataset && active.dataset.id ? `${active.dataset.action}:${active.dataset.id}` : null;
-        list.innerHTML = '';
+        list.replaceChildren();
         streams.forEach((stream, i) => {
             const li = document.createElement('li');
             const playing = stream.id === playerStreamId;
@@ -120,7 +120,7 @@
             const frame = stream.isAd ? '<span class="frame warn">Likely an ad</span>'
                 : `<span class="frame">${stream.frameId > 0 ? `Embedded player · ${esc(hostOf(stream.frameUrl))}` : 'Main frame'}</span>`;
             const label = `${TYPE_LABEL[stream.type] || stream.type}${res ? ` ${res}` : ''}, ${name}`;
-            li.innerHTML = `
+            S.setHTML(li, `
                 <div class="badges"><span class="type ${esc(stream.type)}">${TYPE_LABEL[stream.type] || esc(stream.type)}</span>${res ? `<span class="res">${res}</span>` : ''}</div>
                 <div class="info">
                     <div class="name" title="${esc(stream.url)}">${playing ? 'Playing · ' : ''}${esc(name)}</div>
@@ -134,7 +134,7 @@
                     <button type="button" class="icon-btn" data-action="copy" data-id="${esc(stream.id)}" aria-label="Copy link of stream ${i + 1}">
                         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2.5"/><path d="M16 8V6.5A2.5 2.5 0 0 0 13.5 4h-7A2.5 2.5 0 0 0 4 6.5v7A2.5 2.5 0 0 0 6.5 16H8"/></svg>
                     </button>
-                </div>`;
+                </div>`);
             li.querySelector('[data-action="play"]').addEventListener('click', (e) => launch(stream, e.currentTarget));
             li.querySelector('[data-action="copy"]').addEventListener('click', () => copyUrl(stream));
             list.appendChild(li);
@@ -246,12 +246,12 @@
         if (sig === lastHistorySig) return;
         lastHistorySig = sig;
         const list = $('history-list');
-        list.innerHTML = '';
+        list.replaceChildren();
         for (const [key, e] of entries) {
             const li = document.createElement('li');
             li.className = 'history-item';
             const pct = e.d ? Math.min(100, Math.round((e.t / e.d) * 100)) : 0;
-            li.innerHTML = `
+            S.setHTML(li, `
                 <div class="info">
                     <div class="name" title="${esc(e.url)}">${esc(e.title || hostOf(e.url))}</div>
                     <div class="meta num">${fmtTime(e.t)}${e.d ? ` / ${fmtTime(e.d)}` : ''} · ${esc(fmtAgo(e.updatedAt))}</div>
@@ -260,7 +260,7 @@
                 <button type="button" class="btn small" data-open="${esc(key)}" ${e.page ? '' : 'disabled'} aria-label="Open the page of ${esc(e.title || 'this video')} to resume">Open</button>
                 <button type="button" class="icon-btn" data-del="${esc(key)}" aria-label="Remove ${esc(e.title || 'this video')} from history">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
-                </button>`;
+                </button>`);
             li.querySelector('[data-open]').addEventListener('click', () => {
                 if (e.page && /^https?:/i.test(e.page)) api.tabs.create({ url: e.page });
             });

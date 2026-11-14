@@ -44,3 +44,13 @@ First public release as **Velostream** (previously developed as *FastStream Mobi
 - Full screen is only requested during a real user gesture: no more "can only be initiated by a
   user gesture" failure, and no wrong fallback to filling the window.
 - Removed the redundant `allowfullscreen` attribute from the player frame (console warning).
+- All UI markup is inserted through a sanitizing helper (`setHTML`) instead of `innerHTML`.
+  Subtitle text and titles coming from sites can no longer inject markup or scripts, and AMO
+  linter warnings are cleared.
+
+### Changed
+
+- Firefox minimum versions: **140** on desktop and **142** on Android, the first versions that
+  support the required `data_collection_permissions` manifest key (declared as `none`).
+- New icon: a forward-leaning V with a red dot. A heavier variant is used at 16/32 px, and the
+  tile turns red when a video is found.

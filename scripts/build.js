@@ -92,8 +92,15 @@ function buildTarget(browser, shaka) {
 
     if (browser === 'firefox') {
         manifest.browser_specific_settings = {
-            gecko: { id: GECKO_ID, strict_min_version: '128.0' },
-            gecko_android: { strict_min_version: '128.0' }
+            gecko: {
+                id: GECKO_ID,
+                strict_min_version: '140.0',
+                // Firefox built-in data consent (https://mzl.la/firefox-builtin-data-consent):
+                // Velostream collects and transmits no user data. Supported from Firefox 140 / Android 142,
+                // which is why those are the minimum versions.
+                data_collection_permissions: { required: ['none'] }
+            },
+            gecko_android: { strict_min_version: '142.0' }
         };
         // Firefox MV3 uses a non-persistent event page instead of a service worker.
         manifest.background = { scripts: ['background/engine.js'], type: 'module' };
