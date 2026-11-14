@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Velostream</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+    <a class="skip-link" href="#streams">Skip to detected streams</a>
+    <div id="app" data-accent="blue">
+        <header class="app-header">
+            <img class="app-icon" src="../icons/icon-48.png" alt="" width="28" height="28">
+            <h1>Velostream</h1>
+            <span id="status-pill" class="status-pill" role="status"><span class="dot" aria-hidden="true"></span><span id="status-text">Ready</span></span>
+        </header>
+
+        <div id="announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+        <p id="message" class="message" role="alert" hidden></p>
+
+        <section id="permission-banner" class="card warn" hidden aria-labelledby="perm-title">
+            <h2 id="perm-title" class="card-title">Site access needed</h2>
+            <p class="muted">Velostream needs permission to read pages so it can detect and play videos.</p>
+            <button type="button" id="grant-permission" class="btn btn-primary">Allow access to websites</button>
+        </section>
+
+        <section class="bento" aria-label="Engine telemetry">
+            <div class="card tile">
+                <div class="tile-label">Bandwidth</div>
+                <div class="tile-value num" id="stat-bandwidth">0 Mbps</div>
+                <svg class="spark" id="spark" viewBox="0 0 120 28" preserveAspectRatio="none" aria-hidden="true"><polyline points="" /></svg>
+            </div>
+            <div class="card tile">
+                <div class="tile-label">Buffer &amp; workers</div>
+                <div class="tile-value num" id="stat-cache">— • 0×</div>
+                <div class="tile-sub num" id="stat-ahead">Idle</div>
+            </div>
+        </section>
+        <span id="stat-active" class="sr-only">0</span>
+
+        <section id="player-section" class="card now" hidden aria-labelledby="player-title">
+            <div class="now-head">
+                <svg class="ico accent" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" stroke="none" d="M7.5 5.2v13.6a.9.9 0 0 0 1.37.77l10.9-6.8a.9.9 0 0 0 0-1.54l-10.9-6.8a.9.9 0 0 0-1.37.77z"/></svg>
+                <div class="now-text">
+                    <h2 id="player-title" class="card-title">Now playing</h2>
+                    <p id="player-stream" class="muted ellipsis"></p>
+                </div>
+            </div>
+            <div class="btn-row">
+                <button type="button" id="export-btn" class="btn">Download</button>
+                <button type="button" id="close-player-btn" class="btn btn-quiet">Close player</button>
+            </div>
+        </section>
+
+        <section id="streams" class="section" aria-labelledby="streams-title" tabindex="-1">
+            <div class="section-head">
+                <h2 id="streams-title" class="section-title">Detected streams</h2>
+                <div class="head-actions">
+                    <button type="button" id="rescan-btn" class="icon-btn" aria-label="Rescan this page for videos">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.5 11.5a7.5 7.5 0 1 0-2.2 5.3"/><path d="M19.5 5v6.5H13"/></svg>
+                    </button>
+                    <button type="button" id="clear-btn" class="icon-btn" aria-label="Clear the detected stream list">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12.5h8L17 7"/></svg>
+                    </button>
+                </div>
+            </div>
+            <ul id="stream-list" class="stream-list" aria-labelledby="streams-title"></ul>
+            <p id="empty-state" class="empty muted">Looking for videos… Start the video on the page if nothing appears.</p>
+        </section>
+
+        <section id="site-card" class="card site" hidden aria-labelledby="site-title">
+            <label class="field site-field">
+                <span>
+                    <span id="site-title" class="section-title">Always play in Velostream</span>
+                    <span id="site-host" class="muted site-host"></span>
+                </span>
+                <input type="checkbox" role="switch" id="site-auto" aria-describedby="site-host">
+            </label>
+        </section>
+
+        <form id="paste-form" class="paste" novalidate>
+            <label for="paste-url" class="sr-only">Play any stream link</label>
+            <input type="url" id="paste-url" placeholder="Play any .m3u8 / .mpd / .mp4 URL…" autocomplete="off" spellcheck="false" inputmode="url">
+            <button type="submit" class="go" aria-label="Play this link">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            </button>
+        </form>
+
+        <details id="history" class="card fold">
+            <summary><span class="section-title">Continue watching</span><span id="history-count" class="count num">0</span></summary>
+            <ul id="history-list" class="history-list"></ul>
+            <p id="history-empty" class="muted">Videos you watch in Velostream appear here with their position.</p>
+            <button type="button" id="history-clear" class="btn btn-quiet small">Clear history</button>
+        </details>
+
+        <details id="settings" class="card fold">
+            <summary><span class="section-title">Settings</span></summary>
+            <form id="settings-form" novalidate>
+                <fieldset>
+                    <legend>Appearance</legend>
+                    <div class="field">
+                        <span id="accent-label">Accent</span>
+                        <div class="swatches" role="radiogroup" aria-labelledby="accent-label">
+                            <button type="button" class="swatch" role="radio" data-accent="blue" aria-label="System Blue"><span style="background:#0A84FF"></span></button>
+                            <button type="button" class="swatch" role="radio" data-accent="green" aria-label="Green"><span style="background:#30D158"></span></button>
+                            <button type="button" class="swatch" role="radio" data-accent="indigo" aria-label="Indigo"><span style="background:#5E5CE6"></span></button>
+                            <button type="button" class="swatch" role="radio" data-accent="amber" aria-label="Amber"><span style="background:#FF9F0A"></span></button>
+                            <button type="button" class="swatch" role="radio" data-accent="rose" aria-label="Rose"><span style="background:#FF375F"></span></button>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label for="s-uiScale">Interface size</label>
+                        <select id="s-uiScale" name="uiScale" data-type="number">
+                            <option value="0.85">85%</option>
+                            <option value="1">100%</option>
+                            <option value="1.25">125%</option>
+                            <option value="1.5">150%</option>
+                        </select>
+                    </div>
+                    <label class="field"><span>High contrast</span><input type="checkbox" role="switch" name="highContrast"></label>
+                    <div class="field">
+                        <label for="s-reducedMotion">Reduce motion</label>
+                        <select id="s-reducedMotion" name="reducedMotion">
+                            <option value="system">System</option>
+                            <option value="on">Always</option>
+                            <option value="off">Never</option>
+                        </select>
+                    </div>
+                    <label class="field"><span>Simple mode</span><input type="checkbox" role="switch" name="simpleMode"></label>
+                    <div class="field">
+                        <label for="s-autoHideMs">Auto-hide controls</label>
+                        <select id="s-autoHideMs" name="autoHideMs" data-type="number">
+                            <option value="2000">2 seconds</option>
+                            <option value="3000">3 seconds</option>
+                            <option value="5000">5 seconds</option>
+                            <option value="0">Never</option>
+                        </select>
+                    </div>
+                    <label class="field"><span>Stats for nerds</span><input type="checkbox" role="switch" name="showStats"></label>
+                    <label class="field"><span>On-page Play button</span><input type="checkbox" role="switch" name="quickLaunchBadge"></label>
+                </fieldset>
+                <fieldset>
+                    <legend>Playback</legend>
+                    <div class="field">
+                        <label for="s-autoResume">Resume where I left off</label>
+                        <select id="s-autoResume" name="autoResume">
+                            <option value="ask">Ask</option>
+                            <option value="always">Always</option>
+                            <option value="off">Off</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-defaultSpeed">Default speed</label>
+                        <select id="s-defaultSpeed" name="defaultSpeed" data-type="number">
+                            <option value="0.25">0.25×</option>
+                            <option value="0.5">0.5×</option>
+                            <option value="0.75">0.75×</option>
+                            <option value="1">1.0×</option>
+                            <option value="1.25">1.25×</option>
+                            <option value="1.5">1.5×</option>
+                            <option value="1.75">1.75×</option>
+                            <option value="2">2.0×</option>
+                            <option value="2.5">2.5×</option>
+                            <option value="3">3.0×</option>
+                            <option value="4">4.0×</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-qualityCap">Resolution cap</label>
+                        <select id="s-qualityCap" name="qualityCap" data-type="number">
+                            <option value="0">No limit</option>
+                            <option value="2160">2160p</option>
+                            <option value="1440">1440p</option>
+                            <option value="1080">1080p</option>
+                            <option value="720">720p</option>
+                            <option value="480">480p</option>
+                            <option value="360">360p</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-seekStep">Seek step</label>
+                        <select id="s-seekStep" name="seekStep" data-type="number">
+                            <option value="5">5 s</option>
+                            <option value="10">10 s</option>
+                            <option value="15">15 s</option>
+                            <option value="30">30 s</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-skipSeconds">Skip intro button</label>
+                        <select id="s-skipSeconds" name="skipSeconds" data-type="number">
+                            <option value="30">+30 s</option>
+                            <option value="60">+60 s</option>
+                            <option value="85">+85 s</option>
+                            <option value="90">+90 s</option>
+                        </select>
+                    </div>
+                    <label class="field"><span>Smart skip black &amp; silence</span><input type="checkbox" role="switch" name="smartSkip"></label>
+                    <label class="field"><span>Full screen on first tap</span><input type="checkbox" role="switch" name="autoFullscreen"></label>
+                    <label class="field"><span>Touch gestures</span><input type="checkbox" role="switch" name="gestures.enabled"></label>
+                </fieldset>
+                <fieldset>
+                    <legend>Engine</legend>
+                    <div class="field">
+                        <label for="s-maxBufferSec">Pre-buffer ahead</label>
+                        <select id="s-maxBufferSec" name="maxBufferSec" data-type="number">
+                            <option value="60">1 min (data saver)</option>
+                            <option value="300">5 min</option>
+                            <option value="1800">30 min</option>
+                            <option value="86400">Whole video</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-cacheSizeMB">Cache per tab</label>
+                        <select id="s-cacheSizeMB" name="cacheSizeMB" data-type="number">
+                            <option value="300">300 MB</option>
+                            <option value="1000">1 GB</option>
+                            <option value="2048">2 GB</option>
+                            <option value="5120">5 GB</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-maxWorkers">Parallel downloads</label>
+                        <select id="s-maxWorkers" name="maxWorkers" data-type="number">
+                            <option value="2">2 (battery saver)</option>
+                            <option value="4">4</option>
+                            <option value="6">6</option>
+                            <option value="8">8 (fastest)</option>
+                        </select>
+                    </div>
+                    <label class="field"><span>Range accelerator</span><input type="checkbox" role="switch" name="rangeAccel"></label>
+                    <div class="field">
+                        <label for="s-dvrMinutes">Live rewind (DVR)</label>
+                        <select id="s-dvrMinutes" name="dvrMinutes" data-type="number">
+                            <option value="0">Off</option>
+                            <option value="10">10 min</option>
+                            <option value="30">30 min</option>
+                            <option value="60">60 min</option>
+                            <option value="120">2 hours</option>
+                        </select>
+                    </div>
+                </fieldset>
+                <button type="button" id="reset-settings" class="btn btn-quiet small">Reset all settings</button>
+            </form>
+        </details>
+        <footer class="foot muted"><span id="version" class="num">v2.0</span></footer>
+    </div>
+    <script src="../common/shared.js"></script>
+    <script src="js/popup.js"></script>
+</body>
+
+</html>
