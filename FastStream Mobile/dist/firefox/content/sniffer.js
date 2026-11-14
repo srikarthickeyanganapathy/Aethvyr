@@ -155,6 +155,8 @@
                 if (type) reportStream({ url, type, method: 'dom_scan' });
             }
         }
+        // A player element may have appeared/resized: re-evaluate the quick-launch pill.
+        if (badge.state.count) renderBadge();
     }
 
     function scheduleScan() {
@@ -229,136 +231,464 @@
     }
 
     // ------------------------------------------------------------------
-    // 5. Bridge (top frame only)
+    // 5. In-place player mount
+    //    The player is an extension page (player/player.html) shown in an <iframe> placed
+    //    exactly over the site's own <video>: it is inserted into the site's player container
+    //    (so it scrolls, resizes and stacks with it) and re-synced on every layout change. The
+    //    original video is paused, muted and hidden; its controls are covered. When no usable
+    //    <video> exists in this frame the iframe covers the viewport instead ("page" mode).
     // ------------------------------------------------------------------
-    const bridge = {
-        playerPort: null,     // MessagePort to MAIN-world player
-        enginePort: null,     // runtime port to background
-        sessionId: null,
-        streamId: null,
-        closed: true,
-        reconnects: 0,
-        storageListener: null
+    const mount = {
+        frame: null, session: null, video: null, mode: null, prevMode: null,
+        videoStyle: null, timer: null, ro: null, rect: null, dragStart: null, pageLock: null
     };
+    const FRAME_Z = '2147483647';
 
-    async function readSettings() {
-        const res = await api.storage.local.get(S.SETTINGS_KEY);
-        return S.mergeSettings(res[S.SETTINGS_KEY]);
+    function pickVideo(streamUrl) {
+        let best = null;
+        let bestScore = 0;
+        for (const v of collectMedia(document, [])) {
+            if (v.tagName !== 'VIDEO') continue;
+            const r = v.getBoundingClientRect();
+            if (r.width < 120 || r.height < 68) continue;
+            let score = r.width * r.height;
+            if (!v.paused) score *= 2;
+            if (streamUrl && (v.currentSrc === streamUrl || v.src === streamUrl)) score *= 4;
+            if (score > bestScore) { bestScore = score; best = v; }
+        }
+        return best;
     }
 
-    function toPlayer(msg, transfer) {
-        if (!bridge.playerPort) return;
-        try { bridge.playerPort.postMessage(msg, transfer || []); } catch (_) { /* closed */ }
+    /** Outermost ancestor with (almost) the same box as the video = the site's player container. */
+    function playerContainer(video) {
+        const vr = video.getBoundingClientRect();
+        const same = (r) => Math.abs(r.left - vr.left) < 4 && Math.abs(r.top - vr.top) < 4 &&
+            Math.abs(r.width - vr.width) < 4 && Math.abs(r.height - vr.height) < 4;
+        let container = null;
+        let node = video.parentNode;
+        while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement) {
+            if (!same(node.getBoundingClientRect())) break;
+            container = node;
+            node = node.parentNode;
+        }
+        return container || video.parentNode;
     }
 
-    function connectEngine(resumed) {
-        if (bridge.closed) return;
-        let port;
-        try {
-            port = api.runtime.connect({ name: 'faststream-player' });
-        } catch (err) {
-            toPlayer({ type: 'FATAL', error: 'Extension was reloaded. Close the player and reload the page.' });
+    function setFrameStyle(css) {
+        const f = mount.frame;
+        if (!f) return;
+        f.style.cssText = `all: initial; display: block; border: 0; margin: 0; padding: 0; background: #000; color-scheme: normal; z-index: ${FRAME_Z}; ${css}`;
+    }
+
+    /** Keep the iframe exactly on top of the original video (in its containing block). */
+    function syncInline() {
+        if (mount.mode !== 'inline' || !mount.frame) return;
+        const v = mount.video;
+        if (!v || !v.isConnected) {
+            // The site replaced its <video> (SPA re-render): follow the new one, else go full page.
+            const next = pickVideo(null);
+            if (next) { attachToVideo(next); return; }
+            setMode('page');
             return;
         }
-        bridge.enginePort = port;
-        port.onMessage.addListener((msg) => {
-            if (!msg) return;
-            bridge.reconnects = 0;
-            if (msg.data && (msg.data.kind === 'b64' || msg.data.kind === 'ab')) {
-                const buf = S.unpackBinary(msg.data);
-                toPlayer({ ...msg, data: buf }, buf ? [buf] : []);
-            } else {
-                toPlayer(msg);
-            }
-        });
-        port.onDisconnect.addListener(() => {
-            if (bridge.enginePort === port) bridge.enginePort = null;
-            if (bridge.closed) return;
-            // Service worker restarted / event page suspended: fail in-flight requests so the
-            // player retries them, then reconnect with the same session id (cache is reused).
-            toPlayer({ type: 'ENGINE_RESET' });
-            if (bridge.reconnects++ < 8) {
-                setTimeout(() => connectEngine(true), Math.min(4000, 250 * Math.pow(2, bridge.reconnects)));
-            } else {
-                toPlayer({ type: 'FATAL', error: 'Lost connection to the FastStream engine.' });
-            }
-        });
-        port.postMessage({ type: 'HELLO', sessionId: bridge.sessionId, streamId: bridge.streamId, resumed: !!resumed });
+        const vr = v.getBoundingClientRect();
+        if (vr.width < 2 || vr.height < 2) return; // temporarily hidden by the site: keep last box
+        const cb = mount.frame.offsetParent;
+        let left;
+        let top;
+        if (!cb || (cb === document.body && getComputedStyle(cb).position === 'static')) {
+            left = vr.left + scrollX;
+            top = vr.top + scrollY;
+        } else {
+            const cr = cb.getBoundingClientRect();
+            left = vr.left - cr.left - cb.clientLeft + cb.scrollLeft;
+            top = vr.top - cr.top - cb.clientTop + cb.scrollTop;
+        }
+        const key = `${left}|${top}|${vr.width}|${vr.height}`;
+        if (key === mount.rect) return;
+        mount.rect = key;
+        setFrameStyle(`position: absolute; left: ${left}px; top: ${top}px; width: ${vr.width}px; height: ${vr.height}px;`);
     }
 
-    async function onPlayerMessage(event) {
-        const msg = event.data;
-        if (!msg || typeof msg.type !== 'string') return;
-        switch (msg.type) {
-            case 'SETTINGS_GET':
-                toPlayer({ type: 'SETTINGS', reqId: msg.reqId, settings: await readSettings() });
-                return;
-            case 'SETTINGS_SET': {
-                const current = await readSettings();
-                const next = S.mergeSettings({ ...current, ...(msg.patch || {}) });
-                await api.storage.local.set({ [S.SETTINGS_KEY]: next });
-                return;
-            }
-            case 'STORE_GET': {
-                if (typeof msg.key !== 'string' || !msg.key.startsWith('fs_bm_')) return;
-                const res = await api.storage.local.get(msg.key);
-                toPlayer({ type: 'STORE_VALUE', reqId: msg.reqId, value: res[msg.key] ?? null });
-                return;
-            }
-            case 'STORE_SET':
-                // The port is reachable from page JS in principle: only the bookmark namespace,
-                // bounded size, so a hostile page cannot fill extension storage.
-                if (typeof msg.key !== 'string' || !/^fs_bm_[\w-]{1,64}$/.test(msg.key)) return;
-                if (JSON.stringify(msg.value || null).length > 64 * 1024) return;
-                await api.storage.local.set({ [msg.key]: msg.value });
-                return;
-            case 'CLOSE':
-                if (bridge.enginePort) bridge.enginePort.postMessage({ type: 'CLOSE' });
-                teardownBridge();
-                return;
-            default:
-                if (bridge.enginePort) {
-                    try { bridge.enginePort.postMessage(msg); } catch (_) { /* reconnecting */ }
-                } else if (msg.type === 'REQUEST') {
-                    toPlayer({ type: 'RESPONSE', reqId: msg.reqId, ok: false, status: 0, error: 'Engine reconnecting' });
-                }
+    function hideVideo(v) {
+        mount.videoStyle = { el: v, visibility: v.style.getPropertyValue('visibility'), priority: v.style.getPropertyPriority('visibility') };
+        v.style.setProperty('visibility', 'hidden', 'important');
+    }
+
+    function unhideVideo() {
+        const s = mount.videoStyle;
+        if (!s) return;
+        try {
+            if (s.visibility) s.el.style.setProperty('visibility', s.visibility, s.priority);
+            else s.el.style.removeProperty('visibility');
+        } catch (_) { /* detached */ }
+        mount.videoStyle = null;
+    }
+
+    function attachToVideo(video) {
+        unhideVideo();
+        mount.video = video;
+        const container = playerContainer(video);
+        if (container === video.parentNode) video.parentNode.insertBefore(mount.frame, video.nextSibling);
+        else container.appendChild(mount.frame);
+        hideVideo(video);
+        suspendElement(video);
+        if (mount.ro) mount.ro.disconnect();
+        mount.ro = new ResizeObserver(() => syncInline());
+        mount.ro.observe(video);
+        mount.rect = null;
+        syncInline();
+    }
+
+    function lockPage(on) {
+        if (on && !mount.pageLock) {
+            mount.pageLock = { overflow: document.documentElement.style.overflow, inert: document.body ? document.body.inert : false };
+            document.documentElement.style.overflow = 'hidden';
+            if (document.body && mount.frame.parentNode !== document.body) document.body.inert = true;
+        } else if (!on && mount.pageLock) {
+            document.documentElement.style.overflow = mount.pageLock.overflow;
+            if (document.body) document.body.inert = mount.pageLock.inert;
+            mount.pageLock = null;
         }
     }
 
-    function teardownBridge({ restore = true } = {}) {
-        bridge.closed = true;
-        if (bridge.storageListener) api.storage.onChanged.removeListener(bridge.storageListener);
-        bridge.storageListener = null;
-        try { bridge.playerPort && bridge.playerPort.close(); } catch (_) { /* ignore */ }
-        bridge.playerPort = null;
-        const port = bridge.enginePort;
-        bridge.enginePort = null;
-        if (port) setTimeout(() => { try { port.disconnect(); } catch (_) { /* ignore */ } }, 50);
-        if (restore) restoreMedia();
+    function miniRect(ratio) {
+        const w = Math.round(Math.min(360, innerWidth * 0.6));
+        const h = Math.round(w * (ratio || 9 / 16));
+        return { x: innerWidth - w - 16, y: innerHeight - h - 16, w, h };
     }
 
-    function attachBridge(message) {
-        if (!IS_TOP) return { ok: false, error: 'Bridge must run in the top frame' };
-        // Stream switch: media was just suspended for the new session, keep it suspended.
-        if (!bridge.closed) teardownBridge({ restore: false });
-        const channel = new MessageChannel();
-        bridge.playerPort = channel.port1;
-        bridge.sessionId = message.sessionId;
-        bridge.streamId = message.streamId;
-        bridge.closed = false;
-        bridge.reconnects = 0;
-        channel.port1.onmessage = onPlayerMessage;
-        bridge.storageListener = (changes, area) => {
-            if (area === 'local' && changes[S.SETTINGS_KEY]) {
-                toPlayer({ type: 'SETTINGS_CHANGED', settings: S.mergeSettings(changes[S.SETTINGS_KEY].newValue) });
-            }
-        };
-        api.storage.onChanged.addListener(bridge.storageListener);
-        // The MAIN-world boot function only accepts the port carrying its one-time nonce.
-        window.postMessage({ source: 'faststream-bridge', type: 'FS_BRIDGE_PORT', nonce: message.nonce }, '*', [channel.port2]);
-        connectEngine(false);
-        return { ok: true };
+    function clampRect(r) {
+        r.w = Math.min(Math.max(r.w, 200), innerWidth - 16);
+        r.h = Math.min(Math.max(r.h, 112), innerHeight - 16);
+        r.x = Math.min(Math.max(r.x, 8), innerWidth - r.w - 8);
+        r.y = Math.min(Math.max(r.y, 8), innerHeight - r.h - 8);
+        return r;
     }
+
+    function applyFloating() {
+        const r = mount.float;
+        setFrameStyle(`position: fixed; left: ${r.x}px; top: ${r.y}px; width: ${r.w}px; height: ${r.h}px; border-radius: 16px; overflow: hidden; box-shadow: 0 16px 40px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.3);`);
+    }
+
+    function setMode(mode, opts = {}) {
+        if (!mount.frame) return;
+        const prev = mount.mode;
+        if (prev === mode) return;
+        if (mode === 'mini' || mode === 'fill') mount.prevMode = prev;
+        mount.mode = mode;
+        mount.rect = null;
+        if (mode === 'inline') {
+            lockPage(false);
+            if (mount.video && mount.video.isConnected) attachToVideo(mount.video);
+            else setMode('page');
+            return;
+        }
+        if (mode === 'page' || mode === 'fill') {
+            if (mount.frame.parentNode !== document.documentElement) document.documentElement.appendChild(mount.frame);
+            setFrameStyle('position: fixed; inset: 0; width: 100vw; height: 100vh;');
+            lockPage(true);
+        } else if (mode === 'mini') {
+            lockPage(false);
+            if (mount.frame.parentNode !== document.documentElement) document.documentElement.appendChild(mount.frame);
+            mount.float = clampRect(mount.float || miniRect(opts.ratio));
+            applyFloating();
+        }
+    }
+
+    function unmountPlayer() {
+        if (!mount.frame) return;
+        if (mount.ro) mount.ro.disconnect();
+        clearInterval(mount.timer);
+        window.removeEventListener('resize', syncInline);
+        lockPage(false);
+        mount.frame.remove();
+        unhideVideo();
+        restoreMedia();
+        Object.assign(mount, { frame: null, session: null, video: null, mode: null, prevMode: null, ro: null, rect: null, timer: null, float: null });
+    }
+
+    function onLayoutMessage(e) {
+        const d = e.data;
+        if (!mount.frame || e.source !== mount.frame.contentWindow || !d || d.__faststream !== 'layout' || d.session !== mount.session) return;
+        switch (d.cmd) {
+            case 'close':
+                unmountPlayer();
+                break;
+            case 'mini':
+                setMode('mini', { ratio: d.ratio });
+                break;
+            case 'restore':
+            case 'unfill':
+                setMode(mount.prevMode && mount.prevMode !== 'mini' && mount.prevMode !== 'fill' ? mount.prevMode : (mount.video ? 'inline' : 'page'));
+                break;
+            case 'fill':
+                setMode('fill');
+                break;
+            case 'move-start':
+            case 'resize-start':
+                if (mount.mode === 'mini') mount.dragStart = { ...mount.float };
+                break;
+            case 'move':
+                if (mount.mode === 'mini' && mount.dragStart) {
+                    mount.float = clampRect({ ...mount.dragStart, x: mount.dragStart.x + (+d.dx || 0), y: mount.dragStart.y + (+d.dy || 0) });
+                    applyFloating();
+                }
+                break;
+            case 'resize':
+                if (mount.mode === 'mini' && mount.dragStart) {
+                    // Handle sits in the top-left corner: keep the bottom-right corner anchored.
+                    const s = mount.dragStart;
+                    const w = Math.min(Math.max(s.w - (+d.dx || 0), 200), innerWidth - 16);
+                    const h = Math.round(w * (s.h / s.w));
+                    mount.float = clampRect({ x: s.x + s.w - w, y: s.y + s.h - h, w, h });
+                    applyFloating();
+                }
+                break;
+            case 'move-end':
+            case 'resize-end':
+                mount.dragStart = null;
+                break;
+            default:
+                break;
+        }
+    }
+    window.addEventListener('message', onLayoutMessage);
+
+    function mountPlayer(message) {
+        const base = api.runtime.getURL('player/player.html');
+        if (typeof message.url !== 'string' || !message.url.startsWith(base)) return { ok: false, error: 'Bad player URL' };
+        if (mount.frame) unmountPlayer();
+        const video = message.forcePage ? null : pickVideo(message.streamUrl);
+        if (!video && !IS_TOP && !message.allowPageInFrame) return { ok: false, reason: 'no-video' };
+
+        suspendMedia();
+        const url = new URL(message.url);
+        if (video && Number.isFinite(video.currentTime) && video.currentTime > 1 && Number.isFinite(video.duration)) {
+            url.searchParams.set('t', String(Math.floor(video.currentTime)));
+        }
+        if (IS_TOP && document.title) url.searchParams.set('title', document.title.slice(0, 200));
+        url.searchParams.set('mode', video ? 'inline' : 'page');
+
+        const frame = document.createElement('iframe');
+        frame.src = url.href;
+        frame.title = 'FastStream player';
+        frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write');
+        frame.setAttribute('allowfullscreen', '');
+        mount.frame = frame;
+        mount.session = message.sessionId;
+        setFrameStyle('position: absolute; width: 0; height: 0;');
+        if (video) {
+            mount.mode = 'inline';
+            attachToVideo(video);
+        } else {
+            mount.mode = null;
+            setMode('page');
+        }
+        frame.addEventListener('load', () => { try { frame.focus(); } catch (_) { /* ignore */ } }, { once: true });
+        window.addEventListener('resize', syncInline);
+        mount.timer = setInterval(() => {
+            if (!mount.frame) return;
+            if (!mount.frame.isConnected) {
+                // The site's framework re-rendered its player and dropped our iframe: put it back.
+                // (Re-inserting reloads the player page; it resumes via the saved history.)
+                if (mount.mode === 'inline' && mount.video && mount.video.isConnected) attachToVideo(mount.video);
+                else { document.documentElement.appendChild(mount.frame); mount.rect = null; }
+            }
+            if (mount.mode === 'inline') syncInline();
+        }, 500);
+        return { ok: true, mode: video ? 'inline' : 'page' };
+    }
+
+    // ------------------------------------------------------------------
+    // 6. On-page "Play in FastStream" glass pill
+    //    Shown over the largest visible <video> of this frame (or bottom-right of the top
+    //    frame when no frame reports a <video>). Draggable, dismissible, keyboard accessible.
+    //    Closed shadow root: page CSS cannot restyle it, page JS cannot read it.
+    // ------------------------------------------------------------------
+    const badge = {
+        state: { count: 0, playerOpen: false, videoFrames: [], label: '' },
+        enabled: true,
+        dismissed: false,
+        host: null,
+        shadow: null,
+        offset: { x: 0, y: 0 },
+        target: null,
+        timer: null,
+        busy: false
+    };
+
+    const BADGE_CSS = `
+:host { all: initial; }
+.pill {
+  position: fixed; z-index: 2147483646; display: inline-flex; align-items: center; height: 44px; padding: 0 4px 0 0;
+  border-radius: 9999px; background: rgba(28, 28, 30, 0.78); color: #fff;
+  -webkit-backdrop-filter: blur(28px) saturate(190%); backdrop-filter: blur(28px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 16px 40px rgba(0, 0, 0, 0.55), 0 2px 10px rgba(0, 0, 0, 0.3);
+  font: 500 13px/1 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, system-ui, sans-serif;
+  letter-spacing: -0.01em; transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms; touch-action: none; user-select: none;
+}
+.pill[hidden] { display: none; }
+button { all: unset; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: inherit; height: 44px; border-radius: 9999px; }
+.play { gap: 8px; padding: 0 12px 0 14px; font-weight: 600; }
+.play:active { transform: scale(0.96); }
+.meta { color: rgba(235, 235, 245, 0.82); font-variant-numeric: tabular-nums; font-weight: 500; }
+.divider { width: 1px; height: 20px; background: rgba(255, 255, 255, 0.12); }
+.close { width: 36px; height: 36px; margin-left: 4px; }
+.close:hover, .play:hover { background: rgba(255, 255, 255, 0.10); }
+button:focus-visible { outline: 2px solid #0A84FF; outline-offset: 2px; }
+svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.bolt { color: #0A84FF; stroke: none; fill: currentColor; }
+@media (prefers-reduced-motion: reduce) { .pill { transition: none; } }
+`;
+
+    function largestVideo() {
+        let best = null;
+        let bestArea = 0;
+        for (const el of collectMedia(document, [])) {
+            if (el.tagName !== 'VIDEO') continue;
+            const r = el.getBoundingClientRect();
+            const visW = Math.min(r.right, innerWidth) - Math.max(r.left, 0);
+            const visH = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
+            if (visW < 160 || visH < 90) continue;
+            const area = visW * visH;
+            if (area > bestArea) { bestArea = area; best = el; }
+        }
+        return best;
+    }
+
+    function ensureBadge() {
+        if (badge.host || !document.documentElement) return;
+        const host = document.createElement('faststream-badge');
+        host.style.cssText = 'all: initial; position: fixed; top: 0; left: 0; width: 0; height: 0; z-index: 2147483646;';
+        const shadow = host.attachShadow({ mode: 'closed' });
+        shadow.innerHTML = `<style>${BADGE_CSS}</style>
+<div class="pill" role="group" aria-label="FastStream" hidden>
+  <button type="button" class="play" aria-label="Play this video in FastStream">
+    <svg class="bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4.5 13.2a.6.6 0 0 0 .5 1H11l-1 7.8 8.5-11.2a.6.6 0 0 0-.5-1H12z"/></svg>
+    <span class="label">FastStream</span><span class="meta" aria-hidden="true"></span>
+  </button>
+  <span class="divider" aria-hidden="true"></span>
+  <button type="button" class="close" aria-label="Hide the FastStream button on this page">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+  </button>
+</div>`;
+        badge.host = host;
+        badge.shadow = shadow;
+        const pill = shadow.querySelector('.pill');
+        const play = shadow.querySelector('.play');
+        let drag = null;
+        play.addEventListener('pointerdown', (e) => {
+            drag = { x: e.clientX, y: e.clientY, ox: badge.offset.x, oy: badge.offset.y, moved: false };
+            play.setPointerCapture(e.pointerId);
+        });
+        play.addEventListener('pointermove', (e) => {
+            if (!drag) return;
+            const dx = e.clientX - drag.x;
+            const dy = e.clientY - drag.y;
+            if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+            drag.moved = true;
+            badge.offset = { x: drag.ox + dx, y: drag.oy + dy };
+            positionBadge();
+        });
+        play.addEventListener('pointerup', () => { if (drag) setTimeout(() => { drag = null; }, 0); });
+        play.addEventListener('click', (e) => {
+            if (drag && drag.moved) { e.preventDefault(); return; }
+            launchFromBadge();
+        });
+        shadow.querySelector('.close').addEventListener('click', () => {
+            badge.dismissed = true;
+            renderBadge();
+        });
+        pill.addEventListener('keydown', (e) => { if (e.key === 'Escape') { badge.dismissed = true; renderBadge(); } });
+        document.documentElement.appendChild(host);
+    }
+
+    function positionBadge() {
+        if (!badge.shadow) return;
+        const pill = badge.shadow.querySelector('.pill');
+        if (pill.hidden) return;
+        const w = pill.offsetWidth || 220;
+        const h = pill.offsetHeight || 44;
+        let x;
+        let y;
+        if (badge.target && badge.target.isConnected) {
+            const r = badge.target.getBoundingClientRect();
+            x = Math.min(r.right, innerWidth) - w - 12;
+            y = Math.max(r.top, 0) + 12;
+        } else {
+            x = innerWidth - w - 16;
+            y = innerHeight - h - 16;
+        }
+        x = Math.min(Math.max(8, x + badge.offset.x), innerWidth - w - 8);
+        y = Math.min(Math.max(8, y + badge.offset.y), innerHeight - h - 8);
+        pill.style.left = `${Math.round(x)}px`;
+        pill.style.top = `${Math.round(y)}px`;
+    }
+
+    let rafPending = false;
+    function schedulePosition() {
+        if (rafPending) return;
+        rafPending = true;
+        requestAnimationFrame(() => { rafPending = false; positionBadge(); });
+    }
+
+    function renderBadge() {
+        const s = badge.state;
+        badge.target = largestVideo();
+        const fallbackTop = IS_TOP && !s.videoFrames.length;
+        const show = badge.enabled && !badge.dismissed && !s.playerOpen && s.count > 0 && (badge.target || fallbackTop);
+        if (!show) {
+            if (badge.shadow) badge.shadow.querySelector('.pill').hidden = true;
+            clearInterval(badge.timer);
+            badge.timer = null;
+            return;
+        }
+        ensureBadge();
+        if (!badge.shadow) return;
+        const pill = badge.shadow.querySelector('.pill');
+        badge.shadow.querySelector('.meta').textContent = s.label ? `• ${s.label}` : '';
+        badge.shadow.querySelector('.play').setAttribute('aria-label', `Play this video in FastStream${s.label ? `, ${s.label}` : ''}`);
+        pill.hidden = false;
+        positionBadge();
+        if (!badge.timer) badge.timer = setInterval(() => { badge.target = largestVideo() || badge.target; positionBadge(); }, 1000);
+    }
+
+    async function launchFromBadge() {
+        if (badge.busy) return;
+        badge.busy = true;
+        const label = badge.shadow.querySelector('.label');
+        label.textContent = 'Opening…';
+        try {
+            const res = await api.runtime.sendMessage({ action: 'LAUNCH_FROM_PAGE' });
+            if (!res || !res.ok) throw new Error((res && res.error) || 'Could not open the player');
+            label.textContent = 'FastStream';
+        } catch (err) {
+            label.textContent = 'Can\'t play here';
+            badge.shadow.querySelector('.play').title = String(err && err.message || err);
+            setTimeout(() => { label.textContent = 'FastStream'; }, 3000);
+        } finally {
+            badge.busy = false;
+        }
+    }
+
+    function loadBadgeSetting() {
+        api.storage.local.get(S.SETTINGS_KEY).then(res => {
+            badge.enabled = S.mergeSettings(res[S.SETTINGS_KEY]).quickLaunchBadge;
+            renderBadge();
+        }).catch(() => { });
+    }
+    loadBadgeSetting();
+    api.storage.onChanged.addListener((changes, area) => {
+        if (area === 'local' && changes[S.SETTINGS_KEY]) {
+            badge.enabled = S.mergeSettings(changes[S.SETTINGS_KEY].newValue).quickLaunchBadge;
+            renderBadge();
+        }
+    });
+    window.addEventListener('scroll', schedulePosition, { passive: true, capture: true });
+    window.addEventListener('resize', schedulePosition, { passive: true });
+    send({ action: 'GET_BADGE_STATE' });
 
     // ------------------------------------------------------------------
     // Engine -> frame commands
@@ -367,8 +697,8 @@
         if (!message || typeof message.action !== 'string') return false;
         switch (message.action) {
             case 'PING':
-                if (!IS_TOP) return false;
-                sendResponse({ ok: true });
+                // Lets the engine choose the frame that really shows the video.
+                sendResponse({ ok: true, top: IS_TOP, hasVideo: !!pickVideo(null) });
                 return false;
             case 'FETCH_PROXY':
                 proxyFetch(message, sendResponse);
@@ -382,7 +712,7 @@
                 suspendMedia();
                 return false;
             case 'RESTORE_MEDIA':
-                restoreMedia();
+                if (!mount.frame) restoreMedia();
                 return false;
             case 'RESCAN':
                 reportedUrls.clear();
@@ -390,9 +720,20 @@
                 videoReported = false;
                 scanMedia();
                 return false;
-            case 'BRIDGE_ATTACH':
-                if (!IS_TOP) return false;
-                sendResponse(attachBridge(message));
+            case 'MOUNT_PLAYER':
+                sendResponse(mountPlayer(message));
+                return false;
+            case 'UNMOUNT_PLAYER':
+                if (!message.sessionId || message.sessionId === mount.session) unmountPlayer();
+                return false;
+            case 'STREAMS_AVAILABLE':
+                badge.state = {
+                    count: message.count | 0,
+                    playerOpen: !!message.playerOpen,
+                    videoFrames: Array.isArray(message.videoFrames) ? message.videoFrames : [],
+                    label: String(message.label || '')
+                };
+                renderBadge();
                 return false;
             default:
                 return false;

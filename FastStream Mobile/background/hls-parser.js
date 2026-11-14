@@ -191,6 +191,8 @@ export function parseMedia(text, baseUrl) {
             if (byteRange) lastRangeEnd.set(uri, byteRange.offset + byteRange.length);
         }
         const seq = mediaSequence + segments.length;
+        // A segment preceded by EXT-X-DISCONTINUITY starts the next discontinuity number.
+        if (pendingDiscontinuity) discontinuitySeq++;
         segments.push({
             index: segments.length,
             seq,
@@ -206,7 +208,6 @@ export function parseMedia(text, baseUrl) {
             discontinuitySeq: discontinuitySeq,
             programDateTime: pendingPdt
         });
-        if (pendingDiscontinuity) discontinuitySeq++;
         start += pendingDuration;
         pendingDuration = null;
         pendingTitle = '';
@@ -224,8 +225,59 @@ export function parseMedia(text, baseUrl) {
         playlistType,
         live: !endList && playlistType !== 'VOD',
         totalDuration: start,
-        encrypted
+        encrypted,
+        lowLatency: /#EXT-X-PART[:-]/.test(text)
     };
+}
+
+function byteRangeAttr(br) {
+    return `${br.length}@${br.offset}`;
+}
+
+/**
+ * Serialize parsed segments back into a live media playlist. Used by the live DVR to expose
+ * retained (cached) segments that already slid out of the origin's playlist window.
+ * Segment URIs are absolute, so the output does not depend on its own URL.
+ */
+export function serializeMedia(segments, { targetDuration = 0 } = {}) {
+    if (!segments.length) return '#EXTM3U\n';
+    const first = segments[0];
+    const maxDur = Math.ceil(Math.max(targetDuration, ...segments.map(s => s.duration)));
+    const lines = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:6',
+        `#EXT-X-TARGETDURATION:${maxDur}`,
+        `#EXT-X-MEDIA-SEQUENCE:${first.seq}`,
+        `#EXT-X-DISCONTINUITY-SEQUENCE:${Math.max(0, first.discontinuitySeq - (first.discontinuity ? 1 : 0))}`
+    ];
+    let lastKey = null;
+    let lastMap = null;
+    for (const seg of segments) {
+        if (seg.discontinuity) lines.push('#EXT-X-DISCONTINUITY');
+        const keySig = seg.key ? JSON.stringify(seg.key) : 'none';
+        if (keySig !== lastKey) {
+            if (seg.key) {
+                let tag = `#EXT-X-KEY:METHOD=${seg.key.method}`;
+                if (seg.key.uri) tag += `,URI="${seg.key.uri}"`;
+                if (seg.key.iv) tag += `,IV=${seg.key.iv}`;
+                if (seg.key.keyFormat && seg.key.keyFormat !== 'identity') tag += `,KEYFORMAT="${seg.key.keyFormat}"`;
+                lines.push(tag);
+            } else if (lastKey !== null) {
+                lines.push('#EXT-X-KEY:METHOD=NONE');
+            }
+            lastKey = keySig;
+        }
+        const mapSig = seg.map ? JSON.stringify(seg.map) : null;
+        if (mapSig && mapSig !== lastMap) {
+            lines.push(`#EXT-X-MAP:URI="${seg.map.uri}"${seg.map.byteRange ? `,BYTERANGE="${byteRangeAttr(seg.map.byteRange)}"` : ''}`);
+            lastMap = mapSig;
+        }
+        if (seg.programDateTime) lines.push(`#EXT-X-PROGRAM-DATE-TIME:${new Date(seg.programDateTime).toISOString()}`);
+        if (seg.byteRange) lines.push(`#EXT-X-BYTERANGE:${byteRangeAttr(seg.byteRange)}`);
+        lines.push(`#EXTINF:${seg.duration.toFixed(3)},`);
+        lines.push(seg.uri);
+    }
+    return lines.join('\n') + '\n';
 }
 
 /** Parse either playlist flavour. Returns null when the text is not an M3U8. */

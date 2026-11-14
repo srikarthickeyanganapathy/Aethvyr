@@ -46,6 +46,20 @@
       "match_about_blank": true
     }
   ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "player/player.html",
+        "player/player.js",
+        "player/player-ui.js",
+        "lib/shaka-player.compiled.js",
+        "common/shared.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
   "declarative_net_request": {
     "rule_resources": [
       {

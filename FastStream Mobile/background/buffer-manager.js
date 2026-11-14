@@ -225,10 +225,13 @@ export class BufferManager {
                 };
                 req.onerror = () => reject(req.error);
             });
-            // Pass 1: already-played segments and segments of other (stale) streams.
-            await collect(rec => rec.served || rec.streamId !== this.streamId);
-            // Pass 2: anything not inside the look-ahead window.
+            // Pass 1: segments of other (stale) streams, and played ones outside the protected
+            // set (look-ahead window + live DVR history).
+            await collect(rec => rec.streamId !== this.streamId || (rec.served && !this.isProtected(rec.segmentId)));
+            // Pass 2: anything not protected.
             if (freed < bytesNeeded) await collect(rec => !this.isProtected(rec.segmentId));
+            // Pass 3: cap reached with everything protected - shrink the oldest played DVR history.
+            if (freed < bytesNeeded) await collect(rec => rec.served);
             if (!victims.length) return 0;
             const tx = db.transaction([META, DATA], 'readwrite');
             for (const v of victims) {

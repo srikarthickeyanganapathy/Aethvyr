@@ -129,23 +129,48 @@ async function updateIcon(tabId) {
     } catch (_) { /* tab closed */ }
 }
 
+// ----------------------------------------------------------------------------
+// On-page quick-launch badge: tell every frame how many playable streams exist,
+// which frames own a <video>, and whether the player is already open.
+// ----------------------------------------------------------------------------
+const notifyTimers = new Map();
+function notifyFrames(tabId) {
+    clearTimeout(notifyTimers.get(tabId));
+    notifyTimers.set(tabId, setTimeout(() => {
+        notifyTimers.delete(tabId);
+        const tab = tabs.get(tabId);
+        const list = tab ? visibleStreams(tab).filter(s => !s.isAd) : [];
+        const best = list[0];
+        api.tabs.sendMessage(tabId, {
+            action: 'STREAMS_AVAILABLE',
+            count: list.length,
+            playerOpen: !!(tab && tab.playerSessionId && sessions.has(tab.playerSessionId)),
+            videoFrames: tab ? [...tab.videoFrames] : [],
+            label: best && best.probe && best.probe.maxHeight ? `${best.probe.maxHeight}p` : (best ? ({ hls: 'HLS', dash: 'DASH', progressive: 'MP4' }[best.type]) : '')
+        }).catch(() => { /* no content script (restricted page) */ });
+    }, 300));
+}
+
 async function handleDetection(tabId, frameId, frameUrl, payload) {
-    if (tabId === undefined || tabId < 0 || !payload) return;
+    if (tabId === undefined || tabId < 0 || !payload) return null;
     const tab = await getTab(tabId);
 
     if (payload.type === 'mse') {
         tab.mseFrames.set(frameId, Date.now());
-        return;
+        return null;
     }
     if (payload.type === 'video-present') {
-        tab.videoFrames.add(frameId);
-        return;
+        if (!tab.videoFrames.has(frameId)) {
+            tab.videoFrames.add(frameId);
+            notifyFrames(tabId);
+        }
+        return null;
     }
 
     const url = S.normalizeUrl(payload.url, frameUrl);
-    if (!url) return;
+    if (!url || !/^https?:/i.test(url)) return null;
     const type = S.classifyStream(url, payload.mime) || payload.type;
-    if (!['hls', 'dash', 'progressive'].includes(type)) return;
+    if (!['hls', 'dash', 'progressive'].includes(type)) return null;
 
     const existingId = tab.byUrl.get(url);
     if (existingId) {
@@ -156,7 +181,8 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
             existing.frameUrl = frameUrl || existing.frameUrl;
             persistTab(tabId);
         }
-        return;
+        if (existing && payload.method === 'manual') tab.children.delete(url);
+        return existing || null;
     }
 
     if (tab.streams.size >= MAX_STREAMS_PER_TAB) {
@@ -181,9 +207,25 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
     };
     tab.streams.set(stream.id, stream);
     tab.byUrl.set(url, stream.id);
+    if (payload.method === 'manual') tab.children.delete(url);
     persistTab(tabId);
     updateIcon(tabId);
+    notifyFrames(tabId);
     if (type !== 'progressive') probeStream(tab, stream);
+    return stream;
+}
+
+/** Sniff the first bytes of an extension-less URL to decide hls / dash / progressive. */
+async function detectTypeByContent(tabId, url, frameUrl) {
+    const transport = makeTransport(tabId, () => ({ frameId: 0, frameUrl }));
+    const res = await transport(url, { method: 'GET', headers: { Range: 'bytes=0-2047' } });
+    if (res.status >= 400) throw new Error(`The server answered HTTP ${res.status}`);
+    const ct = (res.headers['content-type'] || '').toLowerCase();
+    const head = new TextDecoder().decode(res.data.slice(0, 2048)).trimStart();
+    if (/mpegurl/.test(ct) || head.startsWith('#EXTM3U')) return 'hls';
+    if (/dash\+xml/.test(ct) || /<MPD[\s>]/i.test(head)) return 'dash';
+    if (/^(video|audio)\//.test(ct) || /application\/octet-stream/.test(ct)) return 'progressive';
+    throw new Error('That address does not look like a video stream (expected .m3u8, .mpd or a media file).');
 }
 
 // ============================================================================
@@ -255,7 +297,14 @@ function proxyViaFrame(tabId, frameId, url, { method = 'GET', headers = {}, sign
     });
 }
 
-/** Session-scoped DNR rule so direct (extension-initiated) fetches carry the page Referer/Origin. */
+const EXT_HOST = (() => { try { return new URL(api.runtime.getURL('')).hostname; } catch (_) { return ''; } })();
+
+/**
+ * Session-scoped DNR rules so requests made by the extension itself carry the site's
+ * Referer/Origin: direct fallback fetches from the engine (no tab) and media requests the
+ * player page makes (e.g. a progressive MP4 in <video src>, initiated by the extension origin).
+ * Many CDNs reject hot-linked media without the right Referer.
+ */
 async function ensureRefererRule(url, frameUrl) {
     let host;
     let origin;
@@ -268,38 +317,48 @@ async function ensureRefererRule(url, frameUrl) {
     if (!origin || origin === 'null' || dnrRulesByHost.has(host)) return;
     const captured = refererByHost.get(host);
     const referer = (captured && captured.referer) || frameUrl;
-    const id = nextDnrRuleId++;
+    const action = {
+        type: 'modifyHeaders',
+        requestHeaders: [
+            { header: 'Referer', operation: 'set', value: referer },
+            { header: 'Origin', operation: 'set', value: (captured && captured.origin) || origin }
+        ]
+    };
+    const resourceTypes = ['xmlhttprequest', 'media', 'other'];
+    const id = nextDnrRuleId;
+    nextDnrRuleId += 2;
     dnrRulesByHost.set(host, id);
+    const addRules = [{ id, priority: 2, action, condition: { requestDomains: [host], tabIds: [api.tabs.TAB_ID_NONE], resourceTypes } }];
+    if (EXT_HOST) addRules.push({ id: id + 1, priority: 2, action, condition: { requestDomains: [host], initiatorDomains: [EXT_HOST], resourceTypes } });
     try {
-        await api.declarativeNetRequest.updateSessionRules({
-            removeRuleIds: [id],
-            addRules: [{
-                id,
-                priority: 2,
-                action: {
-                    type: 'modifyHeaders',
-                    requestHeaders: [
-                        { header: 'Referer', operation: 'set', value: referer },
-                        { header: 'Origin', operation: 'set', value: (captured && captured.origin) || origin }
-                    ]
-                },
-                condition: {
-                    requestDomains: [host],
-                    tabIds: [api.tabs.TAB_ID_NONE],
-                    resourceTypes: ['xmlhttprequest', 'other']
-                }
-            }]
-        });
+        await api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id, id + 1], addRules });
     } catch (e) {
-        dnrRulesByHost.delete(host);
-        console.warn('[Engine] Could not add Referer rule:', e && e.message);
+        // Retry without the initiator rule (older engines reject extension initiators).
+        try {
+            await api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id, id + 1], addRules: addRules.slice(0, 1) });
+        } catch (e2) {
+            dnrRulesByHost.delete(host);
+            console.warn('[Engine] Could not add Referer rule:', e2 && e2.message);
+        }
+    }
+}
+
+/** Custom request headers the site's own player sent to this host (auth tokens etc.). */
+function capturedHeaders(url) {
+    try {
+        const c = refererByHost.get(new URL(url).hostname);
+        return (c && c.headers) || {};
+    } catch (_) {
+        return {};
     }
 }
 
 async function directFetch(url, { method = 'GET', headers = {}, signal }, frameUrl) {
     await ensureRefererRule(url, frameUrl);
     const h = {};
-    if (headers.Range || headers.range) h.Range = headers.Range || headers.range;
+    for (const [k, v] of Object.entries(headers)) {
+        if (!/^(referer|origin|cookie|host)$/i.test(k)) h[k] = v;
+    }
     const res = await fetch(url, { method, headers: h, credentials: 'include', signal, cache: 'no-store' });
     const data = method === 'HEAD' ? new ArrayBuffer(0) : await res.arrayBuffer();
     const outHeaders = {};
@@ -312,6 +371,8 @@ function makeTransport(tabId, getStream) {
         const tab = await getTab(tabId);
         const stream = getStream();
         const frameId = pickFrameId(tab, stream);
+        // Replay auth/token headers the site's player used for this host (Range stays ours).
+        opts = { ...opts, headers: { ...capturedHeaders(url), ...(opts.headers || {}) } };
         try {
             return await proxyViaFrame(tabId, frameId, url, opts);
         } catch (err) {
@@ -381,6 +442,7 @@ async function probeStream(tab, stream) {
         tab.probing--;
         persistTab(tab.tabId);
         updateIcon(tab.tabId);
+        notifyFrames(tab.tabId);
     }
 }
 
@@ -388,18 +450,23 @@ async function probeStream(tab, stream) {
 // WEBREQUEST: header capture + network-level detection (sees worker/native requests too)
 // ============================================================================
 function rememberReferer(details) {
-    if (details.tabId < 0) return;
-    const type = S.classifyStream(details.url);
-    if (type !== 'hls' && type !== 'dash') return;
+    // Our own player iframe's requests come from the extension origin: never learn from those.
+    if (details.tabId < 0 || (details.initiator && details.initiator.includes(EXT_HOST)) || (details.originUrl && details.originUrl.includes(EXT_HOST))) return;
+    // Any data request may be an extension-less manifest; the per-host map is capped at 200.
+    if (!S.classifyStream(details.url) && !['xmlhttprequest', 'media', 'other'].includes(details.type)) return;
     let host;
     try { host = new URL(details.url).hostname; } catch (_) { return; }
-    const info = {};
+    const info = { headers: {} };
+    // Standard / browser-controlled headers are left alone; anything else (Authorization,
+    // X-Playback-Session-Id, custom token headers...) is replayed on our requests to this host.
+    const STANDARD = /^(host|cookie|origin|referer|user-agent|accept(-.*)?|connection|content-(length|type)|sec-.*|range|pragma|cache-control|if-.*|dnt|upgrade-insecure-requests|priority|te|keep-alive|proxy-.*)$/i;
     for (const h of details.requestHeaders || []) {
         const n = h.name.toLowerCase();
         if (n === 'referer') info.referer = h.value;
-        if (n === 'origin') info.origin = h.value;
+        else if (n === 'origin') info.origin = h.value;
+        else if (!STANDARD.test(n) && h.value && h.value.length < 4096) info.headers[h.name] = h.value;
     }
-    if (info.referer || info.origin) {
+    if (info.referer || info.origin || Object.keys(info.headers).length) {
         refererByHost.set(host, info);
         if (refererByHost.size > 200) refererByHost.delete(refererByHost.keys().next().value);
     }
@@ -474,7 +541,9 @@ class Session {
             cachedRanges: this.downloader.cachedRanges(),
             bufferAhead: this.telemetry.bufferAhead,
             currentTime: this.telemetry.currentTime,
-            abrAuto: this.abrAuto
+            abrAuto: this.abrAuto,
+            recording: this.recording ? this.recording.startedAt : 0,
+            exporting: !!this.exportJob
         };
     }
 
@@ -513,8 +582,11 @@ async function endSession(session, { clearCache = true, restoreMedia = true } = 
         tab.playerSessionId = null;
         persistTab(session.tabId);
     }
+    // Remove the player iframe if it is still mounted (closed from the popup, tab navigation...).
+    api.tabs.sendMessage(session.tabId, { action: 'UNMOUNT_PLAYER', sessionId: session.id }).catch(() => { });
     if (restoreMedia) api.tabs.sendMessage(session.tabId, { action: 'RESTORE_MEDIA' }).catch(() => { });
     try { session.port && session.port.disconnect(); } catch (_) { /* already closed */ }
+    notifyFrames(session.tabId);
 }
 
 async function handleRequest(session, msg) {
@@ -567,7 +639,20 @@ function fileBaseName(stream) {
     }
 }
 
-async function runExport(session) {
+/** Live recording: remember the media sequence at "record" time; export from there on stop. */
+function startRecording(session) {
+    const main = session.downloader.mainPlaylist();
+    if (!main || !main.parsed.live) {
+        session.post({ type: 'EXPORT_ERROR', error: 'Recording is for live streams. Use Export for on-demand video.' });
+        return;
+    }
+    const segs = main.parsed.segments;
+    const cur = segs[Math.max(0, main.cursor)] || segs[segs.length - 1];
+    session.recording = { fromSeq: cur ? cur.seq : main.parsed.mediaSequence, startedAt: Date.now() };
+    session.post({ type: 'RECORD_STARTED', startedAt: session.recording.startedAt });
+}
+
+async function runExport(session, opts = {}) {
     if (session.exportJob) return;
     const controller = new AbortController();
     const jobId = crypto.randomUUID();
@@ -587,7 +672,10 @@ async function runExport(session) {
             const audio = d.activePlaylists().find(p => p.role === 'audio' && p !== main);
             if (audio) parts.push(audio);
             for (let i = 0; i < parts.length; i++) {
-                await exportHlsPlaylist(session, parts[i], post, signal, `${base}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`, i, parts.length);
+                let segs = d.exportSegments(parts[i]);
+                if (opts.fromSeq !== undefined) segs = segs.filter(s => s.seq >= opts.fromSeq);
+                const suffix = `${opts.fromSeq !== undefined ? '-recording' : ''}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`;
+                await exportHlsPlaylist(session, parts[i], segs, post, signal, `${base}${suffix}`, i, parts.length);
             }
         } else {
             throw new Error('Export supports HLS and direct media files. DASH export is not available.');
@@ -600,9 +688,8 @@ async function runExport(session) {
     }
 }
 
-async function exportHlsPlaylist(session, playlist, post, signal, name, fileIndex, fileCount) {
-    const segs = playlist.parsed.segments;
-    if (!segs.length) throw new Error('Playlist has no segments');
+async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fileIndex, fileCount) {
+    if (!segs.length) throw new Error('Nothing to save yet');
     if (segs.some(s => s.key && s.key.method !== 'AES-128')) {
         throw new Error('This stream uses SAMPLE-AES/DRM encryption and cannot be exported.');
     }
@@ -670,22 +757,46 @@ async function exportProgressive(session, post, signal, name) {
     if (m) ext = m[1].toLowerCase();
     const mime = { webm: 'video/webm', mkv: 'video/x-matroska', mov: 'video/quicktime', ogv: 'video/ogg' }[ext] || 'video/mp4';
     post({ type: 'EXPORT_BEGIN', fileIndex: 0, fileCount: 1, filename: `${name}.${ext}`, mime });
-    let offset = 0;
-    let total = null;
-    for (;;) {
-        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const fetchChunk = async (offset) => {
         const res = await transport(url, { method: 'GET', headers: { Range: `bytes=${offset}-${offset + CHUNK - 1}` }, signal });
         if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
-        post({ type: 'EXPORT_CHUNK', fileIndex: 0, data: S.packBinary(res.data) });
-        offset += res.data.byteLength;
-        const cr = res.headers['content-range'];
-        if (cr) {
-            const t = parseInt(cr.split('/')[1], 10);
-            if (Number.isFinite(t)) total = t;
+        return res;
+    };
+    const first = await fetchChunk(0);
+    post({ type: 'EXPORT_CHUNK', fileIndex: 0, data: S.packBinary(first.data) });
+    let offset = first.data.byteLength;
+    const cr = first.headers['content-range'];
+    const total = cr ? parseInt(cr.split('/')[1], 10) : NaN;
+    post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total: Number.isFinite(total) ? total : offset, bytes: offset });
+    // 200 = server ignored Range and sent the whole file; short read = end of file.
+    if (first.status === 200 || first.data.byteLength < CHUNK) {
+        post({ type: 'EXPORT_FILE_DONE', fileIndex: 0 });
+        return;
+    }
+    if (Number.isFinite(total)) {
+        // Known size: 4 chunks in flight (range accelerator), emitted strictly in order.
+        const pending = new Map();
+        const offsets = [];
+        for (let o = offset; o < total; o += CHUNK) offsets.push(o);
+        for (let i = 0; i < offsets.length; i++) {
+            for (let k = i; k < Math.min(i + 4, offsets.length); k++) if (!pending.has(k)) pending.set(k, fetchChunk(offsets[k]));
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            const res = await pending.get(i);
+            pending.delete(i);
+            post({ type: 'EXPORT_CHUNK', fileIndex: 0, data: S.packBinary(res.data) });
+            offset += res.data.byteLength;
+            post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total, bytes: offset });
         }
-        post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total: total || offset, bytes: offset });
-        // 200 = server ignored Range and sent the whole file; short read = end of file.
-        if (res.status === 200 || res.data.byteLength < CHUNK || (total !== null && offset >= total)) break;
+    } else {
+        // Content-Range not readable: sequential until a short chunk.
+        for (;;) {
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            const res = await fetchChunk(offset);
+            post({ type: 'EXPORT_CHUNK', fileIndex: 0, data: S.packBinary(res.data) });
+            offset += res.data.byteLength;
+            post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total: offset, bytes: offset });
+            if (res.status === 200 || res.data.byteLength < CHUNK) break;
+        }
     }
     post({ type: 'EXPORT_FILE_DONE', fileIndex: 0 });
 }
@@ -719,6 +830,9 @@ api.runtime.onConnect.addListener((port) => {
             }
             clearTimeout(session.disconnectTimer);
             session.port = port;
+            // Direct media files are loaded by the player page's <video>: give those requests
+            // the site's Referer/Origin so hot-link protection accepts them.
+            if (session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
             session.post({ type: 'INIT', sessionId: session.id, stream: session.stream, resumed: !!msg.resumed });
             return;
         }
@@ -771,6 +885,15 @@ api.runtime.onConnect.addListener((port) => {
             case 'EXPORT_START':
                 runExport(session);
                 break;
+            case 'RECORD_START':
+                startRecording(session);
+                break;
+            case 'RECORD_STOP': {
+                const rec = session.recording;
+                session.recording = null;
+                if (rec) runExport(session, { fromSeq: rec.fromSeq });
+                break;
+            }
             case 'EXPORT_CANCEL':
                 if (session.exportJob) session.exportJob.controller.abort();
                 break;
@@ -796,52 +919,103 @@ api.runtime.onConnect.addListener((port) => {
 // ============================================================================
 // LAUNCH
 // ============================================================================
-async function launchPlayer(tabId, streamId) {
+/** Make sure the content script runs in a frame (frames opened before install/update lack it). */
+async function pingFrame(tabId, frameId) {
+    let res = await api.tabs.sendMessage(tabId, { action: 'PING' }, { frameId }).catch(() => null);
+    if (!res) {
+        try {
+            await api.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: ['common/shared.js', 'content/sniffer.js'] });
+            res = await api.tabs.sendMessage(tabId, { action: 'PING' }, { frameId }).catch(() => null);
+        } catch (_) {
+            res = null; // restricted frame (browser pages, store, PDF viewer)
+        }
+    }
+    return res;
+}
+
+/**
+ * Launch: the player is an extension page mounted as an iframe over the site's own <video>.
+ * Frame choice: the frame the user clicked in (badge) -> the frame that requested the stream
+ * -> any frame known to contain a <video> -> the top frame in full-page mode.
+ */
+async function launchPlayer(tabId, streamId, preferFrameId) {
     const tab = await getTab(tabId);
     const stream = tab.streams.get(streamId);
     if (!stream) throw new Error('Stream no longer available. Reload the page.');
 
-    // Stream switch: end any previous session in this tab (clears its cache).
+    // Stream switch: end any previous session in this tab (clears its cache, removes its iframe).
     if (tab.playerSessionId) {
         const prev = sessions.get(tab.playerSessionId);
         if (prev) await endSession(prev, { clearCache: true, restoreMedia: false });
         tab.playerSessionId = null;
     }
+    await api.tabs.sendMessage(tabId, { action: 'UNMOUNT_PLAYER' }).catch(() => { });
 
     const sessionId = crypto.randomUUID();
-    const nonce = crypto.randomUUID();
-    const target = { tabId, frameIds: [0] };
-
-    // 1. Make sure the bridge (sniffer) exists in the top frame (pages opened before install).
-    const alive = await api.tabs.sendMessage(tabId, { action: 'PING' }, { frameId: 0 }).catch(() => null);
-    if (!alive) {
-        await api.scripting.executeScript({ target, files: ['common/shared.js', 'content/sniffer.js'] });
-    }
-
-    // 2. Pause & mute native media in every frame of the tab.
-    await api.tabs.sendMessage(tabId, { action: 'SUSPEND_MEDIA' }).catch(() => { });
-
-    // 3. Inject the bundled player (Shaka + overlay) into the top frame's MAIN world.
-    //    scripting.executeScript is not subject to the page's Content-Security-Policy.
-    const [{ result: loaded } = {}] = await api.scripting.executeScript({
-        target, world: 'MAIN', func: () => typeof window.__FASTSTREAM_BOOT__ === 'function'
-    });
-    if (!loaded) {
-        await api.scripting.executeScript({ target, world: 'MAIN', files: ['content/player.bundle.js'] });
-    }
-    await api.scripting.executeScript({
-        target, world: 'MAIN',
-        func: (n) => { window.__FASTSTREAM_BOOT__(n); },
-        args: [nonce]
-    });
-
+    const url = api.runtime.getURL(`player/player.html?session=${encodeURIComponent(sessionId)}&stream=${encodeURIComponent(streamId)}`);
+    // Registered before mounting: the player page says HELLO as soon as it loads.
     tab.playerSessionId = sessionId;
     persistTab(tabId);
 
-    // 4. Hand the player a private MessagePort + runtime port via the bridge.
-    const res = await api.tabs.sendMessage(tabId, { action: 'BRIDGE_ATTACH', nonce, sessionId, streamId }, { frameId: 0 });
-    if (!res || !res.ok) throw new Error((res && res.error) || 'Bridge attach failed');
-    return { ok: true, sessionId };
+    const candidates = [];
+    const add = (f) => { if (typeof f === 'number' && f >= 0 && !candidates.includes(f)) candidates.push(f); };
+    add(preferFrameId);
+    add(stream.frameId);
+    [...tab.videoFrames].forEach(add);
+    add(0);
+
+    // Pause & mute native media in every frame of the tab.
+    await api.tabs.sendMessage(tabId, { action: 'SUSPEND_MEDIA' }).catch(() => { });
+
+    let mounted = null;
+    for (const frameId of candidates) {
+        const ping = await pingFrame(tabId, frameId);
+        if (!ping || !ping.hasVideo) continue;
+        const res = await api.tabs.sendMessage(tabId, { action: 'MOUNT_PLAYER', sessionId, url, streamUrl: stream.url }, { frameId }).catch(() => null);
+        if (res && res.ok) { mounted = { frameId, mode: res.mode }; break; }
+    }
+    if (!mounted) {
+        // No <video> element anywhere (stream found on the network only): cover the page.
+        const ping = await pingFrame(tabId, 0);
+        if (!ping) {
+            tab.playerSessionId = null;
+            persistTab(tabId);
+            throw new Error('This page cannot be scripted by extensions (browser or store page).');
+        }
+        const res = await api.tabs.sendMessage(tabId, { action: 'MOUNT_PLAYER', sessionId, url, streamUrl: stream.url, forcePage: true }, { frameId: 0 });
+        if (!res || !res.ok) {
+            tab.playerSessionId = null;
+            persistTab(tabId);
+            throw new Error((res && res.error) || 'Could not open the player on this page.');
+        }
+        mounted = { frameId: 0, mode: 'page' };
+    }
+    tab.mountFrameId = mounted.frameId;
+    notifyFrames(tabId);
+    return { ok: true, sessionId, frameId: mounted.frameId, mode: mounted.mode };
+}
+
+/** On-page badge click: prefer a stream detected in the frame that showed the badge. */
+async function launchFromPage(tabId, frameId) {
+    const tab = await getTab(tabId);
+    const list = visibleStreams(tab);
+    const pick = list.find(s => s.frameId === frameId && !s.isAd) || list.find(s => !s.isAd) || list[0];
+    if (!pick) throw new Error('No playable stream found yet. Start the video on the page first.');
+    return launchPlayer(tabId, pick.id, frameId);
+}
+
+/** Popup "paste a link" bar: register the URL as a stream of the active tab and play it. */
+async function launchManualUrl(tabId, rawUrl, typeHint) {
+    let url;
+    try { url = new URL(String(rawUrl).trim()); } catch (_) { throw new Error('That is not a valid web address.'); }
+    if (!/^https?:$/.test(url.protocol)) throw new Error('Only http:// and https:// links can be played.');
+    const tabInfo = await api.tabs.get(tabId).catch(() => null);
+    const frameUrl = (tabInfo && tabInfo.url) || '';
+    let type = ['hls', 'dash', 'progressive'].includes(typeHint) ? typeHint : S.classifyStream(url.href);
+    if (!type) type = await detectTypeByContent(tabId, url.href, frameUrl);
+    const stream = await handleDetection(tabId, 0, frameUrl, { url: url.href, type, method: 'manual', title: '' });
+    if (!stream) throw new Error('Could not register that stream.');
+    return launchPlayer(tabId, stream.id);
 }
 
 // ============================================================================
@@ -897,6 +1071,14 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
             })(), sendResponse);
         case 'LAUNCH_PLAYER':
             return respondAsync(launchPlayer(message.tabId, message.streamId), sendResponse);
+        case 'LAUNCH_FROM_PAGE':
+            if (fromTab === undefined) return false;
+            return respondAsync(launchFromPage(fromTab, sender.frameId ?? 0), sendResponse);
+        case 'LAUNCH_URL':
+            return respondAsync(launchManualUrl(message.tabId, message.url, message.typeHint), sendResponse);
+        case 'GET_BADGE_STATE':
+            if (fromTab !== undefined) notifyFrames(fromTab);
+            return false;
         case 'CLOSE_PLAYER':
         case 'EXPORT_STREAM':
             return respondAsync((async () => {
@@ -937,7 +1119,10 @@ async function teardownTab(tabId, { keepPlayer = false, removed = false } = {}) 
         api.storage.session.remove(`tab_${tabId}`).catch(() => { });
         if (!keepPlayer) BufferManager.clearTab(tabId).catch(() => { });
     }
-    if (!removed) updateIcon(tabId);
+    if (!removed) {
+        updateIcon(tabId);
+        notifyFrames(tabId);
+    }
 }
 
 api.tabs.onRemoved.addListener((tabId) => {
@@ -971,6 +1156,9 @@ async function startupSweep() {
         console.warn('[Engine] Startup sweep failed:', e && e.message);
     }
 }
+
+// Read-only diagnostics handle (inspect from the service-worker devtools console).
+globalThis.FastStreamEngine = Object.freeze({ tabs, sessions, launchPlayer: (tabId, streamId, frameId) => launchPlayer(tabId, streamId, frameId) });
 
 api.runtime.onStartup && api.runtime.onStartup.addListener(startupSweep);
 api.runtime.onInstalled.addListener(startupSweep);

@@ -2440,6 +2440,11 @@ input[type="text"] { width: 100%; min-width: 0; }
 
         onTick() {
             const v = this.video;
+            // Self-heal the status: events from Shaka and <video> can arrive in an order that
+            // leaves "Buffering" up while the playhead is clearly moving.
+            const moving = !v.paused && v.readyState >= 3 && this.lastTickTime !== undefined && v.currentTime !== this.lastTickTime;
+            this.lastTickTime = v.currentTime;
+            if (moving && (this.status === 'buffering' || this.status === 'loading')) this.setBuffering(false);
             if (this.loop.a != null && this.loop.b != null && v.currentTime >= this.loop.b) {
                 v.currentTime = this.loop.a;
                 this.port.send({ type: 'SEEK', time: this.loop.a });

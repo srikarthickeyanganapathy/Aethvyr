@@ -21,6 +21,21 @@ background/engine.js  → downloader.js (parallel prefetch, retry, backpressure,
 sniffer.js + interceptor.js in the frame that owns the stream (page cookies / Referer)
 ```
 
+## Highlights
+
+- **Glass player UI** (Shadow DOM): floating header islands, a "Dynamic Island" HUD for gestures and status,
+  a centred control deck, segmented Studio popover (Quality · Audio · Display · Tools · Prefs).
+- **On-page "Play in FastStream" pill** over detected videos (also inside embedded players).
+- **Paste-and-play** any `.m3u8` / `.mpd` / media URL from the popup.
+- **Continue watching**: per-video position history with a resume prompt (or auto-resume).
+- **Skip intro** (+30/60/85/90 s) and optional **smart skip** of black + silent stretches.
+- **Mini player** docked in the page, **audio-only battery saver**, **sleep timer** with fade-out.
+- **Live DVR**: live segments are kept in the ring buffer and spliced back into the live playlist,
+  so live streams without native DVR can be paused and rewound (default 30 minutes).
+- **Range accelerator**: large downloads are split into 4 parallel `Range` requests.
+- **Recorder**: download VOD as `.ts` / `.mp4`, record live from "now", save the DVR buffer,
+  PNG snapshot and 6-frame burst contact sheet.
+
 ## Project structure
 
 ```

@@ -1,0 +1,164 @@
+/**
+ * FastStream Mobile - Player page bootstrap
+ *
+ * player.html is an extension page that the content script mounts as an <iframe> exactly over
+ * the site's own <video> (or over the whole page when no video element exists). Running here
+ * instead of in the page means the site's CSP, Trusted Types and scripts cannot break playback.
+ *
+ * EnginePort exposes the same small interface the player UI already uses (postMessage /
+ * onmessage / close) and implements it with:
+ *   - a runtime port to the background engine ("faststream-player"), with auto-reconnect when
+ *     the MV3 service worker / Firefox event page restarts,
+ *   - direct chrome.storage access for settings, bookmarks and watch history,
+ *   - unpacking of binary payloads (base64 on Chromium, ArrayBuffer on Firefox).
+ */
+(function () {
+    'use strict';
+
+    const S = globalThis.FastStreamShared;
+    const api = S.api;
+    const params = new URLSearchParams(location.search);
+    const sessionId = params.get('session');
+    const streamId = params.get('stream');
+
+    class EnginePort {
+        constructor() {
+            this.onmessage = null;
+            this.port = null;
+            this.closed = false;
+            this.reconnects = 0;
+            this.storageListener = (changes, area) => {
+                if (area === 'local' && changes[S.SETTINGS_KEY]) {
+                    this.deliver({ type: 'SETTINGS_CHANGED', settings: S.mergeSettings(changes[S.SETTINGS_KEY].newValue) });
+                }
+            };
+            api.storage.onChanged.addListener(this.storageListener);
+            this.connect(false);
+        }
+
+        deliver(msg) {
+            if (this.closed || typeof this.onmessage !== 'function') return;
+            // Same shape as a MessagePort event.
+            this.onmessage({ data: msg });
+        }
+
+        connect(resumed) {
+            if (this.closed) return;
+            let port;
+            try {
+                port = api.runtime.connect({ name: 'faststream-player' });
+            } catch (_) {
+                this.deliver({ type: 'FATAL', error: 'The extension was updated or reloaded. Close the player and try again.' });
+                return;
+            }
+            this.port = port;
+            port.onMessage.addListener((msg) => {
+                if (!msg) return;
+                this.reconnects = 0;
+                if (msg.data && (msg.data.kind === 'b64' || msg.data.kind === 'ab')) {
+                    this.deliver({ ...msg, data: S.unpackBinary(msg.data) });
+                } else {
+                    this.deliver(msg);
+                }
+            });
+            port.onDisconnect.addListener(() => {
+                if (this.port === port) this.port = null;
+                if (this.closed) return;
+                // Engine restarted: fail in-flight requests (the player retries them) and
+                // reconnect with the same session id so the segment cache is reused.
+                this.deliver({ type: 'ENGINE_RESET' });
+                if (this.reconnects++ < 8) {
+                    setTimeout(() => this.connect(true), Math.min(4000, 250 * Math.pow(2, this.reconnects)));
+                } else {
+                    this.deliver({ type: 'FATAL', error: 'Lost connection to the FastStream engine.' });
+                }
+            });
+            port.postMessage({ type: 'HELLO', sessionId, streamId, resumed: !!resumed });
+        }
+
+        async readSettings() {
+            const res = await api.storage.local.get(S.SETTINGS_KEY);
+            return S.mergeSettings(res[S.SETTINGS_KEY]);
+        }
+
+        async handleLocal(msg) {
+            switch (msg.type) {
+                case 'SETTINGS_GET':
+                    this.deliver({ type: 'SETTINGS', reqId: msg.reqId, settings: await this.readSettings() });
+                    return true;
+                case 'SETTINGS_SET': {
+                    const current = await this.readSettings();
+                    await api.storage.local.set({ [S.SETTINGS_KEY]: S.mergeSettings({ ...current, ...(msg.patch || {}) }) });
+                    return true;
+                }
+                case 'STORE_GET': {
+                    if (typeof msg.key !== 'string' || !msg.key.startsWith('fs_bm_')) return true;
+                    const res = await api.storage.local.get(msg.key);
+                    this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: res[msg.key] ?? null });
+                    return true;
+                }
+                case 'STORE_SET':
+                    if (typeof msg.key === 'string' && /^fs_bm_[\w-]{1,64}$/.test(msg.key)) {
+                        await api.storage.local.set({ [msg.key]: msg.value });
+                    }
+                    return true;
+                case 'HISTORY_GET': {
+                    const all = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
+                    this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: all[msg.key] || null });
+                    return true;
+                }
+                case 'HISTORY_SAVE': {
+                    if (typeof msg.key !== 'string' || !msg.entry) return true;
+                    const all = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
+                    all[msg.key] = { ...msg.entry, updatedAt: Date.now() };
+                    const keys = Object.keys(all);
+                    if (keys.length > 200) {
+                        keys.sort((a, b) => all[a].updatedAt - all[b].updatedAt).slice(0, keys.length - 200).forEach(k => delete all[k]);
+                    }
+                    await api.storage.local.set({ [S.HISTORY_KEY]: all });
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        }
+
+        postMessage(msg) {
+            if (this.closed || !msg) return;
+            this.handleLocal(msg).then(handled => {
+                if (handled) return;
+                if (this.port) {
+                    try { this.port.postMessage(msg); return; } catch (_) { /* reconnecting */ }
+                }
+                if (msg.type === 'REQUEST') this.deliver({ type: 'RESPONSE', reqId: msg.reqId, ok: false, status: 0, error: 'Engine reconnecting' });
+            });
+        }
+
+        close() {
+            if (this.closed) return;
+            this.closed = true;
+            api.storage.onChanged.removeListener(this.storageListener);
+            const port = this.port;
+            this.port = null;
+            if (port) setTimeout(() => { try { port.disconnect(); } catch (_) { /* gone */ } }, 50);
+        }
+    }
+
+    /** Layout commands go straight to the content script that mounted this iframe. */
+    function layout(cmd) {
+        try { window.parent.postMessage({ __faststream: 'layout', session: sessionId, ...cmd }, '*'); } catch (_) { /* detached */ }
+    }
+
+    if (!sessionId || !streamId || !globalThis.FastStreamPlayer) {
+        document.body.textContent = 'FastStream: missing session.';
+        return;
+    }
+    const startTime = parseFloat(params.get('t'));
+    // eslint-disable-next-line no-new
+    new globalThis.FastStreamPlayer(new EnginePort(), {
+        layout,
+        mountMode: params.get('mode') || 'inline',
+        startTime: Number.isFinite(startTime) && startTime > 1 ? startTime : null,
+        pageTitle: params.get('title') || ''
+    });
+})();

@@ -41,7 +41,7 @@
 
     const DEFAULT_SETTINGS = Object.freeze({
         // Appearance & accessibility
-        theme: 'emerald',            // emerald | blue | amethyst | crimson | hc-yellow | amoled | glass
+        theme: 'blue',               // accent: blue | green | indigo | amber | rose
         uiScale: 1,                  // 0.85 | 1 | 1.25 | 1.5
         highContrast: false,
         reducedMotion: 'system',     // system | on | off
@@ -54,10 +54,16 @@
         seekStep: 10,
         autoFullscreen: false,
         longPressRate: 2,
+        autoResume: 'ask',           // ask | always | off
+        skipSeconds: 85,             // "Skip intro" pill: 30 | 60 | 85 | 90
+        smartSkip: false,            // fast-forward through black + silent stretches
+        quickLaunchBadge: true,      // on-page "Play in FastStream" pill
         // Engine
         maxBufferSec: 90,            // prefetch target ahead of the playhead
         cacheSizeMB: 300,            // IndexedDB ring buffer per tab
         maxWorkers: 6,               // upper bound for parallel segment downloads (2-8)
+        rangeAccel: true,            // split large downloads into parallel Range sub-requests
+        dvrMinutes: 30,              // live rewind window kept in the ring buffer (0 = off)
         // Gestures
         gestures: {
             enabled: true,
@@ -80,7 +86,8 @@
         // Audio
         audio: {
             boost: 100,              // percent, 100-300
-            preset: 'normal',        // normal | voice | bass | night
+            preset: 'normal',        // normal | voice | bass | night | custom
+            eq: [0, 0, 0, 0, 0],     // custom 5-band gains in dB (60Hz, 230Hz, 910Hz, 3.6kHz, 14kHz)
             delayMs: 0               // 0-1000ms, delays audio relative to video
         },
         filterPresets: [],
@@ -115,6 +122,11 @@
         out.cacheSizeMB = Math.min(4096, Math.max(32, out.cacheSizeMB));
         out.audio.boost = Math.min(300, Math.max(100, out.audio.boost));
         out.audio.delayMs = Math.min(1000, Math.max(0, out.audio.delayMs));
+        out.dvrMinutes = Math.min(180, Math.max(0, out.dvrMinutes));
+        // Settings saved by older builds used theme names; map them onto accents.
+        const legacy = { emerald: 'green', amethyst: 'indigo', crimson: 'rose', 'hc-yellow': 'amber', amoled: 'blue', glass: 'blue' };
+        if (legacy[out.theme]) out.theme = legacy[out.theme];
+        if (!['blue', 'green', 'indigo', 'amber', 'rose'].includes(out.theme)) out.theme = 'blue';
         return out;
     }
 
@@ -224,6 +236,14 @@
         DEFAULT_SETTINGS,
         DEFAULT_KEYMAP,
         SETTINGS_KEY: 'fs_settings',
+        HISTORY_KEY: 'fs_history',
+        ACCENTS: Object.freeze({
+            blue: { label: 'System Blue', fill: '#0A84FF', strong: '#0058D0' },
+            green: { label: 'Green', fill: '#30D158', strong: '#1E7A36' },
+            indigo: { label: 'Indigo', fill: '#5E5CE6', strong: '#4643C9' },
+            amber: { label: 'Amber', fill: '#FF9F0A', strong: '#9A5B00' },
+            rose: { label: 'Rose', fill: '#FF375F', strong: '#C21E45' }
+        }),
         mergeSettings,
         toBase64,
         fromBase64,
