@@ -8,3 +8,6 @@ dist/*.zip
 .DS_Store
 Thumbs.db
 *.log
+
+# Chrome writes this when it loads an unpacked extension
+dist/*/_metadata/
