@@ -161,37 +161,128 @@
     //     over a BroadcastChannel (never through the worker's own message port, which belongs to
     //     the page). Same-origin http(s) workers are left alone because wrapping would change
     //     their base URL; webRequest catches their requests in the background instead.
+    //     Relative URLs are resolved against the page's document URL (__BASE__): a blob:/data:
+    //     URL cannot be a base, so resolving against the worker's own URL always threw.
+    //     The site's original script is loaded by the wrapper through a PRIVATE object URL of the
+    //     same Blob (tracked via createObjectURL), so a site that revokes its URL right after
+    //     `new Worker(url)` (a common inline-worker pattern) does not break the wrapped worker.
+    //     Our object URLs are revoked once the worker reports that the original script loaded
+    //     (or after a timeout if it never does).
     // ------------------------------------------------------------------
     const OrigWorker = window.Worker;
-    const WORKER_PRELUDE = "(function(){try{\nvar bc=new BroadcastChannel(__CH__);\nvar RE=/\\.(m3u8|mpd|vtt|srt)(\\?|#|&|\\/|$)|[?&](format|type)=(m3u8|mpd|hls|dash)\\b|mpegurl/i;\nvar MT=/mpegurl|dash\\+xml|text\\/vtt|x-subrip/i;\nvar post=function(u,ct){try{u=String(u&&u.url||u);if(RE.test(u)||(ct&&MT.test(ct)))bc.postMessage({url:new URL(u,__SRC__).href,ct:ct||''});}catch(_){}};\nif(self.fetch){var of=self.fetch;self.fetch=function(r){var u=r&&r.url||r;post(u);var p=of.apply(this,arguments);p.then(function(res){try{post(res.url||u,res.headers.get('content-type'));}catch(_){}},function(){});return p;};}\nif(self.XMLHttpRequest){var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){post(u);var x=this;x.addEventListener('load',function(){try{post(x.responseURL||u,x.getResponseHeader('content-type'));}catch(_){}});return xo.apply(this,arguments);};}\n}catch(_){}})();\n";
-    if (OrigWorker && typeof BroadcastChannel === 'function' && typeof Proxy === 'function') {
+    const OrigBlob = window.Blob;
+    const OrigURL = window.URL;
+    const origCreateObjectURL = OrigURL && OrigURL.createObjectURL;
+    const origRevokeObjectURL = OrigURL && OrigURL.revokeObjectURL;
+    const rApply = Reflect.apply;
+    const rConstruct = Reflect.construct;
+    const WORKER_PRELUDE = "(function(){try{\nvar B=__BASE__;var bc=new BroadcastChannel(__CH__);\nvar RE=/\\.(m3u8|mpd|vtt|srt)(\\?|#|&|\\/|$)|[?&](format|type)=(m3u8|mpd|hls|dash)\\b|mpegurl/i;\nvar MT=/mpegurl|dash\\+xml|text\\/vtt|x-subrip/i;\nvar post=function(u,ct){try{u=String(u&&u.url||u);if(RE.test(u)||(ct&&MT.test(ct)))bc.postMessage({url:new URL(u,B).href,ct:ct||''});}catch(_){}};\nif(self.fetch){var of=self.fetch;self.fetch=function(r){var u=r&&r.url||r;post(u);var p=of.apply(this,arguments);p.then(function(res){try{post(res.url||u,res.headers.get('content-type'));}catch(_){}},function(){});return p;};}\nif(self.XMLHttpRequest){var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){post(u);var x=this;x.addEventListener('load',function(){try{post(x.responseURL||u,x.getResponseHeader('content-type'));}catch(_){}});return xo.apply(this,arguments);};}\n}catch(_){}})();\n";
+    // Tells the page the original script was loaded, so our object URLs can be revoked.
+    const WORKER_LOADED = "try{var c=new BroadcastChannel(__CH__);c.postMessage({loaded:__TOKEN__});c.close();}catch(_){}\n";
+    const WORKER_URL_TTL_MS = 60000; // fallback revoke if the worker never reports in
+
+    /** JSON string literal that is also a valid JS literal on every engine (U+2028/2029). */
+    const LINE_SEP = String.fromCharCode(0x2028);
+    const PARA_SEP = String.fromCharCode(0x2029);
+    function jsStr(s) {
+        return JSON.stringify(String(s)).split(LINE_SEP).join('\\u2028').split(PARA_SEP).join('\\u2029');
+    }
+    /** Replace EVERY __TOKEN__ (function replacer: `$` in values is never special). */
+    function fill(tpl, values) {
+        return tpl.replace(/__([A-Z]+)__/g, (m, k) => (Object.prototype.hasOwnProperty.call(values, k) ? values[k] : m));
+    }
+
+    // Blob behind each live object URL the page creates (script-like types only), so a
+    // worker's source can be re-exposed under a URL that the page cannot revoke.
+    const scriptBlobs = new Map();
+    const SCRIPT_BLOB_TYPE = /^$|javascript|ecmascript|^text\/plain/i;
+    function trackObjectUrls() {
+        if (typeof origCreateObjectURL !== 'function' || typeof origRevokeObjectURL !== 'function' || !OrigBlob) return;
+        const createObjectURL = {
+            createObjectURL(obj) {
+                const url = rApply(origCreateObjectURL, this, arguments);
+                try {
+                    if (obj instanceof OrigBlob && SCRIPT_BLOB_TYPE.test(obj.type || '') && typeof url === 'string') scriptBlobs.set(url, obj);
+                } catch (_) { /* never break the page */ }
+                return url;
+            }
+        }.createObjectURL;
+        const revokeObjectURL = {
+            revokeObjectURL(url) {
+                try { scriptBlobs.delete(String(url)); } catch (_) { /* ignore */ }
+                return rApply(origRevokeObjectURL, this, arguments);
+            }
+        }.revokeObjectURL;
+        try {
+            const dc = Object.getOwnPropertyDescriptor(OrigURL, 'createObjectURL');
+            const dr = Object.getOwnPropertyDescriptor(OrigURL, 'revokeObjectURL');
+            if (!dc || !dr || !dc.configurable || !dr.configurable) return;
+            Object.defineProperty(OrigURL, 'createObjectURL', { ...dc, value: createObjectURL });
+            Object.defineProperty(OrigURL, 'revokeObjectURL', { ...dr, value: revokeObjectURL });
+        } catch (_) { /* ignore */ }
+    }
+
+    if (OrigWorker && typeof BroadcastChannel === 'function' && typeof Proxy === 'function' &&
+        typeof origCreateObjectURL === 'function' && OrigBlob) {
         try {
             const channel = 'velostream-worker-sniff-' + Math.random().toString(36).slice(2);
             const bc = new BroadcastChannel(channel);
+            const owned = new Map(); // token -> { urls, timer }
+            const release = (token) => {
+                const o = owned.get(token);
+                if (!o) return;
+                owned.delete(token);
+                clearTimeout(o.timer);
+                for (const u of o.urls) { try { origRevokeObjectURL.call(OrigURL, u); } catch (_) { /* ignore */ } }
+            };
             bc.onmessage = (e) => {
                 const d = e.data;
-                if (!d || typeof d.url !== 'string') return;
+                if (!d) return;
+                if (typeof d.loaded === 'string') { release(d.loaded); return; }
+                if (typeof d.url !== 'string') return;
                 report(d.url, 'worker', d.ct || '');
                 reportSubtitle(d.url, d.ct || '');
             };
+            trackObjectUrls();
+            const mkUrl = (code) => origCreateObjectURL.call(OrigURL, new OrigBlob([code], { type: 'text/javascript' }));
             window.Worker = new Proxy(OrigWorker, {
                 construct(target, args, newTarget) {
+                    const urls = [];
                     try {
                         const raw = args[0];
-                        const src = raw instanceof URL ? raw.href : String(raw);
+                        const src = raw instanceof OrigURL ? raw.href : String(raw);
                         if (/^(blob|data):/i.test(src)) {
                             const isModule = !!(args[1] && args[1].type === 'module');
-                            const code = WORKER_PRELUDE.replace('__CH__', JSON.stringify(channel)).replace('__SRC__', JSON.stringify(src)) +
-                                (isModule ? 'import ' + JSON.stringify(src) + ';' : 'importScripts(' + JSON.stringify(src) + ');');
-                            const wrappedUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+                            const token = Math.random().toString(36).slice(2);
+                            const vals = { CH: jsStr(channel), BASE: jsStr(location.href), TOKEN: jsStr(token) };
+                            // Private URL for the site's Blob (unknown blob -> the site's own URL).
+                            const blob = scriptBlobs.get(src);
+                            let inner = src;
+                            if (blob) { inner = origCreateObjectURL.call(OrigURL, blob); urls.push(inner); }
+                            let code;
+                            if (isModule) {
+                                // Static imports evaluate in order: prelude module first, then the
+                                // original (a hoisted `import` would otherwise run before the hooks).
+                                const preludeUrl = mkUrl(fill(WORKER_PRELUDE, vals));
+                                urls.push(preludeUrl);
+                                code = 'import ' + jsStr(preludeUrl) + ';\nimport ' + jsStr(inner) + ';\n' + fill(WORKER_LOADED, vals);
+                            } else {
+                                code = fill(WORKER_PRELUDE, vals) + 'try{importScripts(' + jsStr(inner) + ');}finally{' + fill(WORKER_LOADED, vals) + '}\n';
+                            }
+                            const wrappedUrl = mkUrl(code);
+                            urls.push(wrappedUrl);
+                            let worker = null;
                             try {
-                                return Reflect.construct(target, [wrappedUrl, ...args.slice(1)], newTarget);
-                            } catch (_) {
-                                URL.revokeObjectURL(wrappedUrl); // CSP refused the wrapper: fall through
+                                worker = rConstruct(target, [wrappedUrl, ...args.slice(1)], newTarget);
+                            } catch (_) { /* CSP / Trusted Types refused the wrapper: fall through */ }
+                            if (worker) {
+                                owned.set(token, { urls, timer: setTimeout(release, WORKER_URL_TTL_MS, token) });
+                                return worker;
                             }
                         }
                     } catch (_) { /* never break the page */ }
-                    return Reflect.construct(target, args, newTarget);
+                    for (const u of urls) { try { origRevokeObjectURL.call(OrigURL, u); } catch (_) { /* ignore */ } }
+                    return rConstruct(target, args, newTarget);
                 }
             });
         } catch (_) { /* BroadcastChannel blocked (sandboxed frame) */ }
@@ -233,17 +324,56 @@
     // ------------------------------------------------------------------
     // 3. Media element src hook
     // ------------------------------------------------------------------
-    const srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-    if (srcDesc && srcDesc.set) {
-        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-            configurable: true,
-            enumerable: srcDesc.enumerable,
-            get: srcDesc.get,
-            set(value) {
-                try { if (typeof value === 'string') report(value, 'video.src'); } catch (_) { /* ignore */ }
-                srcDesc.set.call(this, value);
+    //    Covers `media.src = …`, `source.src = …` and `setAttribute('src', …)` on both. Parser-
+    //    created elements are found by the sniffer's DOM scan. Each URL is reported once
+    //    (report() de-duplicates), and reporting never throws into the page.
+    const OrigMedia = window.HTMLMediaElement;
+    const OrigSource = window.HTMLSourceElement;
+
+    function reportSrc(value) {
+        try {
+            // Only plain strings / URL objects: never call a page object's toString() twice.
+            if (typeof value === 'string') report(value, 'video.src');
+            else if (OrigURL && value instanceof OrigURL) report(value.href, 'video.src');
+        } catch (_) { /* never break the page */ }
+    }
+
+    function hookSrcSetter(proto) {
+        const d = proto && Object.getOwnPropertyDescriptor(proto, 'src');
+        if (!d || typeof d.set !== 'function' || !d.configurable) return;
+        const origSet = d.set;
+        // Accessor from an object literal: named "set src", length 1, not constructible - like the native one.
+        const set = Object.getOwnPropertyDescriptor({
+            set src(value) {
+                reportSrc(value);
+                rApply(origSet, this, [value]);
             }
-        });
+        }, 'src').set;
+        try {
+            Object.defineProperty(proto, 'src', { configurable: true, enumerable: d.enumerable, get: d.get, set });
+        } catch (_) { /* ignore */ }
+    }
+    if (OrigMedia) hookSrcSetter(OrigMedia.prototype);
+    if (OrigSource) hookSrcSetter(OrigSource.prototype);
+
+    const setAttrDesc = window.Element && Object.getOwnPropertyDescriptor(window.Element.prototype, 'setAttribute');
+    if (setAttrDesc && typeof setAttrDesc.value === 'function' && setAttrDesc.configurable) {
+        const origSetAttribute = setAttrDesc.value;
+        // Method shorthand: named "setAttribute", length 2, not constructible - like the native one.
+        const setAttribute = {
+            setAttribute(name, value) {
+                try {
+                    if (typeof name === 'string' && name.length === 3 && name.toLowerCase() === 'src' &&
+                        ((OrigMedia && this instanceof OrigMedia) || (OrigSource && this instanceof OrigSource))) {
+                        reportSrc(value);
+                    }
+                } catch (_) { /* never break the page */ }
+                return rApply(origSetAttribute, this, arguments);
+            }
+        }.setAttribute;
+        try {
+            Object.defineProperty(window.Element.prototype, 'setAttribute', { ...setAttrDesc, value: setAttribute });
+        } catch (_) { /* ignore */ }
     }
 
     // ------------------------------------------------------------------

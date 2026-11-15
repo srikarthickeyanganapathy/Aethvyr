@@ -233,7 +233,7 @@ rotation and mirroring apply identically.
 | | Chromium | Firefox |
 |---|---|---|
 | Background | `service_worker` (module) | event page (`background.scripts`, module) |
-| Manifest | `minimum_chrome_version: 111` (MAIN-world content scripts) | `browser_specific_settings.gecko` (min 140, Android 142) |
+| Manifest | `minimum_chrome_version: 111` (MAIN-world content scripts) | `browser_specific_settings.gecko` (min 128, Android 128) |
 | Site access | granted at install | opt-in: popup shows **Allow access to websites** |
 | API namespace | `chrome.*` | `browser.*` (`common/shared.js` exports whichever exists as `api`) |
 

@@ -74,38 +74,138 @@
         return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms % 1000).padStart(3, '0')}`;
     }
 
-    function scanSubtitleTracks(video) {
-        if (!video || video.tagName !== 'VIDEO') return;
+    function serializeCues(cues) {
+        let out = 'WEBVTT\n\n';
+        const n = Math.min(cues.length, 5000);
+        for (let i = 0; i < n; i++) {
+            const c = cues[i];
+            const text = c && typeof c.text === 'string' ? c.text : '';
+            if (!text) continue;
+            out += `${vttTime(c.startTime)} --> ${vttTime(c.endTime)}\n${text.replace(/\n{2,}/g, '\n')}\n\n`;
+            if (out.length > 1500000) break;
+        }
+        return out;
+    }
+
+    // In-memory tracks are often created late (addTextTrack() after `playing`) and filled
+    // incrementally, so each one is re-checked until its cue count has been stable for a moment;
+    // only then is it serialized. A track that keeps growing a lot afterwards is re-reported a
+    // bounded number of times (the engine keys inline tracks by size, so every report is a new entry).
+    const SUB_RECHECK_MS = 2000;   // re-check period while a track is pending
+    const SUB_MAX_RUNS = 15;       // ~30 s of re-checks after the last real change
+    const SUB_STABLE_MS = 1500;    // cue count must be unchanged this long before serializing
+    const SUB_MAX_REPORTS = 3;     // per track (first report + 2 substantial growths)
+    const trackState = new WeakMap(); // TextTrack -> { count, changedAt, reported, reports }
+    const subWatch = new WeakMap();   // <video> -> { timer, runs, off: [], tracks: WeakSet }
+
+    /** @returns {{pending: boolean, grew: boolean}} */
+    function checkTrack(t) {
+        let cues = null;
+        try {
+            if (t.mode === 'disabled') return { pending: false, grew: false }; // no cues while disabled; 'change' re-kicks
+            cues = t.cues;
+        } catch (_) { return { pending: false, grew: false }; }
+        const count = cues ? cues.length : 0;
+        const now = Date.now();
+        let st = trackState.get(t);
+        if (!st) { st = { count: -1, changedAt: now, reported: 0, reports: 0 }; trackState.set(t, st); }
+        let grew = false;
+        if (count !== st.count) {
+            grew = st.count >= 0 && count > st.count;
+            st.count = count;
+            st.changedAt = now;
+        }
+        const min = t.kind === 'chapters' ? 1 : 3;
+        if (count < min) return { pending: true, grew };
+        if (st.reports >= SUB_MAX_REPORTS || count <= st.reported) return { pending: false, grew };
+        // After a first report, only substantial growth is worth another (size-keyed) entry.
+        if (st.reported && count < Math.max(st.reported + 5, st.reported * 1.25)) return { pending: true, grew };
+        if (now - st.changedAt < SUB_STABLE_MS) return { pending: true, grew }; // still being filled
+        st.reported = count;
+        st.reports++;
+        reportSubtitle({ vtt: serializeCues(cues), label: t.label || '', language: t.language || '', kind: t.kind === 'chapters' ? 'chapters' : 'subtitles', method: 'textTracks' });
+        return { pending: false, grew };
+    }
+
+    function stopSubtitleWatch(video) {
+        const w = subWatch.get(video);
+        if (!w) return;
+        clearTimeout(w.timer);
+        for (const off of w.off) { try { off(); } catch (_) { /* ignore */ } }
+        subWatch.delete(video); // re-watched if the element is inserted and scanned again
+    }
+
+    function runSubtitleWatch(video) {
+        const w = subWatch.get(video);
+        if (!w) return;
+        w.timer = 0;
+        // Removed from the page and not playing detached: drop timers and listeners.
+        if (!video.isConnected && (video.paused || video.ended)) { stopSubtitleWatch(video); return; }
+        w.runs++;
+        const r = scanSubtitleTracks(video, true);
+        if (r.grew) w.runs = 0; // cues still arriving: extend the watch window
+        if (r.pending && w.runs < SUB_MAX_RUNS) w.timer = setTimeout(runSubtitleWatch, SUB_RECHECK_MS, video);
+    }
+
+    /** reset=true for real signals (new track, mode change, cue growth); false for opportunistic scans. */
+    function kickSubtitleWatch(video, reset) {
+        const w = subWatch.get(video);
+        if (!w) return;
+        if (reset) w.runs = 0;
+        if (!w.timer && w.runs < SUB_MAX_RUNS) w.timer = setTimeout(runSubtitleWatch, SUB_RECHECK_MS, video);
+    }
+
+    function watchTextTracks(video) {
+        if (subWatch.has(video)) return;
+        let list;
+        try { list = video.textTracks; } catch (_) { return; }
+        if (!list || typeof list.addEventListener !== 'function') return;
+        const w = { timer: 0, runs: 0, off: [], tracks: new WeakSet() };
+        subWatch.set(video, w);
+        const on = (target, type, fn) => {
+            target.addEventListener(type, fn);
+            w.off.push(() => target.removeEventListener(type, fn));
+        };
+        const watchTrack = (t) => {
+            if (!t || w.tracks.has(t)) return;
+            w.tracks.add(t);
+            // cuechange fires on every active-cue change during playback: only react to growth.
+            on(t, 'cuechange', () => {
+                let n = 0;
+                try { n = t.cues ? t.cues.length : 0; } catch (_) { return; }
+                const st = trackState.get(t);
+                if (!st || n !== st.count) kickSubtitleWatch(video, true);
+            });
+        };
+        try { for (let i = 0; i < list.length; i++) watchTrack(list[i]); } catch (_) { /* ignore */ }
+        on(list, 'addtrack', (e) => { watchTrack(e.track); kickSubtitleWatch(video, true); });
+        on(list, 'change', () => kickSubtitleWatch(video, true));
+    }
+
+    /** @returns {{pending: boolean, grew: boolean}} whether some in-memory track still needs a re-check */
+    function scanSubtitleTracks(video, fromWatch) {
+        const result = { pending: false, grew: false };
+        if (!video || video.tagName !== 'VIDEO') return result;
         video.querySelectorAll('track[src]').forEach(tr => {
             const kind = (tr.getAttribute('kind') || 'subtitles').toLowerCase();
             if (kind !== 'subtitles' && kind !== 'captions' && kind !== 'chapters') return;
             reportSubtitle({ url: tr.src || tr.getAttribute('src'), label: tr.label || '', language: tr.srclang || '', isDefault: tr.default, kind: kind === 'chapters' ? 'chapters' : 'subtitles', method: 'track' });
         });
+        watchTextTracks(video);
         // TextTracks that belong to a <track src> element were reported above by URL.
         const backed = new Set(Array.from(video.querySelectorAll('track[src]')).map(tr => tr.track));
         let tracks;
-        try { tracks = Array.from(video.textTracks || []); } catch (_) { return; }
+        try { tracks = Array.from(video.textTracks || []); } catch (_) { return result; }
         for (const t of tracks) {
             if (t.kind !== 'subtitles' && t.kind !== 'captions' && t.kind !== 'chapters') continue;
             if (backed.has(t)) continue;
             // Only in-memory cue lists (addTextTrack()/addCue()) are serialized.
-            let cues = null;
-            try {
-                if (t.mode === 'disabled') continue; // cues are not readable while disabled
-                cues = t.cues;
-            } catch (_) { continue; }
-            if (!cues || cues.length < (t.kind === 'chapters' ? 1 : 3)) continue;
-            let out = 'WEBVTT\n\n';
-            const n = Math.min(cues.length, 5000);
-            for (let i = 0; i < n; i++) {
-                const c = cues[i];
-                const text = typeof c.text === 'string' ? c.text : '';
-                if (!text) continue;
-                out += `${vttTime(c.startTime)} --> ${vttTime(c.endTime)}\n${text.replace(/\n{2,}/g, '\n')}\n\n`;
-                if (out.length > 1500000) break;
-            }
-            reportSubtitle({ vtt: out, label: t.label || '', language: t.language || '', kind: t.kind === 'chapters' ? 'chapters' : 'subtitles', method: 'textTracks' });
+            const r = checkTrack(t);
+            if (r.pending) result.pending = true;
+            if (r.grew) result.grew = true;
         }
+        if (!fromWatch && result.pending) kickSubtitleWatch(video, result.grew);
+        return result;
     }
 
     // ------------------------------------------------------------------
@@ -224,6 +324,8 @@
         }
         // A player element may have appeared/resized: re-evaluate the quick-launch pill.
         if (badge.state.count) renderBadge();
+        // The mounted player may have lost / gained its target <video>.
+        if (mount.mode === 'inline') scheduleSync();
     }
 
     function scheduleScan() {
@@ -316,17 +418,25 @@
 
     // ------------------------------------------------------------------
     // 5. In-place player mount
-    //    The player is an extension page (player/player.html) shown in an <iframe> placed
-    //    exactly over the site's own <video>: it is inserted into the site's player container
-    //    (so it scrolls, resizes and stacks with it) and re-synced on every layout change. The
-    //    original video is paused, muted and hidden; its controls are covered. When no usable
-    //    <video> exists in this frame the iframe covers the viewport instead ("page" mode).
+    //    The player is an extension page (player/player.html) shown in an <iframe>. The iframe
+    //    is appended ONCE to <html> (outside <body>) and never moved again: re-parenting an
+    //    iframe unloads and reloads its document (player, Shaka, runtime port, playback). Every
+    //    mode is pure CSS on that one element:
+    //      inline - position:fixed over the site's <video>, tracking its viewport box on scroll
+    //               (any scroller), resize, ResizeObserver and layout changes, clipped by the
+    //               video's scrolling ancestors; hidden while the video is detached/zero-size.
+    //      mini   - fixed floating window (drag/resize driven by the player's layout messages).
+    //      fill / page - fixed, covers the viewport; the page underneath is locked.
+    //    The original video is paused, muted and hidden while the player is mounted.
     // ------------------------------------------------------------------
     const mount = {
         frame: null, session: null, video: null, mode: null, prevMode: null,
-        videoStyle: null, timer: null, ro: null, rect: null, dragStart: null, pageLock: null
+        videoStyle: null, timer: null, ro: null, rect: null, dragStart: null, pageLock: null,
+        float: null, raf: 0, lostAt: 0, fix: { x: 0, y: 0 }, lastCss: ''
     };
     const FRAME_Z = '2147483647';
+    const VIDEO_LOST_GRACE_MS = 1500; // a re-rendering site may swap its <video>: wait before going full page
+    const MOUNT_POLL_MS = 250;        // fallback for layout changes no event reports
 
     /** Every video in the frame, plus one seen playing inside a closed shadow root. */
     function allVideos() {
@@ -350,55 +460,135 @@
         return best;
     }
 
-    /** Outermost ancestor with (almost) the same box as the video = the site's player container. */
-    function playerContainer(video) {
-        const vr = video.getBoundingClientRect();
-        const same = (r) => Math.abs(r.left - vr.left) < 4 && Math.abs(r.top - vr.top) < 4 &&
-            Math.abs(r.width - vr.width) < 4 && Math.abs(r.height - vr.height) < 4;
-        let container = null;
-        let node = video.parentNode;
-        while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement) {
-            if (!same(node.getBoundingClientRect())) break;
-            container = node;
-            node = node.parentNode;
-        }
-        return container || video.parentNode;
-    }
-
     function setFrameStyle(css) {
         const f = mount.frame;
         if (!f) return;
         f.style.cssText = `all: initial; display: block; border: 0; margin: 0; padding: 0; background: #000; color-scheme: normal; z-index: ${FRAME_Z}; ${css}`;
     }
 
-    /** Keep the iframe exactly on top of the original video (in its containing block). */
+    /**
+     * position:fixed at viewport coordinates. A transform/filter on <html> would make it the
+     * containing block of fixed boxes: the real box is measured and the offset compensated.
+     */
+    function placeFixed(x, y, w, h, extra) {
+        const f = mount.frame;
+        if (!f) return;
+        const css = (ox, oy) => `position: fixed; left: ${x + ox}px; top: ${y + oy}px; width: ${w}px; height: ${h}px; ${extra || ''}`;
+        mount.lastCss = css(mount.fix.x, mount.fix.y);
+        setFrameStyle(mount.lastCss);
+        const fr = f.getBoundingClientRect();
+        const ex = x - fr.left;
+        const ey = y - fr.top;
+        if (f.isConnected && (Math.abs(ex) > 0.5 || Math.abs(ey) > 0.5) && Math.abs(mount.fix.x + ex) < 1e5 && Math.abs(mount.fix.y + ey) < 1e5) {
+            mount.fix = { x: mount.fix.x + ex, y: mount.fix.y + ey };
+            mount.lastCss = css(mount.fix.x, mount.fix.y);
+            setFrameStyle(mount.lastCss);
+        }
+    }
+
+    /** Hide (not resize: the player keeps its layout) while the target video is unavailable. */
+    function hideInline() {
+        if (mount.rect === 'hidden') return;
+        mount.rect = 'hidden';
+        setFrameStyle(`${mount.lastCss || 'position: fixed; left: 0; top: 0; width: 0; height: 0;'} visibility: hidden;`);
+    }
+
+    /** Parent in the flattened tree (slots, open/closed shadow hosts). */
+    function flatParent(node) {
+        if (node.assignedSlot) return node.assignedSlot;
+        if (node.parentElement) return node.parentElement;
+        const p = node.parentNode;
+        return p && p.nodeType === 11 && p.host ? p.host : null;
+    }
+
+    /**
+     * The visible part of the video inside its scrolling ancestors (an inner scroller would have
+     * clipped the old in-flow iframe too). Only containers that actually overflow are used, and
+     * the walk stops at a position:fixed ancestor, so a non-scrolling overflow:hidden wrapper never
+     * hides a visible video. Returns null when nothing is visible, else the clip-path CSS ('' = none).
+     */
+    function inlineClip(v, vr) {
+        let l = vr.left;
+        let t = vr.top;
+        let r = vr.right;
+        let b = vr.bottom;
+        let node = flatParent(v);
+        let budget = 64;
+        while (node && node !== document.body && node !== document.documentElement && budget-- > 0) {
+            const cs = getComputedStyle(node);
+            if ((cs.overflowX !== 'visible' || cs.overflowY !== 'visible') &&
+                (node.scrollHeight > node.clientHeight + 1 || node.scrollWidth > node.clientWidth + 1)) {
+                const nr = node.getBoundingClientRect();
+                const cl = nr.left + node.clientLeft;
+                const ct = nr.top + node.clientTop;
+                l = Math.max(l, cl);
+                t = Math.max(t, ct);
+                r = Math.min(r, cl + node.clientWidth);
+                b = Math.min(b, ct + node.clientHeight);
+            }
+            if (cs.position === 'fixed') break;
+            node = flatParent(node);
+        }
+        if (r - l < 1 || b - t < 1) return null;
+        const it = t - vr.top;
+        const ir = vr.right - r;
+        const ib = vr.bottom - b;
+        const il = l - vr.left;
+        if (it < 0.5 && ir < 0.5 && ib < 0.5 && il < 0.5) return '';
+        return `clip-path: inset(${it}px ${ir}px ${ib}px ${il}px);`;
+    }
+
+    /** Keep the iframe exactly on top of the original video (viewport coordinates). */
     function syncInline() {
         if (mount.mode !== 'inline' || !mount.frame) return;
         const v = mount.video;
         if (!v || !v.isConnected) {
-            // The site replaced its <video> (SPA re-render): follow the new one, else go full page.
+            // The site replaced its <video> (SPA re-render): follow the new one; give it a moment
+            // to appear before falling back to full page.
             const next = pickVideo(null);
-            if (next) { attachToVideo(next); return; }
+            if (next) { mount.lostAt = 0; attachToVideo(next); return; }
+            if (!mount.lostAt) mount.lostAt = Date.now();
+            if (Date.now() - mount.lostAt < VIDEO_LOST_GRACE_MS) { hideInline(); return; }
+            mount.lostAt = 0;
             setMode('page');
             return;
         }
+        mount.lostAt = 0;
         const vr = v.getBoundingClientRect();
-        if (vr.width < 2 || vr.height < 2) return; // temporarily hidden by the site: keep last box
-        const cb = mount.frame.offsetParent;
-        let left;
-        let top;
-        if (!cb || (cb === document.body && getComputedStyle(cb).position === 'static')) {
-            left = vr.left + scrollX;
-            top = vr.top + scrollY;
-        } else {
-            const cr = cb.getBoundingClientRect();
-            left = vr.left - cr.left - cb.clientLeft + cb.scrollLeft;
-            top = vr.top - cr.top - cb.clientTop + cb.scrollTop;
-        }
-        const key = `${left}|${top}|${vr.width}|${vr.height}`;
+        if (vr.width < 2 || vr.height < 2) { hideInline(); return; } // hidden/collapsed by the site
+        const clip = inlineClip(v, vr);
+        if (clip === null) { hideInline(); return; } // scrolled out of its scroller
+        const key = `${vr.left}|${vr.top}|${vr.width}|${vr.height}|${clip}`;
         if (key === mount.rect) return;
         mount.rect = key;
-        setFrameStyle(`position: absolute; left: ${left}px; top: ${top}px; width: ${vr.width}px; height: ${vr.height}px;`);
+        placeFixed(vr.left, vr.top, vr.width, vr.height, clip);
+    }
+
+    /** rAF-throttled re-layout for scroll / resize / ResizeObserver / transitions. */
+    function scheduleSync() {
+        if (!mount.frame || mount.raf) return;
+        mount.raf = requestAnimationFrame(() => {
+            mount.raf = 0;
+            if (mount.mode === 'inline') syncInline();
+        });
+    }
+
+    function onMountScroll() {
+        if (mount.mode === 'inline') scheduleSync();
+    }
+
+    function onMountResize() {
+        if (mount.mode === 'inline') scheduleSync();
+        else if (mount.mode === 'mini' && mount.float && !mount.dragStart) {
+            // Keep the floating window on screen when the viewport shrinks.
+            mount.float = clampRect(mount.float);
+            applyFloating();
+        }
+    }
+
+    function onMountLayoutEvent(e) {
+        if (mount.mode !== 'inline' || !e.target || e.target === mount.frame) return;
+        scheduleSync();
     }
 
     function hideVideo(v) {
@@ -416,29 +606,31 @@
         mount.videoStyle = null;
     }
 
+    /** Point the (already mounted, never moved) iframe at `video`. Pure bookkeeping + CSS. */
     function attachToVideo(video) {
         unhideVideo();
         mount.video = video;
-        const container = playerContainer(video);
-        if (container === video.parentNode) video.parentNode.insertBefore(mount.frame, video.nextSibling);
-        else container.appendChild(mount.frame);
         hideVideo(video);
         suspendElement(video);
         if (mount.ro) mount.ro.disconnect();
-        mount.ro = new ResizeObserver(() => syncInline());
-        mount.ro.observe(video);
+        mount.ro = typeof ResizeObserver === 'function' ? new ResizeObserver(scheduleSync) : null;
+        if (mount.ro) mount.ro.observe(video);
         mount.rect = null;
         syncInline();
     }
 
     function lockPage(on) {
         if (on && !mount.pageLock) {
-            mount.pageLock = { overflow: document.documentElement.style.overflow, inert: document.body ? document.body.inert : false };
+            const body = document.body;
+            // The frame lives on <html>, outside <body>, so an inert body never makes it inert.
+            const canInert = !!(body && mount.frame && !body.contains(mount.frame));
+            mount.pageLock = { overflow: document.documentElement.style.overflow, body: canInert ? body : null, inert: canInert ? body.inert : false };
             document.documentElement.style.overflow = 'hidden';
-            if (document.body && mount.frame.parentNode !== document.body) document.body.inert = true;
+            if (canInert) body.inert = true;
         } else if (!on && mount.pageLock) {
             document.documentElement.style.overflow = mount.pageLock.overflow;
-            if (document.body) document.body.inert = mount.pageLock.inert;
+            // Restore the body that was locked (a site may have swapped <body> meanwhile).
+            if (mount.pageLock.body) mount.pageLock.body.inert = mount.pageLock.inert;
             mount.pageLock = null;
         }
     }
@@ -459,9 +651,10 @@
 
     function applyFloating() {
         const r = mount.float;
-        setFrameStyle(`position: fixed; left: ${r.x}px; top: ${r.y}px; width: ${r.w}px; height: ${r.h}px; border-radius: 16px; overflow: hidden; box-shadow: 0 16px 40px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.3);`);
+        placeFixed(r.x, r.y, r.w, r.h, 'border-radius: 16px; overflow: hidden; box-shadow: 0 16px 40px rgba(0,0,0,.55), 0 2px 10px rgba(0,0,0,.3);');
     }
 
+    /** Mode switches only restyle the iframe; it is never re-parented (that would reload it). */
     function setMode(mode, opts = {}) {
         if (!mount.frame) return;
         const prev = mount.mode;
@@ -469,19 +662,20 @@
         if (mode === 'mini' || mode === 'fill') mount.prevMode = prev;
         mount.mode = mode;
         mount.rect = null;
+        mount.dragStart = null;
         if (mode === 'inline') {
             lockPage(false);
-            if (mount.video && mount.video.isConnected) attachToVideo(mount.video);
+            let v = mount.video && mount.video.isConnected ? mount.video : null;
+            if (!v) v = pickVideo(null); // the site re-rendered its player while we floated
+            if (v) attachToVideo(v);
             else setMode('page');
             return;
         }
         if (mode === 'page' || mode === 'fill') {
-            if (mount.frame.parentNode !== document.documentElement) document.documentElement.appendChild(mount.frame);
             setFrameStyle('position: fixed; inset: 0; width: 100vw; height: 100vh;');
             lockPage(true);
         } else if (mode === 'mini') {
             lockPage(false);
-            if (mount.frame.parentNode !== document.documentElement) document.documentElement.appendChild(mount.frame);
             mount.float = clampRect(mount.float || miniRect(opts.ratio));
             applyFloating();
         }
@@ -491,12 +685,19 @@
         if (!mount.frame) return;
         if (mount.ro) mount.ro.disconnect();
         clearInterval(mount.timer);
-        window.removeEventListener('resize', syncInline);
+        if (mount.raf) cancelAnimationFrame(mount.raf);
+        window.removeEventListener('resize', onMountResize);
+        window.removeEventListener('scroll', onMountScroll, true);
+        document.removeEventListener('transitionend', onMountLayoutEvent, true);
+        document.removeEventListener('animationend', onMountLayoutEvent, true);
         lockPage(false);
         mount.frame.remove();
         unhideVideo();
         restoreMedia();
-        Object.assign(mount, { frame: null, session: null, video: null, mode: null, prevMode: null, ro: null, rect: null, timer: null, float: null });
+        Object.assign(mount, {
+            frame: null, session: null, video: null, mode: null, prevMode: null, ro: null, rect: null, timer: null,
+            float: null, raf: 0, lostAt: 0, fix: { x: 0, y: 0 }, lastCss: '', dragStart: null
+        });
     }
 
     function onLayoutMessage(e) {
@@ -568,7 +769,11 @@
         frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write');
         mount.frame = frame;
         mount.session = message.sessionId;
-        setFrameStyle('position: absolute; width: 0; height: 0;');
+        // Styled before insertion (no flash), then parented to <html> once and for all: modes
+        // below only restyle it. Inserted before positioning so placeFixed() can measure it.
+        setFrameStyle('position: fixed; left: 0; top: 0; width: 0; height: 0; visibility: hidden;');
+        frame.addEventListener('load', () => { try { frame.focus(); } catch (_) { /* ignore */ } }, { once: true });
+        document.documentElement.appendChild(frame);
         if (video) {
             mount.mode = 'inline';
             attachToVideo(video);
@@ -576,18 +781,23 @@
             mount.mode = null;
             setMode('page');
         }
-        frame.addEventListener('load', () => { try { frame.focus(); } catch (_) { /* ignore */ } }, { once: true });
-        window.addEventListener('resize', syncInline);
+        window.addEventListener('resize', onMountResize, { passive: true });
+        // Capture phase: scrolling any ancestor scroller moves the video too.
+        window.addEventListener('scroll', onMountScroll, { passive: true, capture: true });
+        document.addEventListener('transitionend', onMountLayoutEvent, true);
+        document.addEventListener('animationend', onMountLayoutEvent, true);
         mount.timer = setInterval(() => {
             if (!mount.frame) return;
-            if (!mount.frame.isConnected) {
-                // The site's framework re-rendered its player and dropped our iframe: put it back.
-                // (Re-inserting reloads the player page; it resumes via the saved history.)
-                if (mount.mode === 'inline' && mount.video && mount.video.isConnected) attachToVideo(mount.video);
-                else { document.documentElement.appendChild(mount.frame); mount.rect = null; }
+            if (!mount.frame.isConnected && document.documentElement) {
+                // The page wiped <html>'s children (document.open / framework root swap) and our
+                // iframe with them. Re-inserting is the only option and reloads the player page
+                // (it resumes via the saved history); never done for a mere mode change.
+                document.documentElement.appendChild(mount.frame);
+                mount.rect = null;
+                if (mount.pageLock) { lockPage(false); lockPage(true); } // the old <body> may be gone
             }
-            if (mount.mode === 'inline') syncInline();
-        }, 500);
+            if (mount.mode === 'inline') syncInline(); // layout changes no event reported
+        }, MOUNT_POLL_MS);
         return { ok: true, mode: video ? 'inline' : 'page' };
     }
 

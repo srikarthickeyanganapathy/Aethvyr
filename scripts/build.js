@@ -22,7 +22,9 @@ const DIST = path.join(ROOT, 'dist');
 const SHARED_FILES = ['background', 'common', 'content', 'player', 'popup', 'icons', 'rules'];
 const SHAKA_PATH = path.join(ROOT, 'node_modules', 'shaka-player', 'dist', 'shaka-player.compiled-es2021.js');
 const SHAKA_LICENSE = path.join(ROOT, 'node_modules', 'shaka-player', 'LICENSE');
-const GECKO_ID = 'velostream@antigravity.dev';
+// Firefox add-on ID. AMO ties the add-on to it forever and never accepts an ID again after the
+// add-on is deleted (velostream@antigravity.dev is burned that way). Do not change it once published.
+const GECKO_ID = 'velostream@srikarthickeyanganapathy.github.io';
 
 const args = process.argv.slice(2);
 const targetArg = (args.find(a => a.startsWith('--target=')) || '').split('=')[1];
@@ -41,7 +43,9 @@ function readShaka() {
     if (!fs.existsSync(SHAKA_PATH)) {
         throw new Error('shaka-player is not installed. Run "npm install" first.');
     }
-    return fs.readFileSync(SHAKA_PATH, 'utf8').replace(/\/\/# sourceMappingURL=.*$/m, '');
+    // Byte-for-byte copy: AMO reviewers verify third-party libraries against the official release,
+    // so the file must stay unmodified (the trailing sourceMappingURL comment included).
+    return fs.readFileSync(SHAKA_PATH);
 }
 
 function verifyManifestFiles(manifest, targetDir) {
@@ -94,13 +98,16 @@ function buildTarget(browser, shaka) {
         manifest.browser_specific_settings = {
             gecko: {
                 id: GECKO_ID,
-                strict_min_version: '140.0',
+                // Firefox 128 ESR is the real floor (MV3 + the APIs Velostream uses).
+                strict_min_version: '128.0',
                 // Firefox built-in data consent (https://mzl.la/firefox-builtin-data-consent):
-                // Velostream collects and transmits no user data. Supported from Firefox 140 / Android 142,
-                // which is why those are the minimum versions.
+                // Velostream collects and transmits no user data. The key is only understood from
+                // Firefox 140 / Android 142; older versions ignore unknown gecko sub-keys. Because the
+                // minimum versions are lower than that, AMO's linter shows 2 non-blocking warnings
+                // (one for gecko, one for gecko_android) - expected, and they do not block signing.
                 data_collection_permissions: { required: ['none'] }
             },
-            gecko_android: { strict_min_version: '142.0' }
+            gecko_android: { strict_min_version: '128.0' }
         };
         // Firefox MV3 uses a non-persistent event page instead of a service worker.
         manifest.background = { scripts: ['background/engine.js'], type: 'module' };

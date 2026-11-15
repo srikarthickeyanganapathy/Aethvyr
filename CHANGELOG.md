@@ -48,9 +48,32 @@ First public release as **Velostream** (previously developed as *FastStream Mobi
   Subtitle text and titles coming from sites can no longer inject markup or scripts, and AMO
   linter warnings are cleared.
 
+### Fixed (2.0 audit, 29 bugs plus extras)
+
+- Player no longer reloads when switching to the mini player, fill or page mode: the frame stays in
+  one place in the DOM and follows the video with fixed positioning and scroll-container clipping.
+- Detection: relative URLs in `blob:`/`data:` workers, `setAttribute('src')` and `<source src>`,
+  late in-memory subtitle tracks.
+- Engine: tab state, subtitles and the session's playlists survive service-worker restarts; per-site
+  Referer/Origin rules on shared CDNs; per-playlist sequence numbers for live recordings with separate
+  audio; CORS for direct files, so audio effects, GPU enhancement and snapshots work on MP4/WebM.
+- Downloader: encrypted (AES-128) segments are never sniffed or trimmed; stricter TS/MP4 detection;
+  BOM-prefixed WebVTT/playlists; per-connection throughput reported to ABR from the range
+  accelerator; transient errors no longer disable range requests; live timeline offset learned.
+- Cache: concurrent stores no longer over-evict or overshoot the cap; per-stream accounting.
+- MP4 export: video and audio fragments interleaved by time; `trun.data_offset` fixed when boxes
+  between `moof` and `mdat` are dropped; multi-track fragments, size-0 boxes, missing `trex`.
+- Player: save picker for live-recording stop and only with user activation; Continue Watching
+  saves the page URL; site profiles no longer leak into global settings; the unmuting tap no longer
+  blocks the first gesture; middle-click *Reset zoom*; `.ass` in the subtitle picker; numeric HTML
+  entities; captions toggle restores the last source; GPU resources freed and the canvas recreated.
+- Popup/settings: identical option lists in popup and player, legacy cache sizes mapped, stale
+  stream and history rows, settings save races.
+- DNR rule exposes range headers for extension-less and disguised segments.
+
 ### Changed
 
-- Firefox minimum versions: **140** on desktop and **142** on Android, the first versions that
-  support the required `data_collection_permissions` manifest key (declared as `none`).
+- Firefox minimum version **128** (desktop and Android), with the `data_collection_permissions`
+  key declared as `none` (Firefox 140+ / Android 142+ read it; older versions ignore it).
 - New icon: a forward-leaning V with a red dot. A heavier variant is used at 16/32 px, and the
   tile turns red when a video is found.

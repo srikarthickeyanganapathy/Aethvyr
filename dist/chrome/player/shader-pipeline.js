@@ -195,19 +195,33 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.contentRect = { x: 0, y: 0, w: 0, h: 0 };
             this.guard = { start: 0, frames: 0, cpu: 0, gpu: 0, gpuN: 0, dropped0: 0, total0: 0 };
             this.query = null;
+            this.pendingQuery = null;
+            this.vao = null;
+            this.vbo = null;
+            this.videoTex = null;
+            this.fbo = null;
+            this.destroyed = false;
             this.boundRender = (now, meta) => this.onFrame(now, meta);
+            this.onContextLost = (e) => { e.preventDefault(); this.fail('GPU context lost'); };
         }
 
         get active() { return this.preset !== 'off' && !this.failed && !!this.gl; }
 
         init() {
+            // After destroy() the canvas' context has been lost on purpose; getContext() would hand
+            // back that same dead context, so a destroyed pipeline never re-initialises.
+            if (this.destroyed) return false;
             if (this.gl || this.failed) return !!this.gl;
             const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
             // (No `desynchronized`: low-latency canvases bypass the compositor and can tear/flicker.)
             if (!gl) { this.fail('WebGL2 is not available'); return false; }
+            // A canvas whose context was lost (e.g. by an earlier pipeline's destroy()) keeps returning
+            // that dead context: report it plainly instead of a misleading "Shader compile failed".
+            if (gl.isContextLost()) { this.fail('GPU context lost'); return false; }
             this.gl = gl;
-            this.canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); this.fail('GPU context lost'); });
+            this.canvas.addEventListener('webglcontextlost', this.onContextLost);
             const buf = gl.createBuffer();
+            this.vbo = buf;
             gl.bindBuffer(gl.ARRAY_BUFFER, buf);
             gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
             this.vao = gl.createVertexArray();
@@ -239,21 +253,42 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
 
         link(fsSource) {
             const gl = this.gl;
+            const shaders = [];
+            const p = gl.createProgram();
             const sh = (type, src) => {
                 const s = gl.createShader(type);
+                shaders.push(s);
                 gl.shaderSource(s, src);
                 gl.compileShader(s);
                 if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'compile error');
                 return s;
             };
-            const p = gl.createProgram();
-            gl.attachShader(p, sh(gl.VERTEX_SHADER, VS));
-            gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fsSource));
-            gl.bindAttribLocation(p, 0, 'aPos');
-            gl.linkProgram(p);
-            if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link error');
+            try {
+                gl.attachShader(p, sh(gl.VERTEX_SHADER, VS));
+                gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fsSource));
+                gl.bindAttribLocation(p, 0, 'aPos');
+                gl.linkProgram(p);
+                if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link error');
+            } catch (err) {
+                // Do not leak the half-built program on a compile/link failure.
+                this.deleteProgram({ p, shaders });
+                throw err;
+            }
             const u = n => gl.getUniformLocation(p, n);
-            return { p, uTex: u('uTex'), uIn: u('uInSize'), uOut: u('uOutSize'), uStr: u('uStrength'), uFrame: u('uFrame'), uFbo: u('uFbo') };
+            return { p, shaders, uTex: u('uTex'), uIn: u('uInSize'), uOut: u('uOutSize'), uStr: u('uStrength'), uFrame: u('uFrame'), uFbo: u('uFbo') };
+        }
+
+        /** Detaches and deletes a program's shaders, then the program itself. */
+        deleteProgram(prog) {
+            const gl = this.gl;
+            if (!gl || !prog) return;
+            const attached = (prog.p && !gl.isContextLost() && gl.getAttachedShaders(prog.p)) || [];
+            for (const s of prog.shaders || []) {
+                if (!s) continue;
+                if (attached.includes(s)) gl.detachShader(prog.p, s);
+                gl.deleteShader(s);
+            }
+            if (prog.p) gl.deleteProgram(prog.p);
         }
 
         fail(reason) {
@@ -312,7 +347,8 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             if (this.canvas.width !== w || this.canvas.height !== h) {
                 this.canvas.width = w;
                 this.canvas.height = h;
-                this.fbo = null; // reallocate the intermediate target
+                // The intermediate target is reallocated lazily by ensureFbo() (it compares sizes and
+                // deletes the old framebuffer + texture). Nulling it here used to leak both on resize.
             }
             void vw;
         }
@@ -493,13 +529,40 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             }
         }
 
+        /** Frees every GPU object and loses the context. Idempotent; safe before init() or after a context loss. */
         destroy() {
             this.stop();
+            if (this.destroyed) return;
+            this.destroyed = true;
+            this.canvas.removeEventListener('webglcontextlost', this.onContextLost);
             const gl = this.gl;
             if (gl) {
+                // On a lost context the objects are already gone and delete* calls are no-ops.
+                if (!gl.isContextLost()) {
+                    try {
+                        gl.bindVertexArray(null);
+                        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                        gl.bindTexture(gl.TEXTURE_2D, null);
+                        gl.useProgram(null);
+                        if (this.pendingQuery) gl.deleteQuery(this.pendingQuery);
+                        if (this.videoTex) gl.deleteTexture(this.videoTex);
+                        if (this.fbo) { gl.deleteFramebuffer(this.fbo.fb); gl.deleteTexture(this.fbo.tex); }
+                        for (const prog of Object.values(this.programs)) this.deleteProgram(prog);
+                        if (this.vao) gl.deleteVertexArray(this.vao);
+                        if (this.vbo) gl.deleteBuffer(this.vbo);
+                    } catch (_) { /* best effort: the context is lost next anyway */ }
+                }
                 const lose = gl.getExtension('WEBGL_lose_context');
-                if (lose) lose.loseContext();
+                if (lose && !gl.isContextLost()) lose.loseContext();
             }
+            this.pendingQuery = null;
+            this.videoTex = null;
+            this.fbo = null;
+            this.programs = {};
+            this.vao = null;
+            this.vbo = null;
+            this.timerExt = null;
             this.gl = null;
         }
     }

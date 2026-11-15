@@ -11,3 +11,4 @@ Thumbs.db
 
 # Chrome writes this when it loads an unpacked extension
 dist/*/_metadata/
+FEATURES.md

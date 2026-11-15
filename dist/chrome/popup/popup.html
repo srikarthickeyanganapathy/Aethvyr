@@ -206,8 +206,10 @@
                     <div class="field">
                         <label for="s-maxBufferSec">Pre-buffer ahead</label>
                         <select id="s-maxBufferSec" name="maxBufferSec" data-type="number">
-                            <option value="60">1 min (data saver)</option>
+                            <option value="30">30 s (data saver)</option>
+                            <option value="60">1 min</option>
                             <option value="300">5 min</option>
+                            <option value="900">15 min</option>
                             <option value="1800">30 min</option>
                             <option value="86400">Whole video</option>
                         </select>
@@ -215,9 +217,11 @@
                     <div class="field">
                         <label for="s-cacheSizeMB">Cache per tab</label>
                         <select id="s-cacheSizeMB" name="cacheSizeMB" data-type="number">
-                            <option value="300">300 MB</option>
-                            <option value="1000">1 GB</option>
+                            <option value="256">256 MB</option>
+                            <option value="512">512 MB</option>
+                            <option value="1024">1 GB</option>
                             <option value="2048">2 GB</option>
+                            <option value="4096">4 GB</option>
                             <option value="5120">5 GB</option>
                         </select>
                     </div>
@@ -225,8 +229,11 @@
                         <label for="s-maxWorkers">Parallel downloads</label>
                         <select id="s-maxWorkers" name="maxWorkers" data-type="number">
                             <option value="2">2 (battery saver)</option>
+                            <option value="3">3</option>
                             <option value="4">4</option>
+                            <option value="5">5</option>
                             <option value="6">6</option>
+                            <option value="7">7</option>
                             <option value="8">8 (fastest)</option>
                         </select>
                     </div>

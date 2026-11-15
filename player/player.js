@@ -20,6 +20,9 @@
     const params = new URLSearchParams(location.search);
     const sessionId = params.get('session');
     const streamId = params.get('stream');
+    /** Must match DEEP_SETTINGS in player-ui.js. */
+    const DEEP_SETTINGS = ['audio', 'subtitles', 'gestures', 'mouse', 'memory'];
+    const isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
 
     class EnginePort {
         constructor() {
@@ -85,6 +88,13 @@
             port.postMessage({ type: 'HELLO', sessionId, streamId, resumed: !!resumed });
         }
 
+        /** Runs storage read-modify-write steps one at a time (concurrent ones lost updates). */
+        serial(fn) {
+            const run = (this.writeChain || Promise.resolve()).then(fn);
+            this.writeChain = run.catch(() => { /* keep the chain alive */ });
+            return run;
+        }
+
         async readSettings() {
             const res = await api.storage.local.get(S.SETTINGS_KEY);
             return S.mergeSettings(res[S.SETTINGS_KEY]);
@@ -95,11 +105,18 @@
                 case 'SETTINGS_GET':
                     this.deliver({ type: 'SETTINGS', reqId: msg.reqId, settings: await this.readSettings() });
                     return true;
-                case 'SETTINGS_SET': {
-                    const current = await this.readSettings();
-                    await api.storage.local.set({ [S.SETTINGS_KEY]: S.mergeSettings({ ...current, ...(msg.patch || {}) }) });
+                case 'SETTINGS_SET':
+                    // The player sends only the fields the user edited; sub-objects arrive as
+                    // partial objects and are merged field by field (keymap: null = defaults).
+                    await this.serial(async () => {
+                        const current = await this.readSettings();
+                        const next = { ...current };
+                        for (const [k, v] of Object.entries(msg.patch || {})) {
+                            next[k] = DEEP_SETTINGS.includes(k) && isPlainObject(v) && isPlainObject(current[k]) ? { ...current[k], ...v } : v;
+                        }
+                        await api.storage.local.set({ [S.SETTINGS_KEY]: S.mergeSettings(next) });
+                    });
                     return true;
-                }
                 case 'STORE_GET': {
                     if (typeof msg.key !== 'string' || !msg.key.startsWith('fs_bm_')) return true;
                     const res = await api.storage.local.get(msg.key);
@@ -118,13 +135,15 @@
                 }
                 case 'HISTORY_SAVE': {
                     if (typeof msg.key !== 'string' || !msg.entry) return true;
-                    const all = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
-                    all[msg.key] = { ...msg.entry, updatedAt: Date.now() };
-                    const keys = Object.keys(all);
-                    if (keys.length > 200) {
-                        keys.sort((a, b) => all[a].updatedAt - all[b].updatedAt).slice(0, keys.length - 200).forEach(k => delete all[k]);
-                    }
-                    await api.storage.local.set({ [S.HISTORY_KEY]: all });
+                    await this.serial(async () => {
+                        const all = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
+                        all[msg.key] = { ...msg.entry, updatedAt: Date.now() };
+                        const keys = Object.keys(all);
+                        if (keys.length > 200) {
+                            keys.sort((a, b) => (all[a].updatedAt || 0) - (all[b].updatedAt || 0)).slice(0, keys.length - 200).forEach(k => delete all[k]);
+                        }
+                        await api.storage.local.set({ [S.HISTORY_KEY]: all });
+                    });
                     return true;
                 }
                 default:
@@ -134,7 +153,13 @@
 
         postMessage(msg) {
             if (this.closed || !msg) return;
-            this.handleLocal(msg).then(handled => {
+            this.handleLocal(msg).catch((err) => {
+                // Storage failure: answer requests so the UI does not wait for its timeout.
+                console.warn('[Velostream] Local storage request failed:', err);
+                if (msg.type === 'SETTINGS_GET') this.deliver({ type: 'SETTINGS', reqId: msg.reqId, settings: S.mergeSettings(undefined) });
+                else if (msg.type === 'STORE_GET' || msg.type === 'HISTORY_GET') this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: null });
+                return true;
+            }).then(handled => {
                 if (handled) return;
                 if (msg.type === 'REQUEST') this.pending.set(msg.reqId, msg);
                 else if (msg.type === 'ABORT') this.pending.delete(msg.reqId);

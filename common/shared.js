@@ -130,6 +130,11 @@
         settingsVersion: 3
     });
 
+    /** Option lists shared by the popup and the player's settings panel. */
+    const PREBUFFER_SECONDS = Object.freeze([30, 60, 300, 900, 1800, 86400]);
+    const CACHE_SIZES_MB = Object.freeze([256, 512, 1024, 2048, 4096, 5120]);
+    const LEGACY_CACHE_MB = Object.freeze({ 300: 256, 1000: 1024 });
+
     function isPlainObject(v) {
         return v !== null && typeof v === 'object' && !Array.isArray(v);
     }
@@ -144,7 +149,9 @@
             } else if (Array.isArray(def)) {
                 out[key] = Array.isArray(val) ? val.slice() : def.slice();
             } else {
-                out[key] = (val === undefined || val === null || typeof val !== typeof def) ? def : val;
+                // NaN / Infinity (e.g. Number('') from a form) would survive Math.min/max clamps.
+                const bad = val === undefined || val === null || typeof val !== typeof def || (typeof def === 'number' && !Number.isFinite(val));
+                out[key] = bad ? def : val;
             }
         }
         return out;
@@ -173,6 +180,10 @@
         if (!['mp4', 'original'].includes(out.exportFormat)) out.exportFormat = 'mp4';
         out.gestures.doubleTapZoneWidth = Math.min(0.45, Math.max(0.2, out.gestures.doubleTapZoneWidth));
         out.siteProfiles = out.siteProfiles.filter(p => isPlainObject(p) && typeof p.host === 'string').slice(0, 200);
+        // Older popups offered 300 MB / 1000 MB; the popup and the player now share CACHE_SIZES_MB.
+        // Snap those legacy values onto the list (idempotent, so no settingsVersion bump is needed).
+        // Any other value inside the 32-8192 clamp is kept as is (the UIs show it as a custom option).
+        if (LEGACY_CACHE_MB[out.cacheSizeMB]) out.cacheSizeMB = LEGACY_CACHE_MB[out.cacheSizeMB];
         out.cacheSizeMB = Math.min(8192, Math.max(32, out.cacheSizeMB));
         out.memory.volume = Math.min(1, Math.max(0, out.memory.volume));
         out.autoSites = out.autoSites.filter(h => typeof h === 'string' && h.length < 256).slice(0, 500);
@@ -301,15 +312,31 @@
     const URL_ATTRS = new Set(['href', 'src', 'xlink:href', 'action', 'formaction', 'srcdoc', 'poster', 'data']);
     const SAFE_URL = /^(?:\s*(?:https?:|blob:|data:image\/(?:png|jpe?g|gif|webp);|#|\/|\.{0,2}\/|[\w-]+\.))/i;
 
+    // SVG animation elements can rewrite an attribute after sanitizing (<animate attributeName="href"
+    // values="javascript:…">), so the ones that target a URL attribute are dropped.
+    const ANIMATION_TAGS = new Set(['animate', 'set', 'animatemotion', 'animatetransform']);
+    // Inline styles cannot run script in current engines, but legacy expression()/-moz-binding and
+    // javascript: inside url() are stripped anyway (cheap test; normal UI styles never contain them).
+    const UNSAFE_STYLE = /expression\s*\(|-moz-binding|behavior\s*:|url\s*\(\s*['"]?\s*(?:javascript|vbscript|data:(?!image\/(?:png|jpe?g|gif|webp)))/i;
+
     function sanitizeTree(node) {
-        const walker = node.ownerDocument.createTreeWalker(node, 1 /* NodeFilter.SHOW_ELEMENT */);
+        const walker = (node.ownerDocument || node).createTreeWalker(node, 1 /* NodeFilter.SHOW_ELEMENT */);
         const remove = [];
         for (let el = walker.nextNode(); el; el = walker.nextNode()) {
-            if (BLOCKED_TAGS.has(el.localName.toLowerCase())) { remove.push(el); continue; }
+            const tag = el.localName.toLowerCase();
+            if (BLOCKED_TAGS.has(tag)) { remove.push(el); continue; }
+            if (ANIMATION_TAGS.has(tag)) {
+                const target = (el.getAttribute('attributeName') || el.getAttribute('attributename') || '').toLowerCase();
+                if (URL_ATTRS.has(target) || target.endsWith(':href') || target.startsWith('on')) { remove.push(el); continue; }
+            }
+            // <template> content lives in its own fragment that the walker does not enter.
+            if (tag === 'template' && el.content) sanitizeTree(el.content);
             for (const attr of [...el.attributes]) {
                 const name = attr.name.toLowerCase();
+                const local = (attr.localName || name).toLowerCase();
                 if (name.startsWith('on') || name === 'srcdoc') el.removeAttribute(attr.name);
-                else if (URL_ATTRS.has(name) && attr.value && !SAFE_URL.test(attr.value)) el.removeAttribute(attr.name);
+                else if ((URL_ATTRS.has(name) || URL_ATTRS.has(local)) && attr.value && !SAFE_URL.test(attr.value)) el.removeAttribute(attr.name);
+                else if (name === 'style' && UNSAFE_STYLE.test(attr.value)) el.removeAttribute(attr.name);
             }
         }
         remove.forEach(el => el.remove());
@@ -351,6 +378,8 @@
             rose: { label: 'Rose', fill: '#FF375F', strong: '#C21E45' }
         }),
         mergeSettings,
+        PREBUFFER_SECONDS,
+        CACHE_SIZES_MB,
         toBase64,
         fromBase64,
         packBinary,

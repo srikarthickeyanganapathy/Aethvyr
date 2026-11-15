@@ -32,6 +32,8 @@ body.hc { --card: #1c1c1e; --border: rgba(255, 255, 255, 0.45); --text-2: #fff; 
 body.reduce-motion *, body.reduce-motion *::before, body.reduce-motion *::after { transition-duration: 0s !important; animation: none !important; }
 
 *, *::before, *::after { box-sizing: border-box; }
+/* `display` on .btn / .card etc. would otherwise override the hidden attribute (e.g. "Clear history"). */
+[hidden] { display: none !important; }
 html { min-width: 340px; background: var(--bg); }
 body {
     margin: 0 auto; width: 100%; max-width: 420px; min-width: 340px;

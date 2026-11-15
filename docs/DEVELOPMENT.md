@@ -2,7 +2,7 @@
 
 ## Setup
 
-Requirements: **Node.js 18+** and npm. Development uses Chromium 111+ or Firefox 140+ (Firefox for Android 142+).
+Requirements: **Node.js 18+** and npm. Development uses Chromium 111+ or Firefox 128+ (desktop and Android).
 
 ```bash
 git clone https://github.com/srikarthickeyanganapathy/playerstreamextension.git
@@ -28,7 +28,7 @@ to `lib/shaka-player.compiled.js` with its license. It then writes the browser-s
 `manifest.json`, with the version taken from `package.json`:
 
 - **Chrome:** `minimum_chrome_version: "111"`.
-- **Firefox:** `browser_specific_settings.gecko` (id, `strict_min_version` 140, Android 142, `data_collection_permissions`), and
+- **Firefox:** `browser_specific_settings.gecko` (id, `strict_min_version` 128, Android 128, `data_collection_permissions`), and
   the background becomes an event page (`background.scripts`).
 
 Finally it verifies that every file the manifest references exists and that the DNR rules parse.
@@ -122,9 +122,12 @@ re-check before a release.
 
 ### Before the first public release
 
-- [ ] **Gecko add-on ID.** `scripts/build.js` uses `velostream@antigravity.dev`. Change it to an
-      ID you control (an e-mail-style ID on your own domain, or a `{uuid}`) **before the first AMO
-      upload**: AMO ties the listing to it permanently.
+- [x] **Gecko add-on ID.** `scripts/build.js` uses `velostream@srikarthickeyanganapathy.github.io`.
+      **Never change it again and never delete the add-on on AMO**: AMO ties the add-on to its ID
+      forever, and a deleted add-on's ID can never be uploaded again ("Duplicate add-on ID found").
+      The first ID, `velostream@antigravity.dev`, was lost that way. To change visibility, use
+      *Manage Status & Versions* instead of deleting: switch between listed and unlisted, or
+      disable the add-on.
 - [ ] **Name.** `manifest.json` says `Velostream 2.0`. Store listings usually use the bare name;
       the version is shown separately.
 - [ ] Fill `author` and `homepage_url` (in `manifest.json` and `package.json`).
@@ -165,7 +168,7 @@ re-check before a release.
   own code is not minified, so no other source upload is needed.
 - Reviewer notes: explain the MAIN-world content script (stream detection in the page's own
   `fetch`/XHR) and that no remote code is loaded.
-- **Expected linter result:** 0 errors and 8 warnings, all `UNSUPPORTED_API` inside
+- **Expected linter result:** 0 errors and 10 warnings: two `KEY_FIREFOX*_UNSUPPORTED_BY_MIN_VERSION` notes (data_collection_permissions is understood from Firefox 140 / Android 142; 128-139 ignore it) and eight `UNSUPPORTED_API` inside
   `lib/shaka-player.compiled.js` (`cast.*` and `webview.hostObjects`). These are Shaka's
   feature-detection checks for Chromecast and Windows WebView2: they test whether the API exists
   and are skipped when it does not, so they never run in Firefox. They cannot be removed without

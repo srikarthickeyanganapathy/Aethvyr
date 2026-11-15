@@ -38,7 +38,9 @@
     const EXTERNAL_APPS = [['potplayer', 'PotPlayer', 'Windows'], ['vlc', 'VLC', 'needs vlc:// handler on desktop'], ['mpv', 'mpv', 'needs mpv:// handler'], ['iina', 'IINA', 'macOS'], ['android', 'Android video app', 'MX Player, VLC…']];
     const GPU_PRESETS = [['off', 'Off'], ['cas', 'Fast Sharpen (CAS)'], ['fsr', 'Upscale + sharpen (FSR-style)'], ['anime4k', 'Anime line reconstruction'], ['deband', 'Deband (smooth gradients)']];
     const PREBUFFER_WINDOWS = [[30, '30 seconds'], [60, '1 minute'], [300, '5 minutes'], [900, '15 minutes'], [1800, '30 minutes'], [86400, 'Whole video']];
-    const CACHE_CAPS = [[256, '256 MB'], [512, '512 MB'], [1024, '1 GB'], [2048, '2 GB'], [4096, '4 GB']];
+    const CACHE_CAPS = [[256, '256 MB'], [512, '512 MB'], [1024, '1 GB'], [2048, '2 GB'], [4096, '4 GB'], [5120, '5 GB']];
+    /** Settings sub-objects that are merged field by field (never replaced wholesale). */
+    const DEEP_SETTINGS = ['audio', 'subtitles', 'gestures', 'mouse', 'memory'];
     const TAP_ACTIONS = [['seekBack', 'Seek back'], ['seekFwd', 'Seek forward'], ['playPause', 'Play / pause'], ['fullscreen', 'Full screen'], ['pip', 'Picture in Picture'], ['none', 'Nothing']];
     const QUALITY_CAPS = [[0, 'No limit'], [2160, '2160p'], [1440, '1440p'], [1080, '1080p'], [720, '720p'], [480, '480p'], [360, '360p']];
     const FONTS = {
@@ -198,8 +200,20 @@
         return (+m[1] || 0) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4].padEnd(3, '0')) / 1000;
     }
 
+    const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
+    /** Code point -> string; NUL, surrogates and anything beyond U+10FFFF become U+FFFD. */
+    function safeCodePoint(cp) {
+        if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return '\ufffd';
+        return String.fromCodePoint(cp);
+    }
+
+    /** Single pass, so "&amp;lt;" stays the literal text "&lt;". Unknown names are kept as is. */
     function decodeEntities(s) {
-        return s.replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (_, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", nbsp: '\u00a0' }[e]));
+        return String(s).replace(/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([a-zA-Z]+));/g, (m, dec, hex, name) => {
+            if (dec) return safeCodePoint(dec.length > 8 ? Infinity : parseInt(dec, 10));
+            if (hex) return safeCodePoint(hex.length > 6 ? Infinity : parseInt(hex, 16));
+            return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, name) ? NAMED_ENTITIES[name] : m;
+        });
     }
 
     /** Parse SRT or WebVTT text into [{start, end, text}]. */
@@ -219,7 +233,14 @@
             const parts = line.slice(9).split(',');
             const textIdx = f.indexOf('text');
             const val = k => (parts[f.indexOf(k)] || '').trim();
-            const body = parts.slice(textIdx).join(',').replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, '\n').replace(/\\h/g, ' ');
+            // {\...} override blocks, \N / \n line breaks, \h hard space; then inline HTML-ish
+            // tags (some encoders emit <i>), and finally entities on the plain text.
+            const body = decodeEntities(parts.slice(textIdx).join(',')
+                .replace(/\{[^}]*\}/g, '')
+                .replace(/\\[Nn]/g, '\n')
+                .replace(/\\h/g, ' ')
+                .replace(/<[^>]+>/g, ''))
+                .split('\n').map(l => l.replace(/^[ \t]+|[ \t]+$/g, '')).join('\n');
             const start = parseTimestamp(val('start'));
             const end = parseTimestamp(val('end'));
             if (Number.isFinite(start) && Number.isFinite(end) && body.trim()) cues.push({ start, end, text: body.trim() });
@@ -321,7 +342,10 @@
 
         static async pick(container, filename, mime) {
             const sink = new ExportSink(container, filename, mime);
-            if (typeof window.showSaveFilePicker === 'function') {
+            // The picker needs transient user activation in this frame. A remote "Download"
+            // (popup -> engine -> COMMAND 'export') has none: go straight to the downloads sink
+            // instead of letting the picker throw (or, worse, hang waiting for a gesture).
+            if (typeof window.showSaveFilePicker === 'function' && hasActivation()) {
                 try {
                     const ext = (/\.([a-z0-9]+)$/i.exec(sink.filename) || ['', 'mp4'])[1];
                     const handle = await window.showSaveFilePicker({
@@ -354,6 +378,59 @@
             this.parts = [];
             if (this.writable) { try { await this.writable.abort(); } catch (_) { /* ignore */ } this.writable = null; }
         }
+    }
+
+    // ---- Settings layering: raw (storage) -> site profile -> session overrides ----
+    const isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
+    const cloneValue = v => (Array.isArray(v) ? v.slice() : isPlainObject(v) ? { ...v } : v);
+    const sameValue = (a, b) => a === b || (typeof a === 'object' && typeof b === 'object' && JSON.stringify(a) === JSON.stringify(b));
+    const hasOwn = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+
+    /** Copy whose sub-objects (and their arrays, e.g. audio.eq) are not shared with the source. */
+    function cloneSettings(s) {
+        const out = { ...(s || {}) };
+        for (const k of DEEP_SETTINGS) {
+            if (!isPlainObject(out[k])) continue;
+            const sub = {};
+            for (const [sk, sv] of Object.entries(out[k])) sub[sk] = cloneValue(sv);
+            out[k] = sub;
+        }
+        return out;
+    }
+
+    /** Overlay a partial settings object; sub-objects of DEEP_SETTINGS merge per field. */
+    function overlaySettings(target, partial, only) {
+        for (const [k, v] of Object.entries(partial || {})) {
+            if (DEEP_SETTINGS.includes(k) && isPlainObject(v)) {
+                const sub = { ...(target[k] || {}) };
+                for (const [sk, sv] of Object.entries(v)) {
+                    if (!only || (only[k] && hasOwn(only[k], sk))) sub[sk] = cloneValue(sv);
+                }
+                target[k] = sub;
+            } else if (!only || hasOwn(only, k)) {
+                target[k] = cloneValue(v);
+            }
+        }
+        return target;
+    }
+
+    /** The fields a site profile controls, as a partial settings object. */
+    function profileFields(p) {
+        const out = {};
+        if (!p) return out;
+        if (Number.isFinite(p.defaultSpeed)) out.defaultSpeed = p.defaultSpeed;
+        if (Number.isFinite(p.qualityCap)) out.qualityCap = p.qualityCap;
+        if (typeof p.shader === 'string') out.shader = p.shader;
+        if (Number.isFinite(p.shaderStrength)) out.shaderStrength = p.shaderStrength;
+        if (typeof p.audioPreset === 'string') out.audio = { preset: p.audioPreset };
+        if (Number.isFinite(p.subSize)) out.subtitles = { size: p.subSize };
+        return out;
+    }
+
+    /** Options for a <select>, plus the stored value when it is not one of them (never blank). */
+    function withCurrentOption(pairs, value, label) {
+        if (value == null || value === '' || pairs.some(([v]) => String(v) === String(value))) return pairs;
+        return pairs.concat([[value, label(value)]]);
     }
 
     const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
@@ -407,15 +484,23 @@
             this.ctx = null;
             this.nodes = null;
             this.levels = null;
+            /** Set by the player once a crossorigin="anonymous" file loaded its metadata with CORS. */
+            this.corsOk = false;
         }
 
         get active() { return !!this.ctx; }
 
-        /** Web Audio taps a cross-origin, non-CORS media element as silence: only allow when safe. */
+        /**
+         * Web Audio taps a cross-origin, non-CORS media element as silence: only allow when safe.
+         * MSE (blob:) is always same-origin; a direct file is safe when it was fetched with CORS
+         * (the engine adds Access-Control-Allow-Origin for media requests from the extension).
+         */
         allowed() {
-            const src = this.video.currentSrc || '';
+            const v = this.video;
+            const src = v.currentSrc || '';
             if (!src) return false;
             if (src.startsWith('blob:')) return true;
+            if (this.corsOk && v.getAttribute('crossorigin') !== null) return true;
             try { return new URL(src).origin === location.origin; } catch (_) { return false; }
         }
 
@@ -974,7 +1059,13 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.timers = new Set();
             this.net = new Map();
             this.netSeq = 0;
-            this.settings = null;
+            this.settings = null;          // effective: rawSettings + site profile + session overrides
+            this.rawSettings = null;       // exactly what storage holds (plus our unsent edits)
+            this.sessionOverrides = {};    // in-session edits of profile-controlled fields
+            this.profileValues = {};
+            this.pendingPatch = null;
+            this.loadGen = 0;
+            this.corsUnavailable = false;  // direct file refused CORS once: load it without for this session
             this.stream = null;
             this.player = null;
             this.mode = 'mse';
@@ -1023,7 +1114,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             const [settingsMsg, init] = await Promise.all([this.port.request('SETTINGS_GET'), this.initPromise]);
             this.pageUrl = init.pageUrl || '';
             this.stream = init.stream;
-            this.settings = this.withProfile(settingsMsg.settings);
+            this.rawSettings = cloneSettings(settingsMsg.settings);
+            this.recomputeSettings();
             if (this.profile) this.island('studio', `Site profile · ${this.profile.host}`, null, 2500);
             this.tabId = init.tabId;
             this.sessionId = init.sessionId;
@@ -1123,20 +1215,29 @@ input[type="text"] { width: 100%; min-width: 0; }
             return '';
         }
 
-        /** Overlay the matching site profile (speed, quality cap, shader, EQ, subtitle size) on settings. */
-        withProfile(settings) {
+        /** The site profile matching this page (most specific host wins), or null. */
+        findProfile(settings) {
             const host = this.stream ? this.siteHost() : '';
-            const list = (settings && settings.siteProfiles) || [];
-            const p = host ? list.find(x => host === x.host || host.endsWith(`.${x.host}`)) : null;
-            this.profile = p || null;
-            if (!p) return settings;
-            const out = { ...settings };
-            if (Number.isFinite(p.defaultSpeed)) out.defaultSpeed = p.defaultSpeed;
-            if (Number.isFinite(p.qualityCap)) out.qualityCap = p.qualityCap;
-            if (typeof p.shader === 'string') out.shader = p.shader;
-            if (Number.isFinite(p.shaderStrength)) out.shaderStrength = p.shaderStrength;
-            if (typeof p.audioPreset === 'string') out.audio = { ...out.audio, preset: p.audioPreset };
-            if (Number.isFinite(p.subSize)) out.subtitles = { ...out.subtitles, size: p.subSize };
+            const list = ((settings && settings.siteProfiles) || []).filter(x => x && typeof x.host === 'string' && x.host);
+            if (!host) return null;
+            return list.filter(x => host === x.host || host.endsWith(`.${x.host}`))
+                .sort((a, b) => b.host.length - a.host.length)[0] || null;
+        }
+
+        /**
+         * this.settings = rawSettings, overlaid with the matching site profile (speed, quality
+         * cap, shader, EQ preset, subtitle size), overlaid with this session's explicit edits of
+         * those profile-controlled fields. The profile layer is never written back to storage.
+         */
+        recomputeSettings() {
+            if (!this.rawSettings) return null;
+            const out = cloneSettings(this.rawSettings);
+            this.profile = this.findProfile(this.rawSettings);
+            this.profileValues = profileFields(this.profile);
+            overlaySettings(out, this.profileValues);
+            // Overrides only matter for fields a profile still controls.
+            overlaySettings(out, this.sessionOverrides, this.profileValues);
+            this.settings = out;
             return out;
         }
 
@@ -1148,17 +1249,18 @@ input[type="text"] { width: 100%; min-width: 0; }
                 shader: this.settings.shader || 'off', shaderStrength: this.settings.shaderStrength,
                 audioPreset: this.settings.audio.preset, subSize: this.settings.subtitles.size, savedAt: Date.now()
             };
-            const list = (this.settings.siteProfiles || []).filter(x => x.host !== host).concat([p]).slice(-200);
+            const list = (this.rawSettings.siteProfiles || []).filter(x => x.host !== host).concat([p]).slice(-200);
+            // The profile now holds the session's values: they no longer need to be overrides.
+            this.sessionOverrides = {};
             this.saveSettings({ siteProfiles: list });
-            this.profile = p;
             this.announce(`Saved profile for ${host}`, 'check');
             this.refreshPopover();
         }
 
         removeSiteProfile() {
             const host = this.profile ? this.profile.host : this.siteHost();
-            this.saveSettings({ siteProfiles: (this.settings.siteProfiles || []).filter(x => x.host !== host) });
-            this.profile = null;
+            this.sessionOverrides = {};
+            this.saveSettings({ siteProfiles: (this.rawSettings.siteProfiles || []).filter(x => x.host !== host) });
             this.announce(`Removed profile for ${host}`, 'check');
             this.refreshPopover();
         }
@@ -1223,9 +1325,20 @@ input[type="text"] { width: 100%; min-width: 0; }
         async load(startTime) {
             const v = this.video;
             const type = this.stream.type;
+            const gen = ++this.loadGen;
             this.hideError();
             if (type === 'progressive') {
                 this.mode = 'native';
+                // Request the file with CORS so Web Audio, WebGL shaders, snapshots and smart skip
+                // can read it (an untainted element). The engine answers media requests from the
+                // extension with Access-Control-Allow-Origin; if the file still fails before its
+                // metadata (no CORS, or the server needs cookies), the 'error' handler reloads it
+                // once without crossorigin and remembers that for this session.
+                this.audio.corsOk = false;
+                this.nativeMetaOk = false;
+                this.nativeStart = startTime || 0;
+                if (this.corsUnavailable) v.removeAttribute('crossorigin');
+                else v.crossOrigin = 'anonymous';
                 v.src = this.stream.url;
                 if (startTime) v.currentTime = startTime;
             } else {
@@ -1253,12 +1366,13 @@ input[type="text"] { width: 100%; min-width: 0; }
                     if (err && typeof err.code === 'number') { this.onShakaError({ code: err.code, data: err.data, severity: 2 }); return; }
                     throw err;
                 }
+                if (gen !== this.loadGen || this.closed) return; // superseded by a newer load()
                 this.onTracksChanged();
             }
             v.playbackRate = this.settings.defaultSpeed || 1;
             this.restoreRememberedState();
             this.setupMediaSession();
-            await this.startPlayback();
+            await this.startPlayback(gen);
         }
 
         /**
@@ -1266,12 +1380,16 @@ input[type="text"] { width: 100%; min-width: 0; }
          * without overwriting the remembered mute state, and unmute on the first tap or key press.
          * Only when muted playback also fails does the player wait paused for a press on Play.
          */
-        async startPlayback() {
+        async startPlayback(gen = this.loadGen) {
             const v = this.video;
+            // A newer load() (retry, CORS fallback, fresh link) replaced the source: its own
+            // startPlayback() decides; this one must not show "Press play" or mute anything.
+            const stale = () => this.closed || gen !== this.loadGen;
             try {
                 await v.play();
                 return;
             } catch (e) {
+                if (stale() || (e && e.name === 'AbortError')) return;
                 if (!e || e.name !== 'NotAllowedError' || v.muted) { this.waitForPlay(); return; }
             }
             this.autoMuted = true;          // volumechange must not remember this mute
@@ -1281,17 +1399,24 @@ input[type="text"] { width: 100%; min-width: 0; }
             } catch (_) {
                 this.autoMuted = false;
                 this.restoreRememberedState();
-                this.waitForPlay();
+                if (!stale()) this.waitForPlay();
                 return;
             }
+            if (stale()) return;
             this.showMutedNotice();
             this.announceOnly('Autoplaying muted. Tap or press any key to unmute.');
+            this.removeUnmuteListeners();
             const unmute = (e) => {
-                // The unmuting tap on the video is consumed: it must not also pause playback.
-                if (e && e.type === 'pointerdown' && e.target && e.target.classList && e.target.classList.contains('gesture')) e.stopPropagation();
-                this.root.removeEventListener('pointerdown', unmute, true);
-                this.root.removeEventListener('keydown', unmute, true);
-                if (!this.autoMuted) return;
+                this.removeUnmuteListeners();
+                if (!this.autoMuted || this.closed) return;
+                // The unmuting tap must not also pause playback, but it must still reach the
+                // gesture layer (first swipe / pinch / double-tap work immediately): handleTap()
+                // skips play/pause for this one tap instead of the event being swallowed here.
+                if (e && e.type === 'pointerdown' && e.target && e.target.classList && e.target.classList.contains('gesture')) {
+                    this.justUnmuted = true;
+                    clearTimeout(this.justUnmutedTimer);
+                    this.justUnmutedTimer = setTimeout(() => { this.justUnmuted = false; }, 1500);
+                }
                 const m = (this.settings && this.settings.memory) || {};
                 v.muted = !!m.muted;
                 if (!m.muted && !v.volume) v.volume = 1;
@@ -1299,8 +1424,17 @@ input[type="text"] { width: 100%; min-width: 0; }
                 setTimeout(() => { this.autoMuted = false; }, 0);
                 this.island(v.muted ? 'mute' : 'volume', v.muted ? 'Muted' : `Sound on · ${Math.round(v.volume * 100)}%`);
             };
+            this.unmuteHandler = unmute;
             this.root.addEventListener('pointerdown', unmute, true);
             this.root.addEventListener('keydown', unmute, true);
+        }
+
+        removeUnmuteListeners() {
+            const h = this.unmuteHandler;
+            if (!h) return;
+            this.unmuteHandler = null;
+            this.root.removeEventListener('pointerdown', h, true);
+            this.root.removeEventListener('keydown', h, true);
         }
 
         waitForPlay() {
@@ -1439,19 +1573,21 @@ input[type="text"] { width: 100%; min-width: 0; }
             clearTimeout(this.hideTimer);
             clearTimeout(this.islandTimer);
             clearTimeout(this.saveTimer);
+            clearTimeout(this.justUnmutedTimer);
             clearInterval(this.sleepFadeTimer);
-            // Flush debounced saves (remembered volume/quality/subtitles and speed).
-            const flush = { ...(this.pendingPatch || {}) };
-            if (this.memoryTimer && this.settings) flush.memory = { ...this.settings.memory };
-            if (this.speedTimer && this.pendingSpeed) flush.defaultSpeed = this.pendingSpeed;
-            clearTimeout(this.memoryTimer);
+            this.removeUnmuteListeners();
+            // Flush debounced saves (remembered volume/quality/subtitles and speed). Everything
+            // goes through stageSettings(), so only edited fields reach storage - never the
+            // site profile's values.
+            if (this.speedTimer && this.pendingSpeed) this.stageSettings({ defaultSpeed: this.pendingSpeed });
             clearTimeout(this.speedTimer);
-            if (Object.keys(flush).length) this.port.send({ type: 'SETTINGS_SET', patch: flush });
+            this.speedTimer = null;
+            this.flushSettings();
             for (const d of this.disposers.splice(0)) { try { d(); } catch (_) { /* ignore */ } }
             for (const e of this.net.values()) { try { e.reject(new Error('closed')); } catch (_) { /* ignore */ } }
             this.net.clear();
             if (this.resizeObserver) this.resizeObserver.disconnect();
-            if (this.gpu) { this.gpu.destroy(); this.gpu = null; }
+            this.destroyGpu();
             try { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => { }); } catch (_) { /* ignore */ }
             try { if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); } catch (_) { /* ignore */ }
             try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (_) { /* ignore */ }
@@ -1513,7 +1649,11 @@ input[type="text"] { width: 100%; min-width: 0; }
                     this.applyAbrSwitch(msg.variantId);
                     break;
                 case 'SETTINGS_CHANGED':
-                    this.settings = this.withProfile(msg.settings);
+                    if (!this.rawSettings) break; // start() has not read the settings yet
+                    this.rawSettings = cloneSettings(msg.settings);
+                    // Edits still waiting in the debounce are not in storage yet: keep them.
+                    if (this.pendingPatch) overlaySettings(this.rawSettings, this.pendingPatch);
+                    this.recomputeSettings();
                     this.applySettings();
                     this.refreshPopover();
                     break;
@@ -1717,12 +1857,78 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.later(0, () => this.layoutVideo());
         }
 
+        /** Apply a user edit now and persist it (debounced). */
         saveSettings(patch) {
-            Object.assign(this.settings, patch);
+            if (!this.rawSettings) return;
+            this.stageSettings(patch);
             this.applySettings();
+            this.scheduleSettingsFlush(250);
+        }
+
+        /**
+         * Merge an edit into rawSettings / sessionOverrides and recompute this.settings.
+         * Callers often pass a whole sub-object ({ audio: { ...this.settings.audio, boost } }) that
+         * also carries the site profile's values, so only fields that really changed count:
+         *   - a profile-controlled field counts when it differs from what the session showed
+         *     (override if any, else the profile value). It then wins for this session only (session
+         *     override) and is NOT written to the global settings: on a profiled site, speed,
+         *     quality cap, GPU preset/strength, EQ preset and subtitle size are site-specific.
+         *     "Update profile with current setup" stores them in the profile;
+         *   - any other field counts when it differs from the stored value.
+         * Changed fields are queued in pendingPatch (sub-objects as partial objects; the bridge
+         * deep-merges them), so a profile's values never reach the global settings.
+         */
+        stageSettings(patch) {
+            const raw = this.rawSettings;
+            if (!raw || !patch) return false;
+            const pv = this.profileValues || {};
+            const ov = this.sessionOverrides;
+            const pend = this.pendingPatch || {};
+            let changed = false;
+            const queue = (k, sk, val) => {
+                if (sk == null) { pend[k] = cloneValue(val); raw[k] = cloneValue(val); } else {
+                    pend[k] = { ...(isPlainObject(pend[k]) ? pend[k] : {}), [sk]: cloneValue(val) };
+                    raw[k] = { ...(raw[k] || {}), [sk]: cloneValue(val) };
+                }
+                changed = true;
+            };
+            for (const [k, val] of Object.entries(patch)) {
+                if (DEEP_SETTINGS.includes(k) && isPlainObject(val)) {
+                    for (const [sk, sv] of Object.entries(val)) {
+                        if (pv[k] && hasOwn(pv[k], sk)) {
+                            const shown = ov[k] && hasOwn(ov[k], sk) ? ov[k][sk] : pv[k][sk];
+                            if (sameValue(sv, shown)) continue;           // carried along, not edited
+                            ov[k] = { ...(ov[k] || {}), [sk]: cloneValue(sv) };
+                            changed = true;
+                            continue;                                     // session-only
+                        }
+                        if (!sameValue(sv, (raw[k] || {})[sk])) queue(k, sk, sv);
+                    }
+                } else if (hasOwn(pv, k)) {
+                    const shown = hasOwn(ov, k) ? ov[k] : pv[k];
+                    if (sameValue(val, shown)) continue;
+                    ov[k] = cloneValue(val);                              // session-only
+                    changed = true;
+                } else if (!sameValue(val, raw[k])) {
+                    queue(k, null, val);
+                }
+            }
+            if (changed) this.pendingPatch = pend;
+            this.recomputeSettings();
+            return changed;
+        }
+
+        scheduleSettingsFlush(ms) {
             clearTimeout(this.saveTimer);
-            this.pendingPatch = { ...(this.pendingPatch || {}), ...patch };
-            this.saveTimer = setTimeout(() => { this.port.send({ type: 'SETTINGS_SET', patch: this.pendingPatch }); this.pendingPatch = null; }, 250);
+            this.saveTimer = setTimeout(() => { this.saveTimer = null; this.flushSettings(); }, ms);
+        }
+
+        flushSettings() {
+            clearTimeout(this.saveTimer);
+            this.saveTimer = null;
+            const patch = this.pendingPatch;
+            this.pendingPatch = null;
+            if (patch && Object.keys(patch).length) this.port.send({ type: 'SETTINGS_SET', patch });
         }
 
         applySubtitleStyle() {
@@ -1813,7 +2019,16 @@ input[type="text"] { width: 100%; min-width: 0; }
                 // Remember volume/mute, but not the sleep timer's fade-out or a restore in progress.
                 if (!this.restoring && !this.autoMuted && !(this.sleep && this.sleep.fading)) this.remember({ volume: v.volume, muted: v.muted });
             });
-            media('loadedmetadata', () => { this.layoutVideo(); this.updateQualityBadge(); this.renderMarks(); });
+            media('loadedmetadata', () => {
+                if (this.mode === 'native') {
+                    this.nativeMetaOk = true;
+                    // Metadata arrived through a CORS request: the element is untainted.
+                    this.audio.corsOk = v.getAttribute('crossorigin') !== null;
+                    // The Audio tab's "blocked by CORS" hint / disabled controls depend on it.
+                    if (this.popKind === 'studio' && this.studioTab === 'audio') this.refreshPopover();
+                }
+                this.layoutVideo(); this.updateQualityBadge(); this.renderMarks();
+            });
             media('durationchange', () => this.renderMarks());
             media('resize', () => { this.layoutVideo(); this.updateQualityBadge(); });
             media('seeked', () => { this.subs.render(v.currentTime); if (this.gpu) this.gpu.renderOnce(); });
@@ -1823,6 +2038,16 @@ input[type="text"] { width: 100%; min-width: 0; }
             media('leavepictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'false'));
             media('error', () => {
                 if (this.mode !== 'native' || !v.error || this.closed) return;
+                // The CORS request failed before any metadata (no Access-Control-Allow-Origin,
+                // or the server needs the cookies an anonymous CORS request does not send):
+                // reload once without crossorigin from the same position. Web Audio / WebGL
+                // / snapshots stay unavailable for this session (allowed() is false).
+                if (!this.nativeMetaOk && !this.corsUnavailable && v.getAttribute('crossorigin') !== null) {
+                    this.corsUnavailable = true;
+                    console.warn('[Velostream] Direct file failed with CORS; reloading without it');
+                    this.load(this.nativeStart || undefined).catch(err => this.showError('Could not load this file', String((err && err.message) || err)));
+                    return;
+                }
                 // <video> only reports "format error"; ask the engine what the server really said.
                 this.probeStatus(this.stream.url).then(status => {
                     if (status === 401 || status === 403) {
@@ -2483,13 +2708,15 @@ input[type="text"] { width: 100%; min-width: 0; }
             } else if (source === 'external') {
                 if (!this.subs.externalCues) return;
                 this.subs.source = 'external';
+                this.subs.lastSource = 'external';
                 if (this.player) { try { this.player.selectTextTrack(null); } catch (_) { /* ignore */ } }
-                this.announce(`Subtitles: ${this.subs.externalName}`, 'captions');
+                if (remember) this.announce(`Subtitles: ${this.subs.externalName}`, 'captions');
             } else {
                 const t = this.textTracks().find(x => x.id === trackId);
                 if (!t) return;
                 this.subs.clearShaka();
                 this.subs.source = 'shaka';
+                this.subs.lastSource = 'shaka';
                 this.player.selectTextTrack(t);
                 this.lastShakaText = t.id;
                 if (remember) {
@@ -2505,11 +2732,15 @@ input[type="text"] { width: 100%; min-width: 0; }
 
         toggleCaptions() {
             if (this.subs.source !== 'off') return this.selectSubtitle('off');
-            if (this.subs.externalCues) return this.selectSubtitle('external');
             const tracks = this.textTracks();
             const pick = tracks.find(t => t.id === this.lastShakaText) || tracks[0];
-            if (pick) this.selectSubtitle('shaka', pick.id);
-            else this.announce('No subtitles. Load a file from the captions menu.', 'captions');
+            // Restore what was used last; without history, external cues first (as before).
+            const order = this.subs.lastSource === 'shaka' ? ['shaka', 'external'] : ['external', 'shaka'];
+            for (const src of order) {
+                if (src === 'external' && this.subs.externalCues) return this.selectSubtitle('external');
+                if (src === 'shaka' && pick) return this.selectSubtitle('shaka', pick.id);
+            }
+            this.announce('No subtitles. Load a file from the captions menu.', 'captions');
         }
 
         updateCcButton() {
@@ -2718,12 +2949,29 @@ input[type="text"] { width: 100%; min-width: 0; }
             return { preset: 'off', strength: 0 };
         }
 
+        destroyGpu() {
+            if (!this.gpu) return;
+            try { this.gpu.destroy(); } catch (_) { /* already gone */ }
+            this.gpu = null;
+            if (this.vbox) this.vbox.classList.remove('gl-on');
+        }
+
         applyGpu() {
             const want = this.effectiveShader();
             if (want.preset === 'off' && !this.gpu) return;
             if (!this.gpu) {
                 if (!window.VelostreamShaders || !this.glCanvas) { this.gpuBlocked = 'unavailable'; return; }
-                this.gpu = new window.VelostreamShaders.VideoShaderPipeline(this.video, this.glCanvas, {
+                // A destroyed pipeline called WEBGL_lose_context on its canvas, and getContext()
+                // keeps returning that dead context: start the new pipeline on a fresh canvas.
+                if (this.glCanvasUsed) {
+                    const c = this.glCanvas.cloneNode(false);
+                    c.hidden = true;
+                    c.style.filter = this.glCanvas.style.filter;
+                    this.glCanvas.replaceWith(c);
+                    this.glCanvas = c;
+                }
+                this.glCanvasUsed = true;
+                this.gpu =new window.VelostreamShaders.VideoShaderPipeline(this.video, this.glCanvas, {
                     onStepDown: (to) => {
                         const names = { cas: 'Fast Sharpen', off: 'Off' };
                         this.gpuOverride = to;   // this session only; the saved choice is kept
@@ -2813,10 +3061,11 @@ input[type="text"] { width: 100%; min-width: 0; }
         //   subtitle offset, A-B loop.
         // -----------------------------------------------------------------
         remember(patch) {
-            if (!this.settings) return;
-            this.settings.memory = { ...this.settings.memory, ...patch };
-            clearTimeout(this.memoryTimer);
-            this.memoryTimer = setTimeout(() => { this.memoryTimer = null; this.saveSettings({ memory: { ...this.settings.memory } }); }, 400);
+            if (!this.rawSettings) return;
+            // Staged at once (so a SETTINGS_CHANGED in between cannot drop it); written after a
+            // pause so dragging the volume slider does not hammer storage. No applySettings():
+            // memory has no visual effect.
+            if (this.stageSettings({ memory: patch })) this.scheduleSettingsFlush(400);
         }
 
         /** Re-apply the last-used volume, quality, audio language and subtitles to this video. */
@@ -2853,11 +3102,14 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (!force && v.paused) return;
             if (v.currentTime < 5 && !force) return;
             if (!d && !v.currentTime) return;
+            // The site page the video plays on (Continue Watching opens it), never this
+            // chrome-extension:// iframe.
+            const page = [this.pageUrl, this.stream.frameUrl].find(u => typeof u === 'string' && /^https?:\/\//i.test(u)) || '';
             this.port.send({
                 type: 'HISTORY_SAVE',
                 key: this.mediaKey(),
                 entry: {
-                    url: this.stream.url, title: this.$('.title').textContent, page: location.href, t: v.currentTime, d,
+                    url: this.stream.url, title: this.$('.title').textContent, page, t: v.currentTime, d,
                     done: d > 0 && v.currentTime > d - 20,
                     subOffset: this.subs.offset, loopA: this.loop.a, loopB: this.loop.b
                 }
@@ -3104,29 +3356,58 @@ input[type="text"] { width: 100%; min-width: 0; }
 
         /** Top-right download button: export VOD, start/stop live recording, or cancel. */
         onDownloadButton() {
+            // A save picker is open (or being opened): ignore repeat presses / remote commands.
+            if (this.pickingSink) return;
             if (this.exportState && this.exportState.running) {
                 this.port.send({ type: 'EXPORT_CANCEL' });
                 return;
             }
             if (this.isLive()) {
-                if (this.recordingSince) {
-                    this.recordingSince = 0;
-                    const toMp4 = (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
-                    const name = `${safeFilename(this.$('.title').textContent || 'live')}-recording.mp4`;
-                    this.exportState = { running: true, files: {}, status: 'Saving recording…', pct: 0, toMp4, sink: toMp4 ? new ExportSink(this.shadow, name, 'video/mp4') : null, outName: name, chain: Promise.resolve() };
-                    this.port.send({ type: 'RECORD_STOP' });
-                    this.updateDownloadButton();
-                    this.refreshPopover();
-                } else {
-                    this.port.send({ type: 'RECORD_START' });
-                }
+                if (this.recordingSince) this.stopRecording();
+                else this.port.send({ type: 'RECORD_START' });
                 return;
             }
             this.startExport();
         }
 
+        /**
+         * Stop the live recording and save it. With MP4 output the destination is asked for
+         * first (ExportSink.pick: File System Access with a gesture, else the downloads sink).
+         * Cancelling the picker leaves the recording running - nothing is stopped or lost - and
+         * the next press asks again; RECORD_STOP is only sent once there is somewhere to save.
+         */
+        async stopRecording() {
+            const toMp4 = (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
+            const name = `${safeFilename(this.$('.title').textContent || 'live')}-recording.mp4`;
+            let sink = null;
+            if (toMp4) {
+                this.pickingSink = true;
+                try {
+                    sink = await ExportSink.pick(this.shadow, name, 'video/mp4');
+                } catch (_) {
+                    sink = new ExportSink(this.shadow, name, 'video/mp4');
+                } finally {
+                    this.pickingSink = false;
+                }
+                if (!sink) {
+                    this.announce('Save cancelled · Still recording', 'record');
+                    return;
+                }
+                // Closed, recording ended elsewhere, or another export took over meanwhile.
+                if (this.closed || !this.recordingSince || (this.exportState && this.exportState.running)) {
+                    await sink.abort();
+                    return;
+                }
+            }
+            this.recordingSince = 0;
+            this.exportState = { running: true, files: {}, status: 'Saving recording…', pct: 0, toMp4, sink, outName: sink ? sink.filename : name, chain: Promise.resolve() };
+            this.port.send({ type: 'RECORD_STOP' });
+            this.updateDownloadButton();
+            this.refreshPopover();
+        }
+
         async startExport() {
-            if (this.exportState && this.exportState.running) return;
+            if (this.pickingSink || (this.exportState && this.exportState.running)) return;
             if (this.stream.type === 'dash') { this.announce('DASH export is not supported', 'warn'); return; }
             const hls = this.stream.type === 'hls';
             const toMp4 = hls && (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
@@ -3136,8 +3417,14 @@ input[type="text"] { width: 100%; min-width: 0; }
             // Ask for the destination while the click's user activation is still valid.
             if (toMp4 || !hls) {
                 const ext = toMp4 ? 'mp4' : ((/\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(this.stream.url) || ['', 'mp4'])[1]);
-                st.sink = await ExportSink.pick(this.shadow, `${title}.${ext}`, toMp4 ? 'video/mp4' : '');
-                if (!st.sink) { this.exportState = null; this.announce('Download cancelled', 'download'); return; }
+                this.pickingSink = true;
+                try {
+                    st.sink = await ExportSink.pick(this.shadow, `${title}.${ext}`, toMp4 ? 'video/mp4' : '');
+                } finally {
+                    this.pickingSink = false;
+                }
+                if (this.exportState !== st || this.closed) { if (st.sink) await st.sink.abort(); return; }
+                if (!st.sink) { this.exportState = null; this.announce('Download cancelled', 'download'); this.refreshPopover(); return; }
                 st.outName = st.sink.filename;
             }
             this.port.send({ type: 'EXPORT_START' });
@@ -3323,7 +3610,7 @@ input[type="text"] { width: 100%; min-width: 0; }
 
         sendTelemetry(withVariants) {
             const v = this.video;
-            const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, qualityCap: this.qualityCap };
+            const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
             if (this.player && this.mode === 'mse') {
                 const tracks = this.currentVariants();
                 const active = tracks.find(t => t.active);
@@ -3735,14 +4022,19 @@ input[type="text"] { width: 100%; min-width: 0; }
                         const start = g.startVol * 100 + (g.startVol >= 1 ? g.startBoost - 100 : 0);
                         let val = clamp(Math.round(start - (dy / rect.height) * 200), 0, 300);
                         if (val > 100 && !this.audio.active) val = 100;
+                        // g.boost is the source of truth: this.settings may be recomputed mid-swipe
+                        // (volumechange -> remember()), which would drop an in-place edit.
                         if (val <= 100) {
                             this.video.volume = val / 100;
                             this.video.muted = val === 0;
-                            if (this.settings.audio.boost !== 100) { this.settings.audio.boost = 100; this.audio.apply(this.settings.audio); }
+                            g.boost = 100;
                         } else {
                             this.video.volume = 1;
                             this.video.muted = false;
-                            this.settings.audio.boost = val;
+                            g.boost = val;
+                        }
+                        if (this.settings.audio.boost !== g.boost) {
+                            this.settings.audio.boost = g.boost;
                             this.audio.apply(this.settings.audio);
                         }
                         this.island(val ? 'volume' : 'mute', val > 100 ? `${val}% Boost` : `${val}%`, val / 300, 0);
@@ -3767,14 +4059,19 @@ input[type="text"] { width: 100%; min-width: 0; }
                 pointers.delete(e.pointerId);
                 try { layer.releasePointerCapture(e.pointerId); } catch (_) { /* ignore */ }
                 if (!g) return;
+                const unmuteTap = this.justUnmuted;
                 if (g.mode === 'mini') {
+                    this.justUnmuted = false;
                     if (g.moved) this.dragLayout('move', e, 'end');
-                    else if (e.type !== 'pointercancel') this.togglePlay();
+                    else if (e.type !== 'pointercancel' && !unmuteTap) this.togglePlay();
                     g = null;
                     return;
                 }
+                // Swipes, pinches, long-presses: the unmuting pointer cycle is over either way
+                // (a tap clears the flag in handleTap). Pinch keeps it until its last pointer.
+                if (g.mode && g.mode !== 'pinch') this.justUnmuted = false;
                 if (g.mode === 'pinch') {
-                    if (pointers.size === 0) { this.hideIsland(); this.announceOnly(`Zoom ${Math.round(this.xf.zoom * 100)}%`); g = null; }
+                    if (pointers.size === 0) { this.justUnmuted = false; this.hideIsland(); this.announceOnly(`Zoom ${Math.round(this.xf.zoom * 100)}%`); g = null; }
                     return;
                 }
                 clearTimeout(g.longTimer);
@@ -3791,7 +4088,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                     this.announceOnly(`Brightness ${this.filters.brightness}%`);
                     this.later(600, () => this.hideIsland());
                 } else if (mode === 'volume') {
-                    this.saveSettings({ audio: { ...this.settings.audio } });
+                    if (g.boost != null) this.saveSettings({ audio: { boost: g.boost } });
                     this.announceOnly(`Volume ${Math.round(this.video.volume * 100)}%`);
                     this.later(600, () => this.hideIsland());
                 } else if (!mode && !cancelled) {
@@ -3857,6 +4154,13 @@ input[type="text"] { width: 100%; min-width: 0; }
                 case 'fullscreen': this.toggleFullscreen(); break;
                 case 'pip': this.togglePip(); break;
                 case 'mute': this.toggleMute(); break;
+                case 'resetZoom':
+                    this.xf = { zoom: 1, panX: 0, panY: 0, rotate: 0, flip: false };
+                    this.fit = 'contain';
+                    this.layoutVideo();
+                    this.announce('Transform reset', 'expand');
+                    if (this.popKind) this.refreshPopover();
+                    break;
                 case 'none': break;
                 default: this.togglePlay(); this.showControls();
             }
@@ -3878,10 +4182,15 @@ input[type="text"] { width: 100%; min-width: 0; }
                 this.runAction(action, side);
                 return;
             }
+            // The tap that just unmuted autoplay only shows the controls (it must not pause);
+            // a quick second tap still makes it a double-tap above.
+            const unmuteTap = this.justUnmuted;
+            this.justUnmuted = false;
             setLast({ t: now, side });
             clearTimeout(getTimer());
             setTimer(setTimeout(() => {
-                if (isTouch) this.toggleControls();
+                if (unmuteTap) this.showControls();
+                else if (isTouch) this.toggleControls();
                 else { this.togglePlay(); this.showControls(); }
             }, isTouch ? 280 : 220));
         }
@@ -4115,8 +4424,8 @@ input[type="text"] { width: 100%; min-width: 0; }
                 html += this.row({ id: `cc-cap-${i}`, label: this.capturedLabel(t, i), meta: `${t.language || ''}${t.language ? ' · ' : ''}Site`, checked: this.subs.source === 'external' && this.subs.capturedIndex === i, data: `data-sub="cap:${i}"` });
             });
             if (this.subs.externalCues && this.subs.capturedIndex == null) html += this.row({ id: 'cc-ext', label: this.subs.externalName, meta: 'File', checked: this.subs.source === 'external', data: 'data-sub="external"' });
-            html += this.row({ id: 'cc-load', label: 'Load .srt or .vtt file…', role: 'menuitem', lead: 'upload' });
-            html += '</div><input type="file" id="cc-file" accept=".srt,.vtt,text/vtt,application/x-subrip" hidden>';
+            html += this.row({ id: 'cc-load', label: 'Load .srt, .vtt or .ass file…', role: 'menuitem', lead: 'upload' });
+            html += '</div><input type="file" id="cc-file" accept=".srt,.vtt,.ass,.ssa,text/vtt,application/x-subrip" hidden>';
             const off = this.subs.offset;
             html += `<div class="section-label">Sync offset</div><div class="stepper"><button type="button" class="ib" id="cc-off-minus" aria-label="Subtitles earlier by 0.1 seconds">${icon('frameBack', 18)}</button><output class="num">${off >= 0 ? '+' : ''}${off.toFixed(1)} s</output><button type="button" class="ib" id="cc-off-plus" aria-label="Subtitles later by 0.1 seconds">${icon('frameFwd', 18)}</button></div>`;
             html += `<div role="menu" aria-label="Subtitle sync">${this.row({ id: 'cc-sync-voice', label: 'Sync next line to now', meta: 'when you hear it', role: 'menuitem', lead: 'captions' })}</div>`;
@@ -4164,12 +4473,13 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             const s = this.settings;
             const st = this.engineStats || {};
             const ahead = st.cachedAhead != null ? fmtTime(st.cachedAhead) : '—';
+            const workers = clamp(Math.round(Number(s.maxWorkers) || 4), 2, 8);
             return `<div class="section-label">Buffer &amp; network</div>
-${this.selectField('bf-window', 'Pre-buffer window', PREBUFFER_WINDOWS, PREBUFFER_WINDOWS.some(([v]) => v === s.maxBufferSec) ? s.maxBufferSec : 86400)}
+${this.selectField('bf-window', 'Pre-buffer window', withCurrentOption(PREBUFFER_WINDOWS, s.maxBufferSec, v => `${v >= 60 && v % 60 === 0 ? `${v / 60} min` : `${v} s`} (custom)`), s.maxBufferSec ?? 86400)}
 ${this.rangeField('bf-ahead', 'RAM buffer ahead', 15, 180, 5, s.mseBufferAhead, `${s.mseBufferAhead} s`)}
 ${this.rangeField('bf-behind', 'Back-buffer kept', 10, 180, 5, s.mseBufferBehind, `${s.mseBufferBehind} s`)}
-${this.rangeField('bf-workers', 'Parallel workers', 2, 8, 1, s.maxWorkers, `${s.maxWorkers}`)}
-${this.selectField('bf-cache', 'Disk cache cap', CACHE_CAPS, CACHE_CAPS.some(([v]) => v === s.cacheSizeMB) ? s.cacheSizeMB : 2048)}
+${this.rangeField('bf-workers', 'Parallel workers', 2, 8, 1, workers, `${workers}`)}
+${this.selectField('bf-cache', 'Disk cache cap', withCurrentOption(CACHE_CAPS, s.cacheSizeMB, v => `${v >= 1024 && v % 1024 === 0 ? `${v / 1024} GB` : `${v} MB`} (custom)`), s.cacheSizeMB ?? 2048)}
 ${this.switchField('bf-range', 'Range accelerator (parallel chunks)', s.rangeAccel !== false)}
 ${this.switchField('bf-pause', 'Pause background prefetch', !!this.prefetchPaused)}
 <div role="menu" aria-label="Buffer actions">${this.row({ id: 'bf-purge', label: 'Purge & rebuild buffer', meta: `${ahead} ahead`, role: 'menuitem', lead: 'rotate' })}</div>
@@ -4336,7 +4646,7 @@ ${this.selectField('pf-dt-center', 'Double-tap centre', TAP_ACTIONS, g.doubleTap
 ${this.selectField('pf-dt-right', 'Double-tap right', TAP_ACTIONS, g.doubleTapRight)}
 <div class="section-label">Mouse</div>
 ${this.selectField('pf-wheel', 'Scroll wheel', [['volume', 'Volume'], ['seek', 'Seek'], ['speed', 'Speed'], ['zoom', 'Zoom'], ['none', 'Nothing']], (s.mouse || {}).wheel || 'volume')}
-${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mute']]), (s.mouse || {}).middleClick || 'playPause')}
+${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mute'], ['resetZoom', 'Reset zoom']]), (s.mouse || {}).middleClick || 'playPause')}
 <p class="hint">Ctrl + wheel zooms, Shift + wheel fine-seeks (frame steps when paused), Alt + wheel shifts subtitles.</p>
 <div class="section-label">Site profile${host ? ` · ${esc(host)}` : ''}</div>
 <p class="hint">${this.profile ? `Active: ${esc(fmtRate(this.profile.defaultSpeed || 1))}, ${this.profile.qualityCap ? `${this.profile.qualityCap}p cap` : 'no quality cap'}, GPU ${esc(this.profile.shader || 'off')}, EQ ${esc(this.profile.audioPreset || 'normal')}.` : 'Remember the current speed, quality cap, GPU shader, EQ preset and subtitle size for this site only.'}</p>
@@ -4455,7 +4765,11 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 each('[data-q]', el => this.selectQuality(el.dataset.q === 'auto' ? 'auto' : +el.dataset.q));
                 select('q-cap', v => { this.setQualityCap(+v); this.announce(`Resolution cap ${+v ? `${v}p` : 'off'}`, 'studio'); });
                 const shakaBuf = () => { if (this.player) { try { this.configureShaka(); } catch (_) { /* player gone */ } } };
-                select('bf-window', v => { this.saveSettings({ maxBufferSec: +v }); this.announce(`Pre-buffer ${PREBUFFER_WINDOWS.find(w => w[0] === +v)[1]}`, 'studio'); });
+                select('bf-window', v => {
+                    this.saveSettings({ maxBufferSec: +v });
+                    const w = PREBUFFER_WINDOWS.find(x => x[0] === +v);
+                    this.announce(`Pre-buffer ${w ? w[1] : fmtSpoken(+v)}`, 'studio');
+                });
                 range('bf-ahead', v => { this.saveSettings({ mseBufferAhead: v }); this.settings.mseBufferAhead = v; shakaBuf(); }, v => `${v} s`);
                 range('bf-behind', v => { this.saveSettings({ mseBufferBehind: v }); this.settings.mseBufferBehind = v; shakaBuf(); }, v => `${v} s`);
                 range('bf-workers', v => this.saveSettings({ maxWorkers: v }), v => `${v}`);
@@ -4494,7 +4808,7 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 select('dp-shader', v => {
                     this.gpuOverride = null;
                     this.gpuBlocked = null;
-                    if (this.gpu && this.gpu.failed) { this.gpu.destroy(); this.gpu = null; }
+                    if (this.gpu && this.gpu.failed) this.destroyGpu();
                     this.settings.shader = v;
                     this.saveSettings({ shader: v });
                     this.applyFilters();
@@ -4583,7 +4897,13 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                     this.announceOnly(`Press the new key for ${ACTIONS[el.dataset.key]}, or Escape to cancel`);
                 });
                 // keymap:null makes the bridge restore defaults; SETTINGS_CHANGED re-renders.
-                click('pf-keys-reset', () => { this.port.send({ type: 'SETTINGS_SET', patch: { keymap: null } }); this.announce('Shortcuts reset', 'check'); });
+                click('pf-keys-reset', () => {
+                    // A queued keymap edit must not land after (and undo) the reset.
+                    if (this.pendingPatch) delete this.pendingPatch.keymap;
+                    this.flushSettings();
+                    this.port.send({ type: 'SETTINGS_SET', patch: { keymap: null } });
+                    this.announce('Shortcuts reset', 'check');
+                });
                 click('pf-help', () => this.openPopover('help', this.$('.btn-studio')));
                 click('pf-site-save', () => this.saveSiteProfile());
                 click('pf-site-del', () => this.removeSiteProfile());

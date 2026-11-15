@@ -167,7 +167,8 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 - **Playback** defaults: speed, seek step, resume, auto full screen, controls auto-hide.
 - **Gestures**, **Mouse**, **Keyboard** (see above).
 - **Site profile**: remember speed, quality cap, GPU preset and strength, EQ preset and subtitle
-  size for the current site only.
+  size for the current site only. While a profile is active, changing those settings affects only
+  the current session; use *Update profile with current setup* to keep them for the site.
 
 ---
 

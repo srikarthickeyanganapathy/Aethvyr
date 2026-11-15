@@ -286,9 +286,53 @@ export function parsePlaylist(text, baseUrl) {
     return isMasterPlaylist(text) ? parseMaster(text, baseUrl) : parseMedia(text, baseUrl);
 }
 
-/** Binary search: index of the segment containing time t (clamped). */
-export function segmentIndexForTime(segments, t) {
-    if (!segments.length) return 0;
+/**
+ * Live playlists are re-parsed on every refresh and parseMedia() starts each parse at 0, so the
+ * same segment (same media sequence number) would get a different `start` every refresh. Shift
+ * `parsed`'s start times so that segments it shares with `ref` (an earlier parse of the same
+ * playlist, or a sibling rendition with the same media sequence numbering) keep the start time
+ * they had in `ref`. This gives every live playlist one stable timeline for its lifetime, which
+ * is what a learned playlist->player timeline offset needs to stay valid across refreshes.
+ *
+ * With `bridgeGap`, a refresh that does not overlap `ref` (we missed some refreshes) is anchored
+ * right after `ref`'s last segment plus targetDuration per missing sequence number.
+ * Mutates `parsed.segments[*].start`.
+ * @returns {'overlap'|'gap'|null} how it was aligned (null = left as parsed)
+ */
+export function alignLiveTimeline(parsed, ref, { bridgeGap = false } = {}) {
+    const segs = parsed && parsed.segments;
+    const refSegs = ref && ref.segments;
+    if (!segs || !segs.length || !refSegs || !refSegs.length) return null;
+    const refFirst = refSegs[0].seq;
+    const refLast = refSegs[refSegs.length - 1].seq;
+    let shift = null;
+    let how = null;
+    for (const s of segs) {
+        if (s.seq < refFirst || s.seq > refLast) continue;
+        const r = refSegs[s.seq - refFirst];
+        if (r && r.seq === s.seq) { shift = r.start - s.start; how = 'overlap'; break; }
+    }
+    if (shift === null && bridgeGap && segs[0].seq > refLast) {
+        const last = refSegs[refSegs.length - 1];
+        const missing = segs[0].seq - refLast - 1;
+        const per = parsed.targetDuration || last.duration || 0;
+        shift = last.start + last.duration + missing * per - segs[0].start;
+        how = 'gap';
+    }
+    if (shift === null) return null;
+    if (shift) for (const s of segs) s.start += shift;
+    return how;
+}
+
+/**
+ * Binary search: index of the segment containing time t (clamped).
+ * `t` is on the playlist's own timeline; pass `offset` (player time - playlist time) to look up
+ * a player/presentation time instead.
+ */
+export function segmentIndexForTime(segments, t, offset = 0) {
+    if (!segments || !segments.length) return 0;
+    t = Number(t) - (Number(offset) || 0);
+    if (!Number.isFinite(t)) return 0;
     let lo = 0;
     let hi = segments.length - 1;
     while (lo < hi) {

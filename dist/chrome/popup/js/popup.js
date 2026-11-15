@@ -56,6 +56,7 @@
     }
 
     function fmtAgo(ts) {
+        if (!Number.isFinite(ts)) return 'earlier';
         const d = (Date.now() - ts) / 1000;
         if (d < 90) return 'just now';
         if (d < 3600) return `${Math.round(d / 60)} min ago`;
@@ -100,16 +101,23 @@
 
     function renderStreams(streams) {
         const list = $('stream-list');
-        const sig = JSON.stringify(streams.map(s => [s.id, s.probe && s.probe.status, s.probe && s.probe.variants, s.isAd])) + playerStreamId;
+        // Everything the row renders goes into the signature, so late probe results (resolution,
+        // duration, live, errors) and frame changes are not left stale on screen.
+        const sig = JSON.stringify(streams.map(s => {
+            const p = s.probe || {};
+            return [s.id, s.url, s.type, s.isAd, s.frameId, s.frameUrl, p.status, p.error, p.variants, p.maxHeight, p.duration, p.live, p.encrypted, p.audioTracks, p.subtitleTracks, p.isMaster];
+        })) + playerStreamId;
         $('empty-state').hidden = streams.length > 0;
         const pill = $('status-pill');
         pill.classList.toggle('active', streams.length > 0);
-        $('status-text').textContent = playerStreamId ? 'Playing' : streams.length ? `${streams.length} stream${streams.length === 1 ? '' : 's'}` : 'Ready';
+        // role="status": only touch the text when it changes, or screen readers re-announce it every poll.
+        const statusText = playerStreamId ? 'Playing' : streams.length ? `${streams.length} stream${streams.length === 1 ? '' : 's'}` : 'Ready';
+        if ($('status-text').textContent !== statusText) $('status-text').textContent = statusText;
         if (sig === lastListSig) return;
         lastListSig = sig;
 
         const active = document.activeElement;
-        const focusKey = active && active.dataset && active.dataset.id ? `${active.dataset.action}:${active.dataset.id}` : null;
+        const focus = active && list.contains(active) && active.dataset && active.dataset.id ? { action: active.dataset.action, id: active.dataset.id } : null;
         list.replaceChildren();
         streams.forEach((stream, i) => {
             const li = document.createElement('li');
@@ -139,15 +147,24 @@
             li.querySelector('[data-action="copy"]').addEventListener('click', () => copyUrl(stream));
             list.appendChild(li);
         });
-        if (focusKey) {
-            const [action, id] = focusKey.split(':');
-            const el = list.querySelector(`[data-action="${action}"][data-id="${CSS.escape(id)}"]`);
+        if (focus) {
+            // Stream ids may contain ':' — keep action and id separate (the old "a:b".split broke them).
+            const el = list.querySelector(`[data-action="${CSS.escape(focus.action)}"][data-id="${CSS.escape(focus.id)}"]`);
             if (el) el.focus();
         }
     }
 
+    // Polls run on intervals; a slow background reply must not let calls pile up or land out of order.
+    let streamsBusy = false;
+    let statsBusy = false;
+
     async function refreshStreams() {
-        if (tabId === null) return;
+        if (tabId === null || streamsBusy) return;
+        streamsBusy = true;
+        try { await doRefreshStreams(); } finally { streamsBusy = false; }
+    }
+
+    async function doRefreshStreams() {
         const res = await send({ action: 'GET_STREAMS', tabId });
         if (!res || !res.ok) return;
         playerStreamId = res.player ? res.player.streamId : null;
@@ -180,7 +197,12 @@
     }
 
     async function refreshStats() {
-        if (tabId === null) return;
+        if (tabId === null || statsBusy) return;
+        statsBusy = true;
+        try { await doRefreshStats(); } finally { statsBusy = false; }
+    }
+
+    async function doRefreshStats() {
         const res = await send({ action: 'GET_STATS', tabId });
         if (!res || !res.ok) return;
         const g = res.global || {};
@@ -211,7 +233,10 @@
         }
         button.disabled = false;
         showMessage(friendlyError(res && res.error));
-        button.focus();
+        // The list may have been re-rendered while waiting: focus the live button for this stream.
+        const live = button.isConnected ? button
+            : $('stream-list').querySelector(`[data-action="play"][data-id="${CSS.escape(String(stream.id))}"]`);
+        if (live) live.focus();
     }
 
     function friendlyError(msg) {
@@ -234,45 +259,83 @@
     // -------------------------------------------------------------------
     // Watch history ("Continue watching")
     // -------------------------------------------------------------------
+    /** Returns url only if it is a web page we may open in a tab (http/https). */
+    function webUrl(url) {
+        if (typeof url !== 'string' || !url) return null;
+        try {
+            const u = new URL(url);
+            return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /**
+     * Where "Open" goes: the page the video was watched on, else the media URL itself. Older builds
+     * stored the player's own chrome-extension:// / moz-extension:// page as `page`, which must never
+     * be opened from here (it is not resumable and is not a web page).
+     */
+    function resumeTarget(e) {
+        return webUrl(e.page) || webUrl(e.url);
+    }
+
+    let historySeq = 0;
+
     async function renderHistory() {
+        // The player writes history every few seconds; only the newest read may render.
+        const seq = ++historySeq;
         const res = await api.storage.local.get(S.HISTORY_KEY);
+        if (seq !== historySeq) return;
         const all = res[S.HISTORY_KEY] || {};
         const entries = Object.entries(all).filter(([, e]) => e && !e.done && e.t > 15)
-            .sort((a, b) => b[1].updatedAt - a[1].updatedAt).slice(0, 15);
-        const sig = JSON.stringify(entries.map(([k, e]) => [k, Math.round(e.t)]));
+            .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0)).slice(0, 15);
+        const sig = JSON.stringify(entries.map(([k, e]) => [k, Math.round(e.t), Math.round(e.d || 0), e.title, e.page, e.url]));
         $('history-count').textContent = String(entries.length);
         $('history-empty').hidden = entries.length > 0;
         $('history-clear').hidden = entries.length === 0;
         if (sig === lastHistorySig) return;
         lastHistorySig = sig;
         const list = $('history-list');
+        const active = document.activeElement;
+        const focus = active && list.contains(active) ? { open: active.dataset.open, del: active.dataset.del } : null;
         list.replaceChildren();
         for (const [key, e] of entries) {
             const li = document.createElement('li');
             li.className = 'history-item';
             const pct = e.d ? Math.min(100, Math.round((e.t / e.d) * 100)) : 0;
+            const target = resumeTarget(e);
+            const title = e.title || hostOf(e.url) || 'this video';
             S.setHTML(li, `
                 <div class="info">
                     <div class="name" title="${esc(e.url)}">${esc(e.title || hostOf(e.url))}</div>
                     <div class="meta num">${fmtTime(e.t)}${e.d ? ` / ${fmtTime(e.d)}` : ''} · ${esc(fmtAgo(e.updatedAt))}</div>
-                    <div class="bar" role="progressbar" aria-label="Watched" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div>
+                    <div class="bar" role="progressbar" aria-label="Watched" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-valuetext="${pct}% watched"><i style="width:${pct}%"></i></div>
                 </div>
-                <button type="button" class="btn small" data-open="${esc(key)}" ${e.page ? '' : 'disabled'} aria-label="Open the page of ${esc(e.title || 'this video')} to resume">Open</button>
-                <button type="button" class="icon-btn" data-del="${esc(key)}" aria-label="Remove ${esc(e.title || 'this video')} from history">
+                ${target ? `<button type="button" class="btn small" data-open="${esc(key)}" title="${esc(target)}" aria-label="Open the page of ${esc(title)} to resume">Open</button>` : '<span aria-hidden="true"></span>'}
+                <button type="button" class="icon-btn" data-del="${esc(key)}" aria-label="Remove ${esc(title)} from history">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
                 </button>`);
-            li.querySelector('[data-open]').addEventListener('click', () => {
-                if (e.page && /^https?:/i.test(e.page)) api.tabs.create({ url: e.page });
-            });
+            const open = li.querySelector('[data-open]');
+            if (open) open.addEventListener('click', () => { api.tabs.create({ url: target }); });
             li.querySelector('[data-del]').addEventListener('click', async () => {
+                // Move focus to a neighbour first so keyboard users are not dropped to <body>.
+                const next = li.nextElementSibling || li.previousElementSibling;
+                const nextKey = next && next.querySelector('[data-del]') ? next.querySelector('[data-del]').dataset.del : null;
                 const cur = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
                 delete cur[key];
                 await api.storage.local.set({ [S.HISTORY_KEY]: cur });
                 lastHistorySig = '';
-                renderHistory();
+                await renderHistory();
+                const el = nextKey && list.querySelector(`[data-del="${CSS.escape(nextKey)}"]`);
+                (el || $('history').querySelector('summary')).focus();
                 announce('Removed from history');
             });
             list.appendChild(li);
+        }
+        if (focus) {
+            const sel = focus.open ? `[data-open="${CSS.escape(focus.open)}"]` : focus.del ? `[data-del="${CSS.escape(focus.del)}"]` : null;
+            const el = sel && list.querySelector(sel);
+            if (el) el.focus();
         }
     }
 
@@ -284,30 +347,93 @@
         document.body.classList.toggle('hc', !!settings.highContrast);
         document.body.classList.toggle('reduce-motion', settings.reducedMotion === 'on');
         document.documentElement.style.setProperty('--scale', String(Math.min(settings.uiScale || 1, 1.25)));
-        document.querySelectorAll('.swatch').forEach(b => b.setAttribute('aria-checked', String(b.dataset.accent === settings.theme)));
+        // Radio group: one tab stop (the checked swatch); arrow keys move within the group.
+        const swatches = [...document.querySelectorAll('.swatch')];
+        const anyChecked = swatches.some(b => b.dataset.accent === settings.theme);
+        swatches.forEach((b, i) => {
+            const checked = b.dataset.accent === settings.theme;
+            b.setAttribute('aria-checked', String(checked));
+            b.tabIndex = checked || (!anyChecked && i === 0) ? 0 : -1;
+        });
+        syncSiteToggle();
     }
 
     function readPath(obj, path) {
         return path.split('.').reduce((o, k) => (o ? o[k] : undefined), obj);
     }
 
-    function fillForm() {
+    /** Human label for a stored value that is not one of a select's options. */
+    function customLabel(name, v) {
+        const n = Number(v);
+        switch (name) {
+            case 'cacheSizeMB': return n >= 1024 ? `${+(n / 1024).toFixed(1)} GB` : `${n} MB`;
+            case 'maxBufferSec': return n >= 60 ? `${+(n / 60).toFixed(1)} min` : `${n} s`;
+            case 'defaultSpeed': return `${n}×`;
+            case 'uiScale': return `${Math.round(n * 100)}%`;
+            case 'autoHideMs': return `${+(n / 1000).toFixed(1)} seconds`;
+            case 'qualityCap': return `${n}p`;
+            case 'seekStep': return `${n} s`;
+            case 'skipSeconds': return `+${n} s`;
+            case 'dvrMinutes': return `${n} min`;
+            default: return String(v);
+        }
+    }
+
+    /**
+     * Shows `value` in a select. A value saved elsewhere (the player's panel, an older build, a
+     * synced profile) that is not among the options is added as a "(custom)" option instead of
+     * rendering the select blank; such options are dropped again once no longer needed.
+     */
+    function setSelectValue(el, value) {
+        const str = String(value);
+        el.querySelectorAll('option[data-custom]').forEach(o => { if (o.value !== str) o.remove(); });
+        const match = [...el.options].find(o => o.value === str || (el.dataset.type === 'number' && Number(o.value) === Number(value)));
+        if (!match && value !== undefined && value !== null && str !== '') {
+            const opt = document.createElement('option');
+            opt.value = str;
+            opt.dataset.custom = '1';
+            opt.textContent = `${customLabel(el.name, value)} (custom)`;
+            // Keep numeric lists ordered.
+            const after = el.dataset.type === 'number' ? [...el.options].find(o => !o.dataset.custom && Number(o.value) > Number(value) && Number(o.value) !== 0) : null;
+            el.insertBefore(opt, after || null);
+            el.value = str;
+            return;
+        }
+        el.value = match ? match.value : str;
+    }
+
+    /** Writes settings into the form; `skip` (the control being edited) is left alone. */
+    function fillForm(skip) {
         for (const el of $('settings-form').elements) {
-            if (!el.name) continue;
+            if (!el.name || el === skip) continue;
             const v = readPath(settings, el.name);
             if (el.type === 'checkbox') el.checked = !!v;
+            else if (el.tagName === 'SELECT') setSelectValue(el, v);
             else el.value = String(v);
         }
         applyPopupTheme();
     }
 
-    async function saveSettings(mutate, label) {
-        const next = JSON.parse(JSON.stringify(settings));
-        mutate(next);
-        settings = S.mergeSettings(next);
-        await api.storage.local.set({ [S.SETTINGS_KEY]: settings });
-        applyPopupTheme();
-        if (label) announce(`${label} saved`);
+    // Saves are serialized and applied to the freshest stored copy, so two quick changes in the popup
+    // (or one here while the player writes settings) do not overwrite each other.
+    let saveChain = Promise.resolve();
+
+    function saveSettings(mutate, label) {
+        const run = async () => {
+            let base = settings;
+            try {
+                const res = await api.storage.local.get(S.SETTINGS_KEY);
+                base = S.mergeSettings(res[S.SETTINGS_KEY]);
+            } catch (_) { /* fall back to the in-memory copy */ }
+            const next = JSON.parse(JSON.stringify(base));
+            mutate(next);
+            settings = S.mergeSettings(next);
+            await api.storage.local.set({ [S.SETTINGS_KEY]: settings });
+            applyPopupTheme();
+            if (label) announce(`${label} saved`);
+        };
+        saveChain = saveChain.then(run, run);
+        return saveChain.catch(() => showMessage('Could not save settings.'));
     }
 
     function saveField(el) {
@@ -329,10 +455,20 @@
     }
 
     /** Per-site auto-replace: detected videos on this site open in Velostream automatically. */
+    let siteHost = '';
+
+    /** Keeps the per-site switch in step with settings changed elsewhere (reset, the player). */
+    function syncSiteToggle() {
+        if (!siteHost) return;
+        const box = $('site-auto');
+        if (document.activeElement !== box) box.checked = settings.autoSites.includes(siteHost);
+    }
+
     function setupSiteToggle(tab) {
         let host = '';
         try { const u = new URL(tab && tab.url); if (/^https?:$/.test(u.protocol)) host = u.hostname; } catch (_) { /* no url */ }
         if (!host) return;
+        siteHost = host;
         $('site-card').hidden = false;
         $('site-host').textContent = host;
         const box = $('site-auto');
@@ -380,8 +516,11 @@
             });
         });
         $('reset-settings').addEventListener('click', async () => {
-            settings = S.mergeSettings(null);
-            await api.storage.local.set({ [S.SETTINGS_KEY]: settings });
+            // Through the save queue, so a pending field save cannot land after the reset.
+            await saveSettings(next => {
+                for (const k of Object.keys(next)) delete next[k];
+                Object.assign(next, JSON.parse(JSON.stringify(S.DEFAULT_SETTINGS)));
+            });
             fillForm();
             announce('All settings reset');
         });
@@ -390,6 +529,8 @@
             if (ok) {
                 $('permission-banner').hidden = true;
                 showMessage('Access granted. Reload the page with the video.', true);
+            } else {
+                showMessage('Access was not granted. Velostream cannot detect videos without it.');
             }
         });
         $('rescan-btn').addEventListener('click', async () => {
@@ -405,11 +546,11 @@
         });
         $('close-player-btn').addEventListener('click', async () => {
             const res = await send({ action: 'CLOSE_PLAYER', tabId });
-            if (res && res.ok) { announce('Player closed'); setTimeout(refreshStreams, 400); } else showMessage(res && res.error);
+            if (res && res.ok) { announce('Player closed'); setTimeout(refreshStreams, 400); } else showMessage((res && res.error) || 'Could not close the player.');
         });
         $('export-btn').addEventListener('click', async () => {
             const res = await send({ action: 'EXPORT_STREAM', tabId });
-            if (res && res.ok) { showMessage('Saving in the player. Keep the tab open until it finishes.', true); announce('Saving started'); } else showMessage(res && res.error);
+            if (res && res.ok) { showMessage('Saving in the player. Keep the tab open until it finishes.', true); announce('Saving started'); } else showMessage((res && res.error) || 'Could not start saving.');
         });
         $('paste-form').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -436,7 +577,9 @@
             if (area !== 'local') return;
             if (changes[S.SETTINGS_KEY]) {
                 settings = S.mergeSettings(changes[S.SETTINGS_KEY].newValue);
-                if (!$('settings-form').contains(document.activeElement)) fillForm(); else applyPopupTheme();
+                // Refresh every control except the one being edited (it used to leave the whole form stale).
+                const active = $('settings-form').contains(document.activeElement) ? document.activeElement : null;
+                fillForm(active);
             }
             if (changes[S.HISTORY_KEY]) renderHistory();
         });

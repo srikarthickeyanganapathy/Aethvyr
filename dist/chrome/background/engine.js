@@ -15,7 +15,7 @@
 
 import '../common/shared.js';
 import { BufferManager, sweepOrphans } from './buffer-manager.js';
-import { SegmentDownloader } from './downloader.js';
+import { SegmentDownloader, sniffMedia } from './downloader.js';
 import { ABRController } from './abr-controller.js';
 import { parsePlaylist, ivForSegment, decryptAes128 } from './hls-parser.js';
 
@@ -65,17 +65,30 @@ function newTabState(tabId) {
         videoFrames: new Set(),    // frames with a <video> element
         subtitles: [],             // captured sidecar / in-memory subtitle tracks (bounded)
         drm: null,                 // { keySystem, frameId } once a frame requested EME keys
+        autoLaunched: false,       // auto-replace already ran for this page load
+        mountFrameId: null,        // frame the player iframe was mounted in
         playerSessionId: null,
         probing: 0
     };
 }
 
+// storage.session is small (Chromium: 10 MB for the whole extension). Subtitles live under their
+// own key (written only when they change) and inline cue text is budgeted; sidecar tracks keep
+// their URL and are simply re-fetched by the player.
+const SUBS_PERSIST_BUDGET = 1_500_000;
+const subsDirty = new Set();
+const tabKey = (tabId) => `tab_${tabId}`;
+const tabSubsKey = (tabId) => `tabsubs_${tabId}`;
+
 async function getTab(tabId, { create = true } = {}) {
     let tab = tabs.get(tabId);
     if (tab) return tab;
     // Restore after a service-worker / event-page restart.
-    const key = `tab_${tabId}`;
-    const stored = (await api.storage.session.get(key).catch(() => ({})))[key];
+    const key = tabKey(tabId);
+    const subsKey = tabSubsKey(tabId);
+    const res = await api.storage.session.get([key, subsKey]).catch(() => ({}));
+    const stored = res && res[key];
+    const storedSubs = res && res[subsKey];
     tab = tabs.get(tabId); // re-check after await
     if (tab) return tab;
     if (!stored && !create) return null;
@@ -87,24 +100,60 @@ async function getTab(tabId, { create = true } = {}) {
         }
         (stored.children || []).forEach(u => tab.children.add(u));
         tab.playerSessionId = stored.playerSessionId || null;
+        for (const e of stored.mseFrames || []) {
+            if (Array.isArray(e) && typeof e[0] === 'number') tab.mseFrames.set(e[0], +e[1] || 0);
+        }
+        (stored.videoFrames || []).forEach(f => { if (typeof f === 'number') tab.videoFrames.add(f); });
+        tab.drm = stored.drm || null;
+        tab.autoLaunched = !!stored.autoLaunched;
+        tab.mountFrameId = typeof stored.mountFrameId === 'number' ? stored.mountFrameId : null;
     }
+    if (Array.isArray(storedSubs)) tab.subtitles = storedSubs.slice(-32);
     tabs.set(tabId, tab);
     return tab;
 }
 
-function persistTab(tabId) {
+/** Subtitles to persist: newest first within the inline-text budget (URL tracks keep their URL). */
+function subtitlesForStorage(list) {
+    const out = [];
+    let used = 0;
+    for (let i = list.length - 1; i >= 0; i--) {
+        const t = list[i];
+        const cost = (t.vtt || '').length;
+        if (used + cost <= SUBS_PERSIST_BUDGET) {
+            used += cost;
+            out.unshift(t);
+        } else if (t.url) {
+            out.unshift({ ...t, vtt: '' });
+        }
+    }
+    return out;
+}
+
+function persistTab(tabId, { subtitles = false } = {}) {
+    if (subtitles) subsDirty.add(tabId);
     clearTimeout(persistTimers.get(tabId));
     persistTimers.set(tabId, setTimeout(() => {
         persistTimers.delete(tabId);
         const tab = tabs.get(tabId);
         if (!tab) return;
-        api.storage.session.set({
-            [`tab_${tabId}`]: {
+        const data = {
+            [tabKey(tabId)]: {
                 streams: [...tab.streams.values()],
                 children: [...tab.children].slice(-200),
-                playerSessionId: tab.playerSessionId
+                playerSessionId: tab.playerSessionId,
+                mseFrames: [...tab.mseFrames.entries()].slice(-32),
+                videoFrames: [...tab.videoFrames].slice(-32),
+                drm: tab.drm || null,
+                autoLaunched: !!tab.autoLaunched,
+                mountFrameId: tab.mountFrameId ?? null
             }
-        }).catch(() => { /* quota / unsupported */ });
+        };
+        api.storage.session.set(data).catch(() => { /* quota / unsupported */ });
+        // Separate write: a quota failure on cue text must not lose the stream list.
+        if (subsDirty.delete(tabId)) {
+            api.storage.session.set({ [tabSubsKey(tabId)]: subtitlesForStorage(tab.subtitles || []) }).catch(() => { });
+        }
     }, 250));
 }
 
@@ -169,9 +218,30 @@ async function addSubtitle(tabId, frameId, frameUrl, sub) {
         if (!known.language && sub.language) { known.language = String(sub.language).slice(0, 20); changed = true; }
         if (!known.isDefault && sub.isDefault) { known.isDefault = true; changed = true; }
         if (sub.kind === 'chapters' && known.kind !== 'chapters') { known.kind = 'chapters'; changed = true; }
-        const s0 = changed && tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
+        if (!changed) return;
+        persistTab(tabId, { subtitles: true });
+        const s0 = tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
         if (s0) s0.post({ type: 'SUBTITLES', subtitles: tab.subtitles });
         return;
+    }
+    // In-memory text tracks are re-reported as the site adds cues: update the existing entry
+    // for the same track (frame + label + language + kind) instead of adding a duplicate that
+    // would push other subtitles out of the 32-entry list.
+    if (!url && sub.vtt && sub.method === 'textTracks') {
+        const kind = sub.kind === 'chapters' ? 'chapters' : 'subtitles';
+        const same = tab.subtitles.find(t => !t.url && t.method === 'textTracks' && t.frameId === frameId &&
+            t.label === String(sub.label || '').slice(0, 80) && t.language === String(sub.language || '').slice(0, 20) && t.kind === kind);
+        if (same) {
+            const vtt = String(sub.vtt).slice(0, 2000000);
+            if (vtt.length <= same.vtt.length) return;
+            same.vtt = vtt;
+            same.key = key;
+            if (sub.isDefault) same.isDefault = true;
+            persistTab(tabId, { subtitles: true });
+            const s1 = tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
+            if (s1) s1.post({ type: 'SUBTITLES', subtitles: tab.subtitles });
+            return;
+        }
     }
     if (tab.subtitles.length >= 32) tab.subtitles.shift();
     const mime = String(sub.mime || '');
@@ -186,6 +256,7 @@ async function addSubtitle(tabId, frameId, frameUrl, sub) {
         kind: sub.kind === 'chapters' ? 'chapters' : 'subtitles',
         method: sub.method || 'network'
     });
+    persistTab(tabId, { subtitles: true });
     // Tell an open player about late arrivals.
     const session = tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
     if (session) session.post({ type: 'SUBTITLES', subtitles: tab.subtitles });
@@ -196,12 +267,15 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
     const tab = await getTab(tabId);
 
     if (payload.type === 'mse') {
+        const known = tab.mseFrames.has(frameId);
         tab.mseFrames.set(frameId, Date.now());
+        if (!known) persistTab(tabId); // timestamp refreshes alone are not worth a write
         return null;
     }
     if (payload.type === 'video-present') {
         if (!tab.videoFrames.has(frameId)) {
             tab.videoFrames.add(frameId);
+            persistTab(tabId);
             notifyFrames(tabId);
         }
         return null;
@@ -262,16 +336,24 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
  * playlist probe can win over its variant playlists.
  */
 async function maybeAutoLaunch(tab, stream) {
-    if (tab.autoLaunched || tab.playerSessionId || !settings.autoSites.length) return;
-    // Match the top page's host *and* the embedding frame's host: the stream is often found
-    // inside a third-party player iframe while the user enabled the outer site (or vice versa).
-    const hosts = new Set();
-    try { hosts.add(new URL((await api.tabs.get(tab.tabId)).url).hostname); } catch (_) { /* tab gone */ }
-    try { if (stream && stream.frameUrl) hosts.add(new URL(stream.frameUrl).hostname); } catch (_) { /* opaque */ }
-    const sites = settings.autoSites.map(h => String(h).toLowerCase());
-    const match = [...hosts].some(h => sites.some(s => h === s || h.endsWith(`.${s}`)));
-    if (!match) return;
-    tab.autoLaunched = true;
+    // autoLaunchPending: several streams are usually detected in the same burst; only the first
+    // may run the (async) host check, or two launches would race and end each other's session.
+    if (tab.autoLaunched || tab.autoLaunchPending || tab.playerSessionId || !settings.autoSites.length) return;
+    tab.autoLaunchPending = true;
+    try {
+        // Match the top page's host *and* the embedding frame's host: the stream is often found
+        // inside a third-party player iframe while the user enabled the outer site (or vice versa).
+        const hosts = new Set();
+        try { hosts.add(new URL((await api.tabs.get(tab.tabId)).url).hostname); } catch (_) { /* tab gone */ }
+        try { if (stream && stream.frameUrl) hosts.add(new URL(stream.frameUrl).hostname); } catch (_) { /* opaque */ }
+        const sites = settings.autoSites.map(h => String(h).toLowerCase());
+        const match = [...hosts].some(h => sites.some(s => h === s || h.endsWith(`.${s}`)));
+        if (!match || tab.autoLaunched || tab.playerSessionId) return;
+        tab.autoLaunched = true;
+        persistTab(tab.tabId);
+    } finally {
+        tab.autoLaunchPending = false;
+    }
     setTimeout(() => {
         const list = visibleStreams(tab).filter(s => !s.isAd);
         // Prefer a probed master playlist over its variants when both exist already.
@@ -279,6 +361,7 @@ async function maybeAutoLaunch(tab, stream) {
         if (!best || tab.playerSessionId) return;
         launchPlayer(tab.tabId, best.id).catch(err => {
             tab.autoLaunched = false;
+            persistTab(tab.tabId);
             console.warn('[Engine] Auto-launch failed:', err && err.message);
         });
     }, 600);
@@ -300,9 +383,11 @@ async function detectTypeByContent(tabId, url, frameUrl) {
 // ============================================================================
 // TRANSPORT: proxy through the owning frame (page cookies / Referer), direct fallback
 // ============================================================================
-const refererByHost = new Map(); // host -> {referer, origin}
-const dnrRulesByHost = new Map();
-let nextDnrRuleId = 1000;
+// Headers the site's own player sent, keyed by `${requestHost}|${initiatorSite}` so two sites
+// sharing a CDN host never see each other's Referer/Origin/auth headers.
+const capturedByHostSite = new Map(); // key -> {referer, origin, headers, site}
+const latestCaptureByHost = new Map(); // host -> key of the most recent capture (frame URL unknown)
+const MAX_CAPTURES = 300;
 
 function pickFrameId(tab, stream) {
     if (stream && stream.frameId >= 0) return stream.frameId;
@@ -367,68 +452,272 @@ function proxyViaFrame(tabId, frameId, url, { method = 'GET', headers = {}, sign
 }
 
 const EXT_HOST = (() => { try { return new URL(api.runtime.getURL('')).hostname; } catch (_) { return ''; } })();
+// Built by hand: URL.origin of moz-extension:// URLs is not reliable on every Firefox version.
+const EXT_ORIGIN = (() => { try { const u = new URL(api.runtime.getURL('')); return u.host ? `${u.protocol}//${u.host}` : ''; } catch (_) { return ''; } })();
 
-/**
- * Session-scoped DNR rules so requests made by the extension itself carry the site's
- * Referer/Origin: direct fallback fetches from the engine (no tab) and media requests the
- * player page makes (e.g. a progressive MP4 in <video src>, initiated by the extension origin).
- * Many CDNs reject hot-linked media without the right Referer.
- */
-async function ensureRefererRule(url, frameUrl) {
+// ----------------------------------------------------------------------------
+// Site identity (registrable-domain heuristic; no public-suffix list in an extension)
+// ----------------------------------------------------------------------------
+const MULTI_PART_SLD = /^(co|com|net|org|gov|edu|ac|ne|or|go|gob|mil|nic|ltd|plc|sch)$/;
+
+/** "a.b.example.co.uk" -> "example.co.uk"; IPs and single labels are returned as-is. */
+function siteOf(urlOrHost) {
+    if (!urlOrHost) return '';
     let host;
-    let origin;
     try {
-        host = new URL(url).hostname;
-        origin = new URL(frameUrl).origin;
+        host = String(urlOrHost).includes('://') ? new URL(urlOrHost).hostname : String(urlOrHost);
     } catch (_) {
-        return;
+        return '';
     }
-    if (!origin || origin === 'null' || dnrRulesByHost.has(host)) return;
-    const captured = refererByHost.get(host);
-    const referer = (captured && captured.referer) || frameUrl;
-    const action = {
-        type: 'modifyHeaders',
-        requestHeaders: [
-            { header: 'Referer', operation: 'set', value: referer },
-            { header: 'Origin', operation: 'set', value: (captured && captured.origin) || origin }
-        ]
-    };
-    const resourceTypes = ['xmlhttprequest', 'media', 'other'];
-    const id = nextDnrRuleId;
-    nextDnrRuleId += 2;
-    dnrRulesByHost.set(host, id);
-    const addRules = [{ id, priority: 2, action, condition: { requestDomains: [host], tabIds: [api.tabs.TAB_ID_NONE], resourceTypes } }];
-    if (EXT_HOST) addRules.push({ id: id + 1, priority: 2, action, condition: { requestDomains: [host], initiatorDomains: [EXT_HOST], resourceTypes } });
+    host = host.toLowerCase().replace(/\.$/, '');
+    if (!host) return '';
+    if (/^[\d.]+$/.test(host) || host.includes(':') || host.startsWith('[')) return host;
+    const parts = host.split('.');
+    if (parts.length <= 2) return host;
+    const n = parts[parts.length - 1].length === 2 && MULTI_PART_SLD.test(parts[parts.length - 2]) ? 3 : 2;
+    return parts.slice(-n).join('.');
+}
+
+/** http(s) origin of a frame URL, or '' when it is unknown/opaque (about:blank, data:...). */
+function httpOrigin(frameUrl) {
     try {
-        await api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id, id + 1], addRules });
-    } catch (e) {
-        // Retry without the initiator rule (older engines reject extension initiators).
-        try {
-            await api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id, id + 1], addRules: addRules.slice(0, 1) });
-        } catch (e2) {
-            dnrRulesByHost.delete(host);
-            console.warn('[Engine] Could not add Referer rule:', e2 && e2.message);
-        }
+        const u = new URL(frameUrl);
+        return /^https?:$/.test(u.protocol) ? u.origin : '';
+    } catch (_) {
+        return '';
     }
 }
 
+/**
+ * What the site's player sent to `host`, as seen from the frame that owns the stream. With a known
+ * frame only a capture initiated from the same site is used; with an unknown frame, the latest.
+ */
+function lookupCapture(host, frameUrl) {
+    const site = httpOrigin(frameUrl) ? siteOf(frameUrl) : '';
+    if (site) return capturedByHostSite.get(`${host}|${site}`) || null;
+    const k = latestCaptureByHost.get(host);
+    return (k && capturedByHostSite.get(k)) || null;
+}
+
 /** Custom request headers the site's own player sent to this host (auth tokens etc.). */
-function capturedHeaders(url) {
+function capturedHeaders(url, frameUrl) {
     try {
-        const c = refererByHost.get(new URL(url).hostname);
+        const c = lookupCapture(new URL(url).hostname, frameUrl);
         return (c && c.headers) || {};
     } catch (_) {
         return {};
     }
 }
 
+// ----------------------------------------------------------------------------
+// Session-scoped DNR rules so requests made by the extension itself carry the site's
+// Referer/Origin: direct fallback fetches from the engine (no tab) and media requests the
+// player page makes (e.g. a progressive MP4 in <video src>, initiated by the extension origin).
+// Many CDNs reject hot-linked media without the right Referer.
+//
+// One group of 3 rule ids per CDN host:
+//   id     engine fetches (tabId NONE)                      -> request Referer/Origin
+//   id + 1 requests initiated by the extension origin        -> request Referer/Origin
+//   id + 2 requests initiated by the extension origin        -> CORS response headers, so the
+//          player's <video crossOrigin="anonymous"> can feed Web Audio / WebGL / snapshots.
+// Page-initiated requests never match (tabId NONE / initiatorDomains = our own origin).
+//
+// A host's rule can only carry one Referer at a time, but several sites may use the same CDN:
+// a host is "held" by the config of in-flight engine fetches (readers); a different config waits
+// until they have sent their headers, then rewrites the rule (writer). All rule updates are
+// serialized through one chain so removals/additions never interleave.
+// ----------------------------------------------------------------------------
+const DNR_BASE_ID = 1000;
+const MAX_HOST_RULES = 300;
+const SWITCH_MAX_WAIT_MS = 15000;
+const hostRules = new Map(); // host -> {host, ids, cfgKey, users, waiters: Map<key,n>, idle: fn[], switching}
+let nextDnrRuleId = DNR_BASE_ID;
+let dnrChain = Promise.resolve();
+const NOOP = () => { };
+
+function dnrUpdate(opts) {
+    const run = dnrChain.then(() => api.declarativeNetRequest.updateSessionRules(opts));
+    dnrChain = run.catch(() => { });
+    return run;
+}
+
+function newHostRule(host, baseId) {
+    return { host, ids: [baseId, baseId + 1, baseId + 2], cfgKey: null, users: 0, waiters: new Map(), idle: [], switching: null };
+}
+
+// Session rules survive a service-worker restart (they are cleared on browser restart and on
+// extension update/reload): rebuild the host map from them instead of colliding with their ids.
+const dnrReady = (async () => {
+    try {
+        const rules = await api.declarativeNetRequest.getSessionRules();
+        const groups = new Map();
+        for (const r of rules || []) {
+            if (r.id < DNR_BASE_ID) continue;
+            const base = DNR_BASE_ID + Math.floor((r.id - DNR_BASE_ID) / 3) * 3;
+            if (!groups.has(base)) groups.set(base, []);
+            groups.get(base).push(r);
+            nextDnrRuleId = Math.max(nextDnrRuleId, base + 3);
+        }
+        const orphans = [];
+        for (const [base, list] of groups) {
+            const head = list.find(r => r.id === base);
+            const host = head && head.condition && head.condition.requestDomains && head.condition.requestDomains[0];
+            if (!host || hostRules.has(host)) { orphans.push(...list.map(r => r.id)); continue; }
+            const hdr = (n) => (((head.action && head.action.requestHeaders) || []).find(h => String(h.header).toLowerCase() === n) || {}).value || '';
+            const st = newHostRule(host, base);
+            st.cfgKey = `${hdr('referer')}\n${hdr('origin')}`;
+            hostRules.set(host, st);
+        }
+        if (orphans.length) await dnrUpdate({ removeRuleIds: orphans });
+    } catch (_) { /* DNR session rules unavailable: rules are simply (re)added on demand */ }
+})();
+
+/** Desired Referer/Origin for extension requests to `url` on behalf of the stream's frame. */
+function refererConfig(url, frameUrl) {
+    let host;
+    try { host = new URL(url).hostname; } catch (_) { return null; }
+    if (!host) return null;
+    const frameOrigin = httpOrigin(frameUrl);
+    const frameSite = frameOrigin ? siteOf(frameUrl) : '';
+    const cap = lookupCapture(host, frameOrigin ? frameUrl : '');
+    // A captured value is only trusted when it belongs to the same site as the stream's frame.
+    const sameSite = (v) => !!v && (!frameSite || siteOf(v) === frameSite);
+    const referer = cap && sameSite(cap.referer) ? cap.referer : (frameOrigin ? String(frameUrl).split('#')[0] : '');
+    const origin = cap && sameSite(cap.origin) && cap.origin !== 'null' ? cap.origin : frameOrigin;
+    if (!referer && !origin) return null;
+    return { host, referer, origin, key: `${referer}\n${origin}` };
+}
+
+function wakeHost(st) {
+    const list = st.idle.splice(0);
+    list.forEach(fn => fn());
+}
+
+async function applyHostRule(st, cfg) {
+    const requestHeaders = [];
+    if (cfg.referer) requestHeaders.push({ header: 'Referer', operation: 'set', value: cfg.referer });
+    if (cfg.origin) requestHeaders.push({ header: 'Origin', operation: 'set', value: cfg.origin });
+    const action = { type: 'modifyHeaders', requestHeaders };
+    const resourceTypes = ['xmlhttprequest', 'media', 'other'];
+    const [a, b, c] = st.ids;
+    const base = [{ id: a, priority: 2, action, condition: { requestDomains: [st.host], tabIds: [api.tabs.TAB_ID_NONE], resourceTypes } }];
+    const ext = [];
+    if (EXT_HOST) {
+        ext.push({ id: b, priority: 2, action, condition: { requestDomains: [st.host], initiatorDomains: [EXT_HOST], resourceTypes } });
+        if (EXT_ORIGIN) {
+            ext.push({
+                id: c,
+                priority: 2,
+                action: {
+                    type: 'modifyHeaders',
+                    responseHeaders: [
+                        // Exact extension origin, never '*': only our own pages may read these bytes.
+                        { header: 'Access-Control-Allow-Origin', operation: 'set', value: EXT_ORIGIN },
+                        { header: 'Access-Control-Allow-Credentials', operation: 'set', value: 'true' },
+                        { header: 'Access-Control-Expose-Headers', operation: 'set', value: 'Content-Range, Content-Length, Accept-Ranges, Content-Type' }
+                    ]
+                },
+                condition: { requestDomains: [st.host], initiatorDomains: [EXT_HOST], resourceTypes }
+            });
+        }
+    }
+    // Degrade step by step: engines that reject extension initiators or response-header
+    // modification still get the engine-fetch Referer rule.
+    const attempts = [[...base, ...ext], [...base, ...ext.slice(0, 1)], base];
+    let lastErr = null;
+    for (const addRules of attempts) {
+        try {
+            await dnrUpdate({ removeRuleIds: st.ids, addRules });
+            st.cfgKey = cfg.key;
+            return true;
+        } catch (e) {
+            lastErr = e;
+        }
+    }
+    // A failed update changes nothing: drop the previous site's rule rather than keep sending it.
+    try { await dnrUpdate({ removeRuleIds: st.ids }); st.cfgKey = null; } catch (_) { /* keep state */ }
+    console.warn('[Engine] Could not add Referer rule:', lastErr && lastErr.message);
+    return false;
+}
+
+function evictHostRules() {
+    if (hostRules.size <= MAX_HOST_RULES) return;
+    for (const [host, st] of hostRules) {
+        if (hostRules.size <= MAX_HOST_RULES) break;
+        if (st.users || st.switching || st.waiters.size) continue;
+        hostRules.delete(host);
+        dnrUpdate({ removeRuleIds: st.ids }).catch(() => { });
+    }
+}
+
+/**
+ * Make sure the host's rule carries this frame's Referer/Origin and hold it until release() is
+ * called (after the request's headers went out). Never throws; resolves to a release function.
+ */
+async function acquireRefererRule(url, frameUrl) {
+    const cfg = refererConfig(url, frameUrl);
+    if (!cfg) return NOOP;
+    await dnrReady;
+    let st = hostRules.get(cfg.host);
+    if (!st) {
+        st = newHostRule(cfg.host, nextDnrRuleId);
+        nextDnrRuleId += 3;
+    }
+    hostRules.delete(cfg.host); // LRU order
+    hostRules.set(cfg.host, st);
+    evictHostRules();
+    const t0 = Date.now();
+    for (;;) {
+        if (st.switching) { await st.switching; continue; }
+        const contended = [...st.waiters].some(([k, n]) => k !== cfg.key && n > 0);
+        if (st.cfgKey === cfg.key && !contended) {
+            st.users++;
+            let released = false;
+            return () => {
+                if (released) return;
+                released = true;
+                st.users--;
+                if (st.users <= 0) { st.users = 0; wakeHost(st); }
+            };
+        }
+        // Switch when nobody is using the current config (or a stuck request held it too long).
+        if (st.cfgKey !== cfg.key && (st.users === 0 || Date.now() - t0 > SWITCH_MAX_WAIT_MS)) {
+            st.switching = applyHostRule(st, cfg).catch(() => false).finally(() => {
+                st.switching = null;
+                wakeHost(st);
+            });
+            await st.switching;
+            if (st.cfgKey !== cfg.key) return NOOP; // could not install: go without it
+            continue;
+        }
+        st.waiters.set(cfg.key, (st.waiters.get(cfg.key) || 0) + 1);
+        await new Promise(resolve => {
+            const t = setTimeout(resolve, 2000); // safety net: re-evaluate periodically
+            st.idle.push(() => { clearTimeout(t); resolve(); });
+        });
+        const n = (st.waiters.get(cfg.key) || 1) - 1;
+        if (n > 0) st.waiters.set(cfg.key, n); else st.waiters.delete(cfg.key);
+    }
+}
+
+/** Install (or switch) the host's rule for media the player page loads itself (<video src>). */
+async function ensureRefererRule(url, frameUrl) {
+    const release = await acquireRefererRule(url, frameUrl).catch(() => NOOP);
+    release();
+}
+
 async function directFetch(url, { method = 'GET', headers = {}, signal }, frameUrl) {
-    await ensureRefererRule(url, frameUrl);
     const h = {};
     for (const [k, v] of Object.entries(headers)) {
         if (!/^(referer|origin|cookie|host)$/i.test(k)) h[k] = v;
     }
-    const res = await fetch(url, { method, headers: h, credentials: 'include', signal, cache: 'no-store' });
+    const release = await acquireRefererRule(url, frameUrl).catch(() => NOOP);
+    let res;
+    try {
+        res = await fetch(url, { method, headers: h, credentials: 'include', signal, cache: 'no-store' });
+    } finally {
+        release(); // request headers are on the wire once the response started
+    }
     const data = method === 'HEAD' ? new ArrayBuffer(0) : await res.arrayBuffer();
     const outHeaders = {};
     res.headers.forEach((v, k) => { outHeaders[k] = v; });
@@ -452,7 +741,8 @@ function makeTransport(tabId, getStream) {
         const frameId = pickFrameId(tab, stream);
         const frameUrl = (stream && stream.frameUrl) || '';
         // Replay auth/token headers the site's player used for this host (Range stays ours).
-        opts = { ...opts, headers: { ...capturedHeaders(url), ...(opts.headers || {}) } };
+        // Only headers captured from the same site as the stream's frame (never another site's).
+        opts = { ...opts, headers: { ...capturedHeaders(url, frameUrl), ...(opts.headers || {}) } };
         let host = '';
         try { host = new URL(url).host; } catch (_) { /* opaque */ }
 
@@ -562,8 +852,9 @@ async function probeStream(tab, stream) {
 // ============================================================================
 function rememberReferer(details) {
     // Our own player iframe's requests come from the extension origin: never learn from those.
-    if (details.tabId < 0 || (details.initiator && details.initiator.includes(EXT_HOST)) || (details.originUrl && details.originUrl.includes(EXT_HOST))) return;
-    // Any data request may be an extension-less manifest; the per-host map is capped at 200.
+    if (details.tabId < 0) return;
+    if (EXT_HOST && ((details.initiator && details.initiator.includes(EXT_HOST)) || (details.originUrl && details.originUrl.includes(EXT_HOST)))) return;
+    // Any data request may be an extension-less manifest; the capture map is capped (LRU).
     if (!S.classifyStream(details.url) && !['xmlhttprequest', 'media', 'other'].includes(details.type)) return;
     let host;
     try { host = new URL(details.url).hostname; } catch (_) { return; }
@@ -578,8 +869,17 @@ function rememberReferer(details) {
         else if (!STANDARD.test(n) && h.value && h.value.length < 4096) info.headers[h.name] = h.value;
     }
     if (info.referer || info.origin || Object.keys(info.headers).length) {
-        refererByHost.set(host, info);
-        if (refererByHost.size > 200) refererByHost.delete(refererByHost.keys().next().value);
+        // Site that issued the request: Chromium reports `initiator` (origin), Firefox
+        // `originUrl`/`documentUrl`; the Referer is the last resort.
+        info.site = siteOf(details.initiator && details.initiator !== 'null' ? details.initiator
+            : (details.originUrl || details.documentUrl || info.referer || ''));
+        const key = `${host}|${info.site}`;
+        capturedByHostSite.delete(key); // refresh LRU position
+        capturedByHostSite.set(key, info);
+        latestCaptureByHost.delete(host);
+        latestCaptureByHost.set(host, key);
+        while (capturedByHostSite.size > MAX_CAPTURES) capturedByHostSite.delete(capturedByHostSite.keys().next().value);
+        while (latestCaptureByHost.size > MAX_CAPTURES) latestCaptureByHost.delete(latestCaptureByHost.keys().next().value);
     }
 }
 
@@ -607,6 +907,79 @@ api.webRequest.onHeadersReceived.addListener((details) => {
 // ============================================================================
 // PLAYER SESSIONS
 // ============================================================================
+const SESSION_PLAYLIST_TEXT_MAX = 1_000_000; // larger VOD playlists are stored as URL only
+const SESSION_TEXT_BUDGET = 3_000_000;       // all stored playlist texts of one session
+const SESSION_MAX_PLAYLISTS = 48;
+const sessionKey = (id) => `session_${id}`;
+
+function removeSessionState(id) {
+    api.storage.session.remove([sessionKey(id), `${sessionKey(id)}_texts`]).catch(() => { });
+}
+
+/**
+ * Worker restart with the player still open: the new Session's downloader knows nothing (Shaka
+ * already has its playlists and will not reload VOD ones). Re-teach it from storage.session:
+ * stored texts are ingested synchronously; live / oversized playlists are re-fetched by URL in
+ * the background (a live playlist from before the restart would be stale anyway).
+ */
+async function restoreSessionState(session) {
+    const key = sessionKey(session.id);
+    const res = await api.storage.session.get([key, `${key}_texts`]).catch(() => ({}));
+    const meta = res && res[key];
+    if (!meta || session.closing) return false;
+    const texts = (res && res[`${key}_texts`]) || {};
+    const d = session.downloader;
+
+    session.abrAuto = meta.abrAuto !== false;
+    session.activeVariantId = meta.activeVariantId ?? null;
+    if (typeof meta.qualityCap === 'number') {
+        session.qualityCap = meta.qualityCap;
+        session.abr.setMaxHeight(meta.qualityCap);
+    }
+    if (!session.abrAuto && session.activeVariantId !== null) session.abr.lockQuality(session.activeVariantId);
+    if (meta.recording && typeof meta.recording.startedAt === 'number') session.recording = meta.recording;
+
+    const list = Array.isArray(meta.playlists) ? meta.playlists : [];
+    // Roles first: a media playlist is filed under the role known when it is ingested.
+    // (roles / playlists are the downloader's own maps; guarded in case its internals change)
+    if (d.roles instanceof Map) for (const p of list) if (p.role && !d.roles.has(p.url)) d.roles.set(p.url, p.role);
+    const applyCursor = (p) => {
+        const entry = d.playlists instanceof Map ? d.playlists.get(p.url) : null;
+        if (!entry || typeof p.cursorSeq !== 'number') return;
+        const n = entry.parsed.segments.length;
+        if (!n) return;
+        entry.cursor = Math.max(0, Math.min(n - 1, p.cursorSeq - entry.parsed.mediaSequence));
+        entry.lastUsed = p.lastUsed || Date.now();
+    };
+    const ingest = (p, text) => {
+        try {
+            if (d.ingestPlaylist(p.url, text)) applyCursor(p);
+        } catch (_) { /* corrupt entry */ }
+    };
+    const refetch = [];
+    for (const p of list) {
+        if (typeof texts[p.url] === 'string') ingest(p, texts[p.url]);
+        else refetch.push(p);
+    }
+    if (refetch.length) {
+        (async () => {
+            const fetchOne = async (p) => {
+                try {
+                    const r = await d.transport(p.url, { method: 'GET', headers: {} });
+                    if (session.closing || r.status >= 400 || !r.data) return;
+                    ingest(p, new TextDecoder().decode(r.data));
+                } catch (_) { /* the player will reload it (live) or prefetch stays off (VOD) */ }
+            };
+            // Masters first (roles of their renditions), then media playlists in parallel.
+            for (const p of refetch.filter(x => x.type === 'master')) await fetchOne(p);
+            await Promise.all(refetch.filter(x => x.type !== 'master').map(fetchOne));
+            if (!session.closing) d.schedulePump();
+        })();
+    }
+    d.schedulePump();
+    return true;
+}
+
 class Session {
     constructor({ id, tabId, stream }) {
         this.id = id;
@@ -636,8 +1009,92 @@ class Session {
         });
         this.buffer.init().catch(err => console.warn('[Engine] Buffer init failed:', err));
 
+        // Observe every playlist the downloader learns (player manifest loads go through
+        // downloader.load -> ingestPlaylist) so it can be re-taught after a worker restart.
+        this.playlistLog = new Map(); // url -> {url, type, live, text|null}
+        this.textsDirty = false;
+        this.persistTimer = null;
+        this.lastPersistAt = 0;
+        const ingest = this.downloader.ingestPlaylist.bind(this.downloader);
+        this.downloader.ingestPlaylist = (url, text) => {
+            const parsed = ingest(url, text);
+            if (parsed && !this.closing) this.notePlaylist(url, text, parsed);
+            return parsed;
+        };
+
         this.statsTimer = setInterval(() => this.pushStats(), 1000);
         this.abrTimer = setInterval(() => this.runAbr(), 2000);
+    }
+
+    notePlaylist(url, text, parsed) {
+        const live = parsed.type === 'media' && !!parsed.live;
+        // Live playlists change every few seconds: store the URL only and re-fetch on restore.
+        // Huge VOD playlists also go URL-only (storage.session is small and shared).
+        const keepText = !live && typeof text === 'string' && text.length <= SESSION_PLAYLIST_TEXT_MAX;
+        const entry = { url, type: parsed.type, live, text: keepText ? text : null };
+        const prev = this.playlistLog.get(url);
+        if (prev && prev.type === entry.type && prev.live === entry.live && prev.text === entry.text) {
+            if (!live) return; // nothing new
+        } else {
+            this.playlistLog.delete(url);
+            this.playlistLog.set(url, entry);
+            while (this.playlistLog.size > SESSION_MAX_PLAYLISTS) this.playlistLog.delete(this.playlistLog.keys().next().value);
+            this.textsDirty = true;
+        }
+        // First save right away: a worker restart in the first second must not lose the playlists.
+        this.persistState({ soon: !this.lastPersistAt });
+    }
+
+    /** Debounced write of everything needed to rebuild this session after a worker restart. */
+    persistState({ soon = false } = {}) {
+        if (this.closing) return;
+        clearTimeout(this.persistTimer);
+        this.persistTimer = setTimeout(() => {
+            this.persistTimer = null;
+            if (this.closing || !sessions.has(this.id)) return;
+            this.lastPersistAt = Date.now();
+            const d = this.downloader;
+            const playlists = [];
+            for (const p of this.playlistLog.values()) {
+                const entry = d.playlists instanceof Map ? d.playlists.get(p.url) : null;
+                playlists.push({
+                    url: p.url,
+                    type: p.type,
+                    live: p.live,
+                    role: (entry && entry.role) || (d.roles instanceof Map && d.roles.get(p.url)) || null,
+                    cursorSeq: entry && entry.cursor >= 0 ? entry.parsed.mediaSequence + entry.cursor : null,
+                    lastUsed: (entry && entry.lastUsed) || 0
+                });
+            }
+            const key = sessionKey(this.id);
+            const data = {
+                [key]: {
+                    tabId: this.tabId,
+                    streamId: this.stream.id,
+                    abrAuto: this.abrAuto,
+                    activeVariantId: this.activeVariantId,
+                    qualityCap: this.qualityCap,
+                    recording: this.recording || null,
+                    playlists
+                }
+            };
+            if (this.textsDirty) {
+                this.textsDirty = false;
+                const texts = {};
+                let used = 0;
+                // Masters first (they carry the roles), then media, within the budget.
+                const ordered = [...this.playlistLog.values()].sort((a, b) => (a.type === 'master' ? 0 : 1) - (b.type === 'master' ? 0 : 1));
+                for (const p of ordered) {
+                    if (!p.text || used + p.text.length > SESSION_TEXT_BUDGET) continue;
+                    used += p.text.length;
+                    texts[p.url] = p.text;
+                }
+                // Separate write: if the texts exceed the quota, the state above still lands
+                // (restore then re-fetches those playlists by URL).
+                api.storage.session.set({ [`${key}_texts`]: texts }).catch(() => { });
+            }
+            api.storage.session.set(data).catch(() => { });
+        }, soon ? 50 : 1000);
     }
 
     post(msg) {
@@ -679,6 +1136,8 @@ class Session {
         clearInterval(this.statsTimer);
         clearInterval(this.abrTimer);
         clearTimeout(this.disconnectTimer);
+        clearTimeout(this.persistTimer);
+        this.persistTimer = null;
         for (const c of this.requests.values()) c.abort();
         this.requests.clear();
         if (this.exportJob) this.exportJob.controller.abort();
@@ -691,6 +1150,7 @@ async function endSession(session, { clearCache = true, restoreMedia = true } = 
     session.closing = true;
     sessions.delete(session.id);
     session.destroy();
+    removeSessionState(session.id);
     if (clearCache) await session.buffer.clearStream().catch(() => { });
     const tab = tabs.get(session.tabId);
     if (tab && tab.playerSessionId === session.id) {
@@ -758,21 +1218,78 @@ function fileBaseName(stream) {
     }
 }
 
-/** Live recording: remember the media sequence at "record" time; export from there on stop. */
+/**
+ * Live recording: remember, for every playlist in use, the media sequence at "record" time
+ * (audio and video renditions number their segments independently), plus wall-clock /
+ * program-date-time anchors for playlists that only show up later (track switch).
+ */
 function startRecording(session) {
-    const main = session.downloader.mainPlaylist();
+    const d = session.downloader;
+    const main = d.mainPlaylist();
     if (!main || !main.parsed.live) {
         session.post({ type: 'EXPORT_ERROR', error: 'Recording is for live streams. Use Export for on-demand video.' });
         return;
     }
-    const segs = main.parsed.segments;
-    const cur = segs[Math.max(0, main.cursor)] || segs[segs.length - 1];
-    session.recording = { fromSeq: cur ? cur.seq : main.parsed.mediaSequence, startedAt: Date.now() };
+    const fromSeqByUrl = {};
+    let startPdt = null;
+    let behindEdgeSec = 0;
+    for (const p of new Set([main, ...d.activePlaylists()])) {
+        if (!p.parsed.live) continue;
+        const segs = p.parsed.segments;
+        const idx = segs[Math.max(0, p.cursor)] ? Math.max(0, p.cursor) : segs.length - 1;
+        const cur = segs[idx];
+        fromSeqByUrl[p.url] = cur ? cur.seq : p.parsed.mediaSequence;
+        if (p === main && cur) {
+            startPdt = segmentPdts(segs)[idx];
+            behindEdgeSec = segs.slice(idx).reduce((t, s) => t + (s.duration || 0), 0);
+        }
+    }
+    session.recording = { fromSeqByUrl, startPdt, behindEdgeSec, startedAt: Date.now() };
+    session.persistState({ soon: true });
     session.post({ type: 'RECORD_STARTED', startedAt: session.recording.startedAt });
 }
 
+/** Program-date-time (ms) of every segment, carried forward across segments without the tag. */
+function segmentPdts(segs) {
+    const out = new Array(segs.length).fill(null);
+    let t = null;
+    for (let i = 0; i < segs.length; i++) {
+        if (typeof segs[i].programDateTime === 'number') t = segs[i].programDateTime;
+        out[i] = t;
+        if (t !== null) t += (segs[i].duration || 0) * 1000;
+    }
+    return out;
+}
+
+/** Segments of one playlist that belong to the recording. */
+function recordingSegments(rec, playlist, segs) {
+    const from = rec.fromSeqByUrl && rec.fromSeqByUrl[playlist.url];
+    if (typeof from === 'number') return segs.filter(s => s.seq >= from);
+    // Playlist unknown at "record" time: match by program-date-time when both sides have it...
+    if (typeof rec.startPdt === 'number') {
+        const pdts = segmentPdts(segs);
+        if (pdts.some(t => t !== null)) {
+            // Keep the segment that contains the start instant (ends after it).
+            return segs.filter((s, i) => pdts[i] !== null && pdts[i] + (s.duration || 0) * 1000 > rec.startPdt + 100);
+        }
+    }
+    // ...else approximate: the same amount of media back from the live edge as the main
+    // playlist had at "record" time plus the wall-clock time recorded since.
+    const want = (rec.behindEdgeSec || 0) + Math.max(0, (Date.now() - rec.startedAt) / 1000);
+    let total = 0;
+    let i = segs.length;
+    while (i > 0 && total < want - 0.05) {
+        i--;
+        total += segs[i].duration || 0;
+    }
+    return segs.slice(i);
+}
+
 async function runExport(session, opts = {}) {
-    if (session.exportJob) return;
+    if (session.exportJob) {
+        session.post({ type: 'EXPORT_ERROR', error: 'An export is already running. Wait for it to finish or cancel it.' });
+        return false;
+    }
     const controller = new AbortController();
     const jobId = crypto.randomUUID();
     session.exportJob = { id: jobId, controller };
@@ -792,8 +1309,8 @@ async function runExport(session, opts = {}) {
             if (audio) parts.push(audio);
             for (let i = 0; i < parts.length; i++) {
                 let segs = d.exportSegments(parts[i]);
-                if (opts.fromSeq !== undefined) segs = segs.filter(s => s.seq >= opts.fromSeq);
-                const suffix = `${opts.fromSeq !== undefined ? '-recording' : ''}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`;
+                if (opts.recording) segs = recordingSegments(opts.recording, parts[i], segs);
+                const suffix = `${opts.recording ? '-recording' : ''}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`;
                 await exportHlsPlaylist(session, parts[i], segs, post, signal, `${base}${suffix}`, i, parts.length);
             }
         } else {
@@ -805,6 +1322,7 @@ async function runExport(session, opts = {}) {
     } finally {
         session.exportJob = null;
     }
+    return true;
 }
 
 async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fileIndex, fileCount) {
@@ -837,13 +1355,18 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
     const startFetch = (i) => {
         if (i >= segs.length || pending.has(i)) return;
         const seg = segs[i];
-        pending.set(i, (async () => {
+        const p = (async () => {
+            // Encrypted segments come back as raw ciphertext (the downloader must not sniff or
+            // trim them): decrypt first, then strip any disguise header from the plaintext.
             let data = await session.downloader.fetchForExport(seg, signal);
             if (seg.key && seg.key.method === 'AES-128') {
                 data = await decryptAes128(data, await getKey(seg.key.uri), ivForSegment(seg));
             }
-            return data;
-        })());
+            const sniff = sniffMedia(data);
+            return sniff && sniff.offset ? data.slice(sniff.offset) : data;
+        })();
+        p.catch(() => { }); // awaited in order below; avoid unhandled rejections past a failure
+        pending.set(i, p);
     };
     let bytes = 0;
     for (let i = 0; i < segs.length; i++) {
@@ -854,8 +1377,10 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
             const headers = seg.map.byteRange ? { Range: `bytes=${seg.map.byteRange.offset}-${seg.map.byteRange.offset + seg.map.byteRange.length - 1}` } : {};
             const init = await transport(seg.map.uri, { method: 'GET', headers, signal });
             if (init.status >= 400) throw new Error(`Init segment HTTP ${init.status}`);
-            post({ type: 'EXPORT_CHUNK', fileIndex, kind: 'init', data: S.packBinary(init.data) });
-            bytes += init.data.byteLength;
+            const initSniff = sniffMedia(init.data);
+            const initData = initSniff && initSniff.offset ? init.data.slice(initSniff.offset) : init.data;
+            post({ type: 'EXPORT_CHUNK', fileIndex, kind: 'init', data: S.packBinary(initData) });
+            bytes += initData.byteLength;
             lastMap = seg.map;
         }
         const data = await pending.get(i);
@@ -898,7 +1423,12 @@ async function exportProgressive(session, post, signal, name) {
         const offsets = [];
         for (let o = offset; o < total; o += CHUNK) offsets.push(o);
         for (let i = 0; i < offsets.length; i++) {
-            for (let k = i; k < Math.min(i + 4, offsets.length); k++) if (!pending.has(k)) pending.set(k, fetchChunk(offsets[k]));
+            for (let k = i; k < Math.min(i + 4, offsets.length); k++) {
+                if (pending.has(k)) continue;
+                const p = fetchChunk(offsets[k]);
+                p.catch(() => { }); // awaited in order; no unhandled rejection after a failure
+                pending.set(k, p);
+            }
             if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
             const res = await pending.get(i);
             pending.delete(i);
@@ -957,7 +1487,10 @@ api.runtime.onConnect.addListener((port) => {
                 sessions.set(session.id, session);
                 tab.playerSessionId = session.id;
                 persistTab(tabId);
+                // Worker restart: re-teach the downloader the playlists Shaka already holds.
+                if (msg.resumed) await restoreSessionState(session).catch(e => console.warn('[Engine] Session restore failed:', e && e.message));
             }
+            if (session.closing) return;
             clearTimeout(session.disconnectTimer);
             session.port = port;
             // Direct media files are loaded by the player page's <video>: give those requests
@@ -984,17 +1517,28 @@ api.runtime.onConnect.addListener((port) => {
                 session.telemetry = {
                     currentTime: +msg.currentTime || 0,
                     bufferAhead: +msg.bufferAhead || 0,
-                    paused: !!msg.paused
+                    paused: !!msg.paused,
+                    // Start of Shaka's seek range (live window / DVR): optional, used by the downloader.
+                    seekRangeStart: Number.isFinite(+msg.seekRangeStart) && msg.seekRangeStart !== null ? +msg.seekRangeStart : undefined,
+                    // Lets the downloader skip timeline-offset samples taken mid-seek (bug 12).
+                    seeking: !!msg.seeking
                 };
                 session.downloader.updatePlayback(session.telemetry);
                 if (Array.isArray(msg.variants)) session.abr.setProfiles(msg.variants);
+                let stateChanged = false;
                 if (msg.activeVariantId !== undefined) {
+                    stateChanged = stateChanged || session.activeVariantId !== msg.activeVariantId;
                     session.activeVariantId = msg.activeVariantId;
                     session.abr.setActive(msg.activeVariantId);
                 }
                 if (typeof msg.qualityCap === 'number') {
+                    stateChanged = stateChanged || session.qualityCap !== msg.qualityCap;
                     session.qualityCap = msg.qualityCap;
                     session.abr.setMaxHeight(msg.qualityCap);
+                }
+                // Keep the stored cursors reasonably fresh without writing every second.
+                if (stateChanged || Date.now() - session.lastPersistAt > 10000) {
+                    if (!session.persistTimer) session.persistState();
                 }
                 break;
             }
@@ -1009,7 +1553,9 @@ api.runtime.onConnect.addListener((port) => {
                 } else {
                     session.abrAuto = false;
                     session.abr.lockQuality(msg.variantId);
+                    if (msg.variantId !== undefined) session.activeVariantId = msg.variantId;
                 }
+                session.persistState({ soon: true });
                 break;
             case 'PREFETCH':
                 if (msg.enabled) session.downloader.resume(); else session.downloader.pause();
@@ -1048,8 +1594,15 @@ api.runtime.onConnect.addListener((port) => {
                 break;
             case 'RECORD_STOP': {
                 const rec = session.recording;
+                if (!rec) break;
+                if (session.exportJob) {
+                    // Keep recording: the user can stop again once the running export is done.
+                    session.post({ type: 'EXPORT_ERROR', error: 'An export is already running. Stop the recording again when it has finished.' });
+                    break;
+                }
                 session.recording = null;
-                if (rec) runExport(session, { fromSeq: rec.fromSeq });
+                session.persistState({ soon: true });
+                runExport(session, { recording: rec });
                 break;
             }
             case 'EXPORT_CANCEL':
@@ -1149,6 +1702,7 @@ async function launchPlayer(tabId, streamId, preferFrameId) {
         mounted = { frameId: 0, mode: 'page' };
     }
     tab.mountFrameId = mounted.frameId;
+    persistTab(tabId);
     notifyFrames(tabId);
     return { ok: true, sessionId, frameId: mounted.frameId, mode: mounted.mode };
 }
@@ -1206,8 +1760,9 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'DRM_DETECTED':
             if (fromTab !== undefined) getTab(fromTab).then(tab => {
                 tab.drm = { keySystem: String((message.payload && message.payload.keySystem) || '').slice(0, 80), frameId: sender.frameId ?? 0 };
+                persistTab(fromTab);
                 notifyFrames(fromTab);
-            });
+            }).catch(() => { });
             return false;
 
         // ---- From popup -------------------------------------------------------
@@ -1289,7 +1844,8 @@ async function teardownTab(tabId, { keepPlayer = false, removed = false } = {}) 
         tabs.delete(tabId);
         clearTimeout(persistTimers.get(tabId));
         persistTimers.delete(tabId);
-        api.storage.session.remove(`tab_${tabId}`).catch(() => { });
+        subsDirty.delete(tabId);
+        api.storage.session.remove([tabKey(tabId), tabSubsKey(tabId)]).catch(() => { });
         if (!keepPlayer) BufferManager.clearTab(tabId).catch(() => { });
     }
     if (!removed) {
@@ -1323,7 +1879,18 @@ async function startupSweep() {
         const removed = await sweepOrphans(live);
         if (removed) console.log(`[Engine] Swept cache of ${removed} closed tab(s)`);
         const stored = await api.storage.session.get(null);
-        const stale = Object.keys(stored).filter(k => k.startsWith('tab_') && !live.has(parseInt(k.slice(4), 10)));
+        const tabIdOf = (k) => parseInt(k.slice(k.indexOf('_') + 1), 10);
+        const stale = Object.keys(stored).filter(k => (k.startsWith('tab_') || k.startsWith('tabsubs_')) && !live.has(tabIdOf(k)));
+        // Session state: keep only the session its (live) tab still points at. Sessions alive in
+        // this worker are never touched (onInstalled/onStartup may run this again later).
+        for (const k of Object.keys(stored)) {
+            if (!k.startsWith('session_')) continue;
+            const id = k.slice(8).replace(/_texts$/, '');
+            if (sessions.has(id)) continue;
+            const meta = stored[`session_${id}`];
+            const tabState = meta && stored[`tab_${meta.tabId}`];
+            if (!meta || !live.has(meta.tabId) || !tabState || tabState.playerSessionId !== id) stale.push(k);
+        }
         if (stale.length) await api.storage.session.remove(stale);
     } catch (e) {
         console.warn('[Engine] Startup sweep failed:', e && e.message);
