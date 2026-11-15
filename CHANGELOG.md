@@ -10,6 +10,16 @@ First public release as **Velostream** (previously developed as *FastStream Mobi
 
 ### Added
 
+- **A–B clip export**: save just the looped range of an HLS video as an `.mp4`.
+- **Chapter-aware skip**: *Skip Intro / Recap / Credits / Preview* jumps to the end of matching
+  chapters; the +N s skip remains the fallback.
+- **Snapshot with subtitles & effects** (Shift+S): GPU enhancement, colour filters and the visible
+  subtitle lines burned into the PNG.
+- **Ambient glow** behind the video (Display tab and popup).
+- **Diagnostics** in Stats for nerds: video/audio codec names, hardware-decoding check, dropped-frame
+  percentage, GPU enhancement cost and active effects.
+- **Backup & restore**: settings, site profiles, presets, shortcuts, bookmarks and history as one
+  validated `.json` file (player Prefs and popup).
 - **Player as an extension page** mounted exactly over the site's video (or full-page), with the
   glass UI, Dynamic Island HUD, Studio panel, mini player, lock, audio-only mode and sleep timer.
 - **Background pre-buffer engine**: whole-video prefetch with 2–8 adaptive workers, a byte-range

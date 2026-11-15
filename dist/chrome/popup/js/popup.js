@@ -515,6 +515,58 @@
                 next.click();
             });
         });
+        // Backup / restore. A toolbar popup closes as soon as a file picker or save dialog takes
+        // focus (always on Firefox), so: export saves straight to Downloads without a dialog, and
+        // import continues in this same page opened as a tab.
+        const inTab = new URLSearchParams(location.search).has('tab');
+        if (inTab && location.hash === '#settings') { $('settings').open = true; $('backup-import').focus(); }
+        $('backup-export').addEventListener('click', async () => {
+            try {
+                const json = JSON.stringify(await S.buildBackup(api), null, 2);
+                // Chromium: a data: URL survives the popup closing; Firefox's downloads API refuses
+                // data: URLs, so it gets a blob: URL (revoked once the download finishes).
+                let url;
+                let blobUrl = null;
+                if (S.IS_FIREFOX) url = blobUrl = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+                else url = `data:application/json;base64,${S.toBase64(new TextEncoder().encode(json))}`;
+                const id = await api.downloads.download({ url, filename: S.backupFilename(), saveAs: false });
+                if (blobUrl) {
+                    const done = (d) => {
+                        if (d.id !== id || !d.state || d.state.current === 'in_progress') return;
+                        api.downloads.onChanged.removeListener(done);
+                        URL.revokeObjectURL(blobUrl);
+                    };
+                    api.downloads.onChanged.addListener(done);
+                }
+                showMessage('Backup saved to your Downloads folder.', true);
+            } catch (e) {
+                showMessage(`Export failed: ${(e && e.message) || e}`);
+            }
+        });
+        $('backup-import').addEventListener('click', () => {
+            if (!inTab) {
+                api.tabs.create({ url: api.runtime.getURL('popup/popup.html?tab=1#settings') });
+                window.close();
+                return;
+            }
+            $('backup-file').click();
+        });
+        $('backup-file').addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            if (file.size > 5 * 1024 * 1024) { showMessage('That file is too large to be a Velostream backup.'); return; }
+            try {
+                const res = await S.restoreBackup(api, await file.text());
+                const fresh = await api.storage.local.get(S.SETTINGS_KEY);
+                settings = S.mergeSettings(fresh[S.SETTINGS_KEY]);
+                fillForm();
+                showMessage(`Settings & profiles restored (${res.profiles} site profiles, ${res.bookmarks} bookmarked videos, ${res.history} history entries).`, true);
+                announce('Settings and profiles restored');
+            } catch (err) {
+                showMessage(`Import failed: ${(err && err.message) || err}`);
+            }
+        });
         $('reset-settings').addEventListener('click', async () => {
             // Through the save queue, so a pending field save cannot land after the reset.
             await saveSettings(next => {

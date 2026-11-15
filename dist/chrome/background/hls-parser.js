@@ -349,9 +349,10 @@ export function ivForSegment(segment) {
         const hex = segment.key.iv.replace(/^0x/i, '').padStart(32, '0');
         for (let i = 0; i < 16; i++) iv[i] = parseInt(hex.substr(i * 2, 2), 16);
     } else {
+        // RFC 8216 5.2: the whole media sequence number, big-endian, in the 16-octet buffer.
+        // (Sequence numbers above 2^32 occur with epoch/timestamp based numbering.)
         let seq = segment.seq;
-        for (let i = 15; i >= 12 && seq > 0; i--) { iv[i] = seq & 0xff; seq = Math.floor(seq / 256); }
-        // Sequence numbers above 2^32 are vanishingly rare; upper bytes stay 0 as per spec.
+        for (let i = 15; i >= 0 && seq > 0; i--) { iv[i] = seq % 256; seq = Math.floor(seq / 256); }
     }
     return iv;
 }

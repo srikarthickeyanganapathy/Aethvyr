@@ -139,6 +139,7 @@
                         </select>
                     </div>
                     <label class="field"><span>Stats for nerds</span><input type="checkbox" role="switch" name="showStats"></label>
+                    <label class="field"><span>Ambient glow</span><input type="checkbox" role="switch" name="ambientMode"></label>
                     <label class="field"><span>On-page Play button</span><input type="checkbox" role="switch" name="quickLaunchBadge"></label>
                 </fieldset>
                 <fieldset>
@@ -249,6 +250,11 @@
                         </select>
                     </div>
                 </fieldset>
+                <div class="btn-row backup-row" role="group" aria-label="Backup and restore">
+                    <button type="button" id="backup-export" class="btn btn-quiet small">Export settings (.json)</button>
+                    <button type="button" id="backup-import" class="btn btn-quiet small">Import settings (.json)</button>
+                    <input type="file" id="backup-file" accept=".json,application/json" hidden>
+                </div>
                 <button type="button" id="reset-settings" class="btn btn-quiet small">Reset all settings</button>
             </form>
         </details>

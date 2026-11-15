@@ -26,6 +26,7 @@ Other storage keys:
 | `simpleMode` | `false` | Hides advanced controls |
 | `autoHideMs` | `3000` | Controls auto-hide delay; `0` never hides |
 | `showStats` | `false` | *Stats for nerds* overlay |
+| `ambientMode` | `false` | Ambient glow from the video behind the letterbox bars |
 | `quickLaunchBadge` | `true` | On-page *Play in Velostream* pill |
 
 ## Playback

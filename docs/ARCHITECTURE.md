@@ -147,7 +147,7 @@ clone is not available).
 | E → P | `STATS`, `ABR_SWITCH {variantId}`, `SUBTITLES`, `FATAL` | Engine → UI updates. |
 | P → E | `SEEK`, `SET_QUALITY`, `PREFETCH {enabled}`, `PURGE_CACHE` | Playback control. |
 | P → E / E → P | `FIND_FRESH {url, since}` / `FRESH {url}` | Find a newer signed link for the same video. |
-| P → E | `EXPORT_START`, `RECORD_START`, `RECORD_STOP`, `EXPORT_CANCEL` | Downloads. |
+| P → E | `EXPORT_START [{clip: {start, end}}]`, `RECORD_START`, `RECORD_STOP`, `EXPORT_CANCEL` | Downloads. `clip` (player time, HLS only) keeps the segments overlapping the A–B range, mapped through the downloader's timeline offset. |
 | E → P | `EXPORT_BEGIN`, `EXPORT_CHUNK`, `EXPORT_PROGRESS`, `EXPORT_FILE_DONE`, `EXPORT_ERROR` | Download data and progress. |
 | P → E | `CLOSE` | End the session and restore the site player. |
 

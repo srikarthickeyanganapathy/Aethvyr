@@ -391,6 +391,7 @@ const MAX_CAPTURES = 300;
 
 function pickFrameId(tab, stream) {
     if (stream && stream.frameId >= 0) return stream.frameId;
+    if (!tab) return 0;
     // Unknown frame (e.g. request issued by a worker): prefer the most recent MSE frame.
     let best = 0;
     let bestTs = 0;
@@ -712,16 +713,32 @@ async function directFetch(url, { method = 'GET', headers = {}, signal }, frameU
         if (!/^(referer|origin|cookie|host)$/i.test(k)) h[k] = v;
     }
     const release = await acquireRefererRule(url, frameUrl).catch(() => NOOP);
+    // A stalled connection must not hold a prefetch slot forever: time out waiting for the
+    // response (the body itself may legitimately take long for big files). A timeout is a
+    // retryable network error, not an abort.
+    const ctl = new AbortController();
+    const onAbort = () => ctl.abort();
+    if (signal) { if (signal.aborted) ctl.abort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctl.abort(); }, PROXY_TIMEOUT_MS);
     let res;
     try {
-        res = await fetch(url, { method, headers: h, credentials: 'include', signal, cache: 'no-store' });
+        res = await fetch(url, { method, headers: h, credentials: 'include', signal: ctl.signal, cache: 'no-store' });
+    } catch (err) {
+        if (timedOut && !(signal && signal.aborted)) throw new Error(`Direct fetch timeout (${PROXY_TIMEOUT_MS}ms)`);
+        throw err;
     } finally {
+        clearTimeout(timer);
         release(); // request headers are on the wire once the response started
     }
-    const data = method === 'HEAD' ? new ArrayBuffer(0) : await res.arrayBuffer();
-    const outHeaders = {};
-    res.headers.forEach((v, k) => { outHeaders[k] = v; });
-    return { status: res.status, headers: outHeaders, url: res.url || url, data };
+    try {
+        const data = method === 'HEAD' ? new ArrayBuffer(0) : await res.arrayBuffer();
+        const outHeaders = {};
+        res.headers.forEach((v, k) => { outHeaders[k] = v; });
+        return { status: res.status, headers: outHeaders, url: res.url || url, data };
+    } finally {
+        if (signal) signal.removeEventListener('abort', onAbort);
+    }
 }
 
 /** Hosts that only answer requests made from inside the page (cookie/session-bound CDNs). */
@@ -736,7 +753,8 @@ const pageOnlyHosts = new Set();
  */
 function makeTransport(tabId, getStream) {
     return async (url, opts) => {
-        const tab = await getTab(tabId);
+        // No create: a late request for a closed tab must not resurrect its state.
+        const tab = await getTab(tabId, { create: false });
         const stream = getStream();
         const frameId = pickFrameId(tab, stream);
         const frameUrl = (stream && stream.frameUrl) || '';
@@ -1230,6 +1248,12 @@ function startRecording(session) {
         session.post({ type: 'EXPORT_ERROR', error: 'Recording is for live streams. Use Export for on-demand video.' });
         return;
     }
+    if (!main.dvr) {
+        // Without the DVR ring only the server's current window (often 30-60 s) is kept, so a
+        // longer recording would be silently cut down to its last minute.
+        session.post({ type: 'EXPORT_ERROR', error: 'Recording needs live rewind. Set "Live rewind (DVR)" in the popup settings to a duration; low-latency streams do not support it.' });
+        return;
+    }
     const fromSeqByUrl = {};
     let startPdt = null;
     let behindEdgeSec = 0;
@@ -1310,7 +1334,16 @@ async function runExport(session, opts = {}) {
             for (let i = 0; i < parts.length; i++) {
                 let segs = d.exportSegments(parts[i]);
                 if (opts.recording) segs = recordingSegments(opts.recording, parts[i], segs);
-                const suffix = `${opts.recording ? '-recording' : ''}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`;
+                if (opts.clip) {
+                    // A-B clip: the range is in player time; segment starts are playlist time.
+                    // Whole segments overlapping [start, end] are kept (cuts land on segment
+                    // boundaries, which are keyframes, so no re-encoding is needed).
+                    const off = typeof d.timelineOffset === 'function' ? (d.timelineOffset(parts[i]) || 0) : 0;
+                    const { start, end } = opts.clip;
+                    segs = segs.filter(s => Number.isFinite(s.start) && s.start + off < end && s.start + off + (s.duration || 0) > start);
+                    if (!segs.length) throw new Error('No segments in the A–B range. Play through it once, then try again.');
+                }
+                const suffix = `${opts.recording ? '-recording' : ''}${opts.clip ? '-clip' : ''}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`;
                 await exportHlsPlaylist(session, parts[i], segs, post, signal, `${base}${suffix}`, i, parts.length);
             }
         } else {
@@ -1468,8 +1501,11 @@ api.runtime.onConnect.addListener((port) => {
             return;
         }
         if (hello) await hello;
-        handle(msg);
+        // A throw (e.g. malformed TELEMETRY variants) must not become an unhandled rejection.
+        handle(msg).catch(e => console.warn('[Engine] message failed:', msg.type, e && e.message));
     });
+    // The port can die while attach() is still awaiting; attach must then not adopt it.
+    let disconnected = false;
 
     async function attach(msg) {
         {
@@ -1491,6 +1527,15 @@ api.runtime.onConnect.addListener((port) => {
                 if (msg.resumed) await restoreSessionState(session).catch(e => console.warn('[Engine] Session restore failed:', e && e.message));
             }
             if (session.closing) return;
+            if (disconnected) {
+                // The player went away mid-attach: onDisconnect saw no port to clear, so start the
+                // grace timer here (the session would otherwise leak with its timers running).
+                if (!session.port) {
+                    clearTimeout(session.disconnectTimer);
+                    session.disconnectTimer = setTimeout(() => { if (!session.port) endSession(session, { clearCache: true, restoreMedia: false }); }, RECONNECT_GRACE_MS);
+                }
+                return;
+            }
             clearTimeout(session.disconnectTimer);
             session.port = port;
             // Direct media files are loaded by the player page's <video>: give those requests
@@ -1586,9 +1631,16 @@ api.runtime.onConnect.addListener((port) => {
                 session.post({ type: 'FRESH', reqId: msg.reqId, url: fresh ? fresh.url : null });
                 break;
             }
-            case 'EXPORT_START':
-                runExport(session);
+            case 'EXPORT_START': {
+                const clip = msg.clip && Number.isFinite(+msg.clip.start) && Number.isFinite(+msg.clip.end) && +msg.clip.end > +msg.clip.start
+                    ? { start: +msg.clip.start, end: +msg.clip.end } : null;
+                if (clip && session.stream.type !== 'hls') {
+                    session.post({ type: 'EXPORT_ERROR', error: 'A–B clips can be saved from HLS streams only.' });
+                    break;
+                }
+                runExport(session, clip ? { clip } : {});
                 break;
+            }
             case 'RECORD_START':
                 startRecording(session);
                 break;
@@ -1618,6 +1670,7 @@ api.runtime.onConnect.addListener((port) => {
     }
 
     port.onDisconnect.addListener(() => {
+        disconnected = true;
         if (!session || session.closing || session.port !== port) return;
         session.port = null;
         // Give the bridge a moment to reconnect (navigation within bfcache, SW hiccup).
@@ -1865,9 +1918,9 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
         // destroys the page, which disconnects the player port and ends the session anyway.
         teardownTab(tabId, { keepPlayer: true });
     } else if (changeInfo.status === 'loading') {
-        // Same-URL reload: drop streams (they will be re-detected) and the cache.
-        const tab = tabs.get(tabId);
-        if (tab && !tab.playerSessionId) teardownTab(tabId);
+        // Same-URL reload: drop streams (they will be re-detected) and the cache. getTab also
+        // restores a tab the idle worker forgot, so a reload after a restart still resets it.
+        getTab(tabId, { create: false }).then(tab => { if (tab && !tab.playerSessionId) teardownTab(tabId); }).catch(() => { });
     }
 });
 

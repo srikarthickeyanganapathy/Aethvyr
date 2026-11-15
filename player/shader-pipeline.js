@@ -202,10 +202,24 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.fbo = null;
             this.destroyed = false;
             this.boundRender = (now, meta) => this.onFrame(now, meta);
-            this.onContextLost = (e) => { e.preventDefault(); this.fail('GPU context lost'); };
+            // preventDefault() asks the browser to restore the context (GPU reset, driver update,
+            // mobile tab backgrounded). Until then the plain <video> shows through; on restore every
+            // GL object is rebuilt. (Failing for good here, as before, left enhancement off for the
+            // rest of the session although the browser handed the context back moments later.)
+            this.lost = false;
+            this.resumeOnRestore = false;
+            this.onContextLost = (e) => {
+                e.preventDefault();
+                this.resumeOnRestore = this.running;
+                this.stop();
+                this.lost = true;
+                this.drawn = false;
+                this.canvas.hidden = true;
+            };
+            this.onContextRestored = () => this.restore();
         }
 
-        get active() { return this.preset !== 'off' && !this.failed && !!this.gl; }
+        get active() { return this.preset !== 'off' && !this.failed && !this.lost && !!this.gl; }
 
         init() {
             // After destroy() the canvas' context has been lost on purpose; getContext() would hand
@@ -220,6 +234,22 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             if (gl.isContextLost()) { this.fail('GPU context lost'); return false; }
             this.gl = gl;
             this.canvas.addEventListener('webglcontextlost', this.onContextLost);
+            this.canvas.addEventListener('webglcontextrestored', this.onContextRestored);
+            try {
+                this.setupGl();
+            } catch (err) {
+                this.fail(`Shader compile failed: ${err.message}`);
+                return false;
+            }
+            return true;
+        }
+
+        /** (Re)creates every GL object: on init and after a context restore (all objects died). */
+        setupGl() {
+            const gl = this.gl;
+            this.programs = {};
+            this.fbo = null;
+            this.pendingQuery = null;
             const buf = gl.createBuffer();
             this.vbo = buf;
             gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -230,14 +260,26 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
             this.videoTex = this.makeTexture();
             this.timerExt = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+            const src = { cas: FS_CAS, lanczos: FS_LANCZOS, rcas: FS_RCAS, a4k: FS_A4K, deband: FS_DEBAND, copy: FS_COPY };
+            for (const [k, fs] of Object.entries(src)) this.programs[k] = this.link(fs);
+        }
+
+        restore() {
+            if (this.destroyed || this.failed || !this.lost || !this.gl) return;
+            if (this.gl.isContextLost()) return;
+            this.lost = false;
             try {
-                const src = { cas: FS_CAS, lanczos: FS_LANCZOS, rcas: FS_RCAS, a4k: FS_A4K, deband: FS_DEBAND, copy: FS_COPY };
-                for (const [k, fs] of Object.entries(src)) this.programs[k] = this.link(fs);
+                this.setupGl();
             } catch (err) {
                 this.fail(`Shader compile failed: ${err.message}`);
-                return false;
+                return;
             }
-            return true;
+            this.resetGuard();
+            if (!this.active) return;
+            this.resize();
+            this.renderOnce();
+            if (this.resumeOnRestore && !this.video.paused) this.start();
+            this.resumeOnRestore = false;
         }
 
         makeTexture() {
@@ -310,7 +352,8 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             if (!this.active) { this.canvas.hidden = true; this.drawn = false; } else if (!wasActive) this.drawn = false;
             this.canvas.hidden = !this.active || !this.drawn;
             this.resetGuard();
-            if (this.active) { this.resize(); this.renderOnce(); } else this.stop();
+            // (While the context is lost nothing runs, and stop() would drop the resume intent.)
+            if (this.active) { this.resize(); this.renderOnce(); } else if (!this.lost) this.stop();
             return this.active;
         }
 
@@ -437,6 +480,9 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
         }
 
         start() {
+            // While the context is lost, remember the caller's intent (play / pause / audio-only
+            // toggles keep arriving) and honour it on restore.
+            if (this.lost) { this.resumeOnRestore = true; return; }
             if (this.running || !this.active) return;
             this.running = true;
             this.resetGuard();
@@ -444,6 +490,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
         }
 
         stop() {
+            if (this.lost) this.resumeOnRestore = false;
             this.running = false;
             if (this.handle) {
                 if (this.rvfc) { try { this.video.cancelVideoFrameCallback(this.handle); } catch (_) { /* ignore */ } } else cancelAnimationFrame(this.handle);
@@ -535,6 +582,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             if (this.destroyed) return;
             this.destroyed = true;
             this.canvas.removeEventListener('webglcontextlost', this.onContextLost);
+            this.canvas.removeEventListener('webglcontextrestored', this.onContextRestored);
             const gl = this.gl;
             if (gl) {
                 // On a lost context the objects are already gone and delete* calls are no-ops.

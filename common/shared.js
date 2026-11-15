@@ -48,6 +48,7 @@
         simpleMode: false,
         autoHideMs: 3000,            // 0 = never hide
         showStats: false,
+        ambientMode: false,          // soft colour glow from the video behind letterbox bars
         // Playback defaults
         defaultSpeed: 1,
         qualityCap: 0,               // max height, 0 = unlimited
@@ -361,9 +362,85 @@
         el.replaceWith(parseHTML(markup));
     }
 
+    // ---------------------------------------------------------------------
+    // Backup / restore (settings incl. site profiles, presets, keymap and auto sites; bookmarks;
+    // watch history) as one portable JSON document.
+    // ---------------------------------------------------------------------
+    const BACKUP_APP = 'velostream';
+    const BACKUP_VERSION = 2;
+    const BOOKMARK_KEY_RE = /^fs_bm_[\w-]{1,64}$/;
+
+    async function buildBackup(storageApi) {
+        const all = await storageApi.storage.local.get(null);
+        const bookmarks = {};
+        for (const [k, v] of Object.entries(all || {})) if (BOOKMARK_KEY_RE.test(k) && Array.isArray(v)) bookmarks[k] = v;
+        return {
+            app: BACKUP_APP,
+            version: BACKUP_VERSION,
+            exportedAt: new Date().toISOString(),
+            settings: mergeSettings(all && all.fs_settings),
+            bookmarks,
+            history: isPlainObject(all && all.fs_history) ? all.fs_history : {}
+        };
+    }
+
+    const httpUrl = (u) => typeof u === 'string' && u.length < 4096 && /^https?:\/\//i.test(u) ? u : '';
+    const finiteNum = (n) => (typeof n === 'number' && Number.isFinite(n) ? n : null);
+
+    /** Validate + clean a parsed backup. Throws with a readable message when it is not one. */
+    function sanitizeBackup(data) {
+        if (!isPlainObject(data) || data.app !== BACKUP_APP || !isPlainObject(data.settings)) {
+            throw new Error('This file is not a Velostream backup.');
+        }
+        if (!(data.version >= 1 && data.version <= BACKUP_VERSION)) throw new Error('This backup was made by a newer Velostream. Update the extension first.');
+        const bookmarks = {};
+        for (const [k, list] of Object.entries(isPlainObject(data.bookmarks) ? data.bookmarks : {})) {
+            if (!BOOKMARK_KEY_RE.test(k) || !Array.isArray(list)) continue;
+            const clean = list.filter(b => isPlainObject(b) && finiteNum(b.t) !== null && b.t >= 0)
+                .slice(0, 500).map(b => ({ t: b.t, label: String(b.label == null ? '' : b.label).slice(0, 120) }));
+            if (clean.length) bookmarks[k] = clean;
+        }
+        const history = {};
+        const entries = Object.entries(isPlainObject(data.history) ? data.history : {})
+            .filter(([k, e]) => typeof k === 'string' && k.length <= 512 && isPlainObject(e) && httpUrl(e.url))
+            .sort((a, b) => (finiteNum(b[1].updatedAt) || 0) - (finiteNum(a[1].updatedAt) || 0))
+            .slice(0, 200);
+        for (const [k, e] of entries) {
+            history[k] = {
+                url: httpUrl(e.url),
+                page: httpUrl(e.page),
+                title: String(e.title == null ? '' : e.title).slice(0, 200),
+                t: Math.max(0, finiteNum(e.t) || 0),
+                d: Math.max(0, finiteNum(e.d) || 0),
+                done: !!e.done,
+                subOffset: finiteNum(e.subOffset) || 0,
+                loopA: finiteNum(e.loopA),
+                loopB: finiteNum(e.loopB),
+                updatedAt: finiteNum(e.updatedAt) || Date.now()
+            };
+        }
+        return { settings: mergeSettings(data.settings), bookmarks, history };
+    }
+
+    /** Parse, validate and write a backup. Returns counts for the confirmation message. */
+    async function restoreBackup(storageApi, jsonText) {
+        let data;
+        try { data = JSON.parse(jsonText); } catch (_) { throw new Error('This file is not valid JSON.'); }
+        const clean = sanitizeBackup(data);
+        const write = { fs_settings: clean.settings, fs_history: clean.history, ...clean.bookmarks };
+        await storageApi.storage.local.set(write);
+        return { bookmarks: Object.keys(clean.bookmarks).length, history: Object.keys(clean.history).length, profiles: clean.settings.siteProfiles.length };
+    }
+
+    const backupFilename = () => `velostream-backup-${new Date().toISOString().slice(0, 10)}.json`;
+
     root.VelostreamShared = Object.freeze({
         setHTML,
         replaceWithHTML,
+        buildBackup,
+        restoreBackup,
+        sanitizeBackup,
+        backupFilename,
         api,
         IS_FIREFOX,
         DEFAULT_SETTINGS,

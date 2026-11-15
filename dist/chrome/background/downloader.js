@@ -25,6 +25,12 @@ const ACCEL_PARTS = 4;
 const ACCEL_STRIKES = 3;                     // consecutive transient accel failures before a host is downgraded
 const RANGE_REJECT_STATUS = new Set([400, 416, 501]); // the server refuses Range itself
 
+// Prefetch failure cooldown: a segment whose prefetch failed (404/403, retries exhausted) or that
+// could not be cached is not re-queued until its cooldown ends (exponential per key).
+const FAIL_COOLDOWN_MS = 2000;
+const FAIL_COOLDOWN_MAX_MS = 60000;
+const FAIL_TRACK_MAX = 512;
+
 // Playlist timeline -> player (presentation) timeline offset learning.
 const TELEMETRY_FRESH_MS = 2500;             // telemetry arrives ~1/s
 const TIMELINE_SAMPLES = 9;
@@ -239,6 +245,8 @@ export class SegmentDownloader {
         this.rangeStrikes = new Map();  // host -> consecutive transient accelerated failures
         this._abrMs = new WeakMap();    // response -> connection-time to report to ABR (accelerator)
         this.dvrKeys = new Set();       // live segments retained for rewind (protected from eviction)
+        this.failures = new Map();      // segmentKey -> {count, until}: failed prefetches cooling down
+        this._retryTimer = null;
 
         // Per media playlist: offset = player presentation time - playlist time (see _learnTimeline).
         this.timeline = new Map();      // playlistUrl -> {offset:number|null, samples:number[], learnedAt}
@@ -347,10 +355,13 @@ export class SegmentDownloader {
             lastUsed: prev ? prev.lastUsed : 0,
             retired: prev && prev.retired ? prev.retired : new Map() // seq -> key of slid-out segments
         };
-        // Live refresh: keep the cursor aligned by media sequence number.
+        // Live refresh: keep the cursor aligned by media sequence number. When the cursor's
+        // segment slid out of the window (paused, or watching DVR history that never moves the
+        // cursor) the playlist is still the one in use: clamp to the window start instead of -1,
+        // which would mark it inactive and stop look-ahead and DVR capture of new segments.
         if (prev && prev.parsed.mediaSequence !== parsed.mediaSequence && prev.cursor >= 0) {
             const seq = prev.parsed.mediaSequence + prev.cursor;
-            entry.cursor = Math.max(-1, seq - parsed.mediaSequence);
+            entry.cursor = Math.max(0, seq - parsed.mediaSequence);
         }
         // Live DVR: remember every segment we have seen (by media sequence) for N minutes so the
         // player can rewind past the origin's sliding window using the cached copies.
@@ -684,6 +695,7 @@ export class SegmentDownloader {
                     ? await this.buffer.storeSegment(key, norm.data, norm.mime).catch(() => false)
                     : false;
                 if (stored) {
+                    this.failures.delete(key);
                     // Already served to the player: eligible for early eviction.
                     this.buffer.markServed(key);
                     if (zeroCopy) return cachedReply();
@@ -797,6 +809,15 @@ export class SegmentDownloader {
         const tasks = [];
         const queued = new Set();
         const windowSec = this._prefetchWindow();
+        const now = Date.now();
+        let nextRetry = Infinity;
+        // Failed recently: skip (and wake up the pump when the first cooldown ends).
+        const coolingDown = (key) => {
+            const f = this.failures.get(key);
+            if (!f || now >= f.until) return false;
+            nextRetry = Math.min(nextRetry, f.until - now);
+            return true;
+        };
         for (const p of this.activePlaylists()) {
             const segs = p.parsed.segments;
             if (!segs.length) continue;
@@ -808,7 +829,7 @@ export class SegmentDownloader {
                 const seg = segs[i];
                 if (seg.start - startTime >= budget) break;
                 const key = segmentKey(seg.uri, seg.range);
-                if (this.buffer.has(key) || this.inflight.has(key) || queued.has(key)) continue;
+                if (this.buffer.has(key) || this.inflight.has(key) || queued.has(key) || coolingDown(key)) continue;
                 queued.add(key);
                 tasks.push({ key, url: seg.uri, range: seg.range, playlistUrl: p.url, index: i, order: seg.start - startTime });
             }
@@ -819,14 +840,34 @@ export class SegmentDownloader {
             if (!p.dvr) continue;
             for (const seg of p.parsed.segments) {
                 const key = segmentKey(seg.uri, seg.range);
-                if (this.buffer.has(key) || this.inflight.has(key) || queued.has(key)) continue;
+                if (this.buffer.has(key) || this.inflight.has(key) || queued.has(key) || coolingDown(key)) continue;
                 queued.add(key);
                 tasks.push({ key, url: seg.uri, range: seg.range, playlistUrl: p.url, index: seg.index, order: 1e6 + seg.index });
             }
         }
+        if (nextRetry !== Infinity && !this._retryTimer && !this.destroyed) {
+            this._retryTimer = setTimeout(() => {
+                this._retryTimer = null;
+                this.schedulePump();
+            }, nextRetry + 20);
+        }
         // Interleave roles by timeline position so audio and video stay balanced.
         tasks.sort((a, b) => a.order - b.order);
         return tasks;
+    }
+
+    /**
+     * A prefetch failed (or its bytes could not be cached): without a cooldown the next pump
+     * re-queues the same key at once - a 403/404 segment (expired token, missing file) or one
+     * the cache refuses (larger than half the cap) would be downloaded in a tight loop forever.
+     */
+    _noteFailure(key, hard = false) {
+        const prev = this.failures.get(key);
+        const count = hard ? Math.max(6, prev ? prev.count + 1 : 0) : (prev ? prev.count + 1 : 1);
+        const delay = Math.min(FAIL_COOLDOWN_MAX_MS, FAIL_COOLDOWN_MS * Math.pow(2, count - 1));
+        this.failures.delete(key); // refresh insertion order (oldest entries are dropped first)
+        this.failures.set(key, { count, until: Date.now() + delay });
+        while (this.failures.size > FAIL_TRACK_MAX) this.failures.delete(this.failures.keys().next().value);
     }
 
     _pump() {
@@ -848,15 +889,26 @@ export class SegmentDownloader {
         entry.promise = (async () => {
             try {
                 const headers = task.range ? { Range: task.range } : {};
-                const res = await this._fetchWithRetry(task.url, { method: 'GET', headers }, controller.signal, false, true);
+                let res;
+                try {
+                    res = await this._fetchWithRetry(task.url, { method: 'GET', headers }, controller.signal, false, true);
+                } catch (err) {
+                    // Recorded before `finally` re-pumps, or the pump would restart this key at once.
+                    if (err && err.name !== 'AbortError' && !controller.signal.aborted &&
+                        generation === this.generation) this._noteFailure(task.key);
+                    throw err;
+                }
                 // Purged (reset) while downloading: never re-insert into the cleared cache.
                 if (res.data && res.data.byteLength && res.status < 400 &&
                     generation === this.generation && !this.destroyed) {
                     // Encrypted segments are cached byte-exact (sniffing ciphertext corrupts it).
                     const norm = this._normalize(task.key, res.data, res.headers['content-type']);
-                    await this.buffer.storeSegment(task.key, norm.data, norm.mime).catch(err => {
+                    const stored = await this.buffer.storeSegment(task.key, norm.data, norm.mime).catch(err => {
                         console.warn('[Downloader] Cache store failed:', err && err.message);
+                        return false;
                     });
+                    if (stored) this.failures.delete(task.key);
+                    else if (generation === this.generation && !this.destroyed) this._noteFailure(task.key, true);
                 }
                 return res;
             } finally {
@@ -1105,10 +1157,13 @@ export class SegmentDownloader {
         this.generation++;
         this._abortWhere(() => true);
         this.queue = [];
+        this.failures.clear();
     }
 
     destroy() {
         this.destroyed = true;
+        clearTimeout(this._retryTimer);
+        this._retryTimer = null;
         this.reset();
         this.playlists.clear();
         this.segmentIndex.clear();

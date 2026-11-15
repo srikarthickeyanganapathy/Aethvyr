@@ -67,7 +67,8 @@ speed, subtitles, **Studio**, download and full screen.
 | **Lock** | Blocks touches (for pockets and kids). Tap the unlock pill to release. |
 | **Audio-only** | Drops to the lowest-bitrate stream and stops video rendering to save battery and data. |
 | **Sleep timer** | Stops after a time or at the end of the video, fading the volume out. |
-| **Skip intro** | A pill offers to skip 30/60/85/90 s near the start. *Smart skip* fast-forwards through black, silent stretches. |
+| **Skip intro / recap / credits** | When the stream has chapters, the pill reads **Skip Intro**, **Skip Recap**, **Skip Credits** or **Skip Preview** inside a chapter named like an opening (*Opening*, *Intro*, *OP*), recap, ending (*Ending*, *Credits*, *ED*) or preview that is 10 s – 4 min long, and jumps to that chapter's end. Otherwise it offers +30/60/85/90 s near the start. *Smart skip* fast-forwards through black, silent stretches. |
+| **Ambient glow** | Studio → Display (or the popup): a soft glow in the video's colours fills the letterbox bars. Updates about 4 times a second, only while playing. |
 | **Live streams** | A **Live** button jumps to the edge. The DVR keeps the last 30 minutes (configurable) so you can pause and rewind even when the site does not offer it. |
 
 ---
@@ -112,7 +113,7 @@ Keyboard**.
 | <kbd>←</kbd> / <kbd>J</kbd> | Back 10 s | <kbd>P</kbd> | Picture-in-Picture |
 | <kbd>→</kbd> / <kbd>L</kbd> | Forward 10 s | <kbd>C</kbd> | Subtitles on/off |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Volume ±5 % | <kbd>M</kbd> | Mute |
-| <kbd><</kbd> / <kbd>></kbd> | Slower / faster | <kbd>S</kbd> | Snapshot |
+| <kbd><</kbd> / <kbd>></kbd> | Slower / faster | <kbd>S</kbd> / <kbd>Shift</kbd>+<kbd>S</kbd> | Snapshot / with subtitles & effects |
 | <kbd>,</kbd> / <kbd>.</kbd> | Previous / next frame | <kbd>[</kbd> / <kbd>]</kbd> | Set loop A / B |
 | <kbd>?</kbd> | Shortcuts & gestures | <kbd>Esc</kbd> | Close menu, then the player |
 
@@ -147,6 +148,7 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 ### Display
 
 - **GPU enhancement**: preset, strength and maximum render resolution (see below).
+- **Ambient glow** behind the video.
 - Colour: brightness, contrast, saturation, hue, warmth and sharpness, with saveable presets.
 - **Aspect ratio**: fit, fill, cover, 16:9, 4:3 or 21:9. Zoom, **Rotate 90°**, **Mirror** and
   *Reset transform*.
@@ -154,21 +156,28 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 ### Tools
 
 - **A–B loop & bookmarks**.
-- **Capture**: PNG snapshot, or a burst of 6 frames as a contact sheet.
+- **Capture**: PNG snapshot, snapshot with subtitles & effects, or a burst of 6 frames as a
+  contact sheet.
 - **Download** (on-demand video) or **Record & DVR** (live), and the **Save format** (MP4 or
-  original).
+  original). With both loop points set on an HLS video, **Save A–B clip** saves just that range.
 - **Sleep timer** and **Skip** settings.
 - **Open in external player**, and copy commands.
 
 ### Prefs
 
-- **Modes**: simple mode, high contrast, reduced motion, stats for nerds.
+- **Modes**: simple mode, high contrast, reduced motion, stats for nerds (resolution, frame rate,
+  dropped frames, video and audio codec, whether decoding is smooth and hardware-backed, GPU
+  enhancement cost, active effects, network and buffer).
 - **Accent** colour and **Interface size** (85–150 %).
 - **Playback** defaults: speed, seek step, resume, auto full screen, controls auto-hide.
 - **Gestures**, **Mouse**, **Keyboard** (see above).
 - **Site profile**: remember speed, quality cap, GPU preset and strength, EQ preset and subtitle
   size for the current site only. While a profile is active, changing those settings affects only
   the current session; use *Update profile with current setup* to keep them for the site.
+- **Backup & restore**: export everything (settings, site profiles, colour presets, shortcuts,
+  auto-play sites, bookmarks and watch history) to one `.json` file, and import it on another
+  browser or device. Also in the popup under Settings; in the popup, Import opens in a tab
+  because a toolbar popup closes when a file picker opens.
 
 ---
 
@@ -231,6 +240,7 @@ Press the **download** button or *Studio → Tools*.
 | HLS on-demand (fMP4 segments) | One `.mp4` with init segments merged. |
 | Direct file | Saved as is. |
 | Live stream | **Record** from now until you stop, or **save the DVR buffer**. |
+| A–B clip (HLS on-demand) | Set loop points A and B (<kbd>[</kbd> / <kbd>]</kbd>), then *Tools → Save A–B clip*: an `.mp4` of just that range, starting at 0:00. Cuts land on segment boundaries (keyframes, no re-encoding), so the clip can start and end a few seconds outside A and B. |
 
 Choose **Save format → Original** to keep `.ts`/`.aac` files instead of MP4. If the first segment
 cannot be remuxed (an unusual codec), Velostream falls back to the original format automatically.
@@ -239,8 +249,10 @@ Files are saved through the browser's download manager, with a *Save as* dialog 
 asks for one. Encrypted HLS (AES-128) is decrypted while saving. **DRM-protected video cannot be
 saved.**
 
-**Snapshots** (<kbd>S</kbd>) save a PNG of the current frame at full resolution, including colour
-filters. **Burst** saves a 6-frame contact sheet.
+**Snapshots** (<kbd>S</kbd>) save a PNG of the current frame at full resolution.
+<kbd>Shift</kbd>+<kbd>S</kbd> (or *Tools → Snapshot with subtitles & effects*) saves the picture as
+you see it: GPU enhancement and colour filters applied, with the visible subtitle lines (main and
+top) drawn in your subtitle style. **Burst** saves a 6-frame contact sheet.
 
 ---
 

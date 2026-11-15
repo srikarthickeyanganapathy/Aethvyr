@@ -105,6 +105,40 @@
         if (len && +len > 2 * 1024 * 1024) return false;
         return SNIFF_TYPES.test(String(ct || '').split(';')[0].trim());
     }
+    // Reads only the first bytes of a CLONE of the response, then cancels the clone. Reading the
+    // whole clone (res.clone().text()) buffered the entire body a second time, and never finished
+    // for endless octet-stream bodies without Content-Length (live FLV/ts over fetch), so memory
+    // grew for the lifetime of the stream. Cancelling one tee branch never affects the page's.
+    const SNIFF_HEAD_BYTES = 1024;
+    function sniffHead(res, onText) {
+        let reader;
+        try {
+            const body = res.clone().body;
+            if (!body || typeof body.getReader !== 'function' || typeof TextDecoder !== 'function') return;
+            reader = body.getReader();
+        } catch (_) { return; }
+        const chunks = [];
+        let size = 0;
+        const finish = () => {
+            try { reader.cancel().catch(() => { }); } catch (_) { /* ignore */ }
+            try {
+                const buf = new Uint8Array(Math.min(size, SNIFF_HEAD_BYTES));
+                let off = 0;
+                for (const c of chunks) {
+                    const n = Math.min(c.byteLength, buf.length - off);
+                    buf.set(c.subarray(0, n), off);
+                    off += n;
+                    if (off >= buf.length) break;
+                }
+                onText(new TextDecoder().decode(buf));
+            } catch (_) { /* never break the page */ }
+        };
+        const pump = () => reader.read().then(r => {
+            if (r.value && r.value.byteLength) { chunks.push(r.value); size += r.value.byteLength; }
+            if (r.done || size >= SNIFF_HEAD_BYTES) finish(); else pump();
+        }, () => { });
+        pump();
+    }
 
     window.fetch = function (resource, init) {
         const url = urlOf(resource);
@@ -119,7 +153,7 @@
                     if (ct && SUB_MIME.test(ct)) { reportSubtitle(final, ct); return; }
                     if (res.ok && res.type !== 'opaque' && shouldSniff(final, ct, res.headers.get('content-length'))) {
                         sniffed.add(final);
-                        res.clone().text().then(t => { const k = sniffKind(t); if (k === 'text/vtt') reportSubtitle(final, k); else if (k) report(final, 'fetch', k); }, () => { });
+                        sniffHead(res, t => { const k = sniffKind(t); if (k === 'text/vtt') reportSubtitle(final, k); else if (k) report(final, 'fetch', k); });
                     }
                 } catch (_) { /* opaque */ }
             }, () => { });
@@ -163,11 +197,13 @@
     //     their base URL; webRequest catches their requests in the background instead.
     //     Relative URLs are resolved against the page's document URL (__BASE__): a blob:/data:
     //     URL cannot be a base, so resolving against the worker's own URL always threw.
-    //     The site's original script is loaded by the wrapper through a PRIVATE object URL of the
-    //     same Blob (tracked via createObjectURL), so a site that revokes its URL right after
-    //     `new Worker(url)` (a common inline-worker pattern) does not break the wrapped worker.
-    //     Our object URLs are revoked once the worker reports that the original script loaded
-    //     (or after a timeout if it never does).
+    //     The wrapper is one Blob made of [prelude, the site's own Blob (tracked via
+    //     createObjectURL) or decoded data: bytes, "loaded" ping], so a site that revokes its URL
+    //     right after `new Worker(url)` (a common inline-worker pattern) does not break it, and no
+    //     second script load (subject to the page's script-src) is needed. Our object URL is
+    //     revoked once the worker reports that the original script ran (or after a timeout).
+    //     Known trade-off: a classic worker whose source starts with a top-level "use strict"
+    //     directive runs sloppy, since the prelude now precedes it.
     // ------------------------------------------------------------------
     const OrigWorker = window.Worker;
     const OrigBlob = window.Blob;
@@ -178,7 +214,7 @@
     const rConstruct = Reflect.construct;
     const WORKER_PRELUDE = "(function(){try{\nvar B=__BASE__;var bc=new BroadcastChannel(__CH__);\nvar RE=/\\.(m3u8|mpd|vtt|srt)(\\?|#|&|\\/|$)|[?&](format|type)=(m3u8|mpd|hls|dash)\\b|mpegurl/i;\nvar MT=/mpegurl|dash\\+xml|text\\/vtt|x-subrip/i;\nvar post=function(u,ct){try{u=String(u&&u.url||u);if(RE.test(u)||(ct&&MT.test(ct)))bc.postMessage({url:new URL(u,B).href,ct:ct||''});}catch(_){}};\nif(self.fetch){var of=self.fetch;self.fetch=function(r){var u=r&&r.url||r;post(u);var p=of.apply(this,arguments);p.then(function(res){try{post(res.url||u,res.headers.get('content-type'));}catch(_){}},function(){});return p;};}\nif(self.XMLHttpRequest){var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){post(u);var x=this;x.addEventListener('load',function(){try{post(x.responseURL||u,x.getResponseHeader('content-type'));}catch(_){}});return xo.apply(this,arguments);};}\n}catch(_){}})();\n";
     // Tells the page the original script was loaded, so our object URLs can be revoked.
-    const WORKER_LOADED = "try{var c=new BroadcastChannel(__CH__);c.postMessage({loaded:__TOKEN__});c.close();}catch(_){}\n";
+    const WORKER_LOADED = "(function(){try{var c=new BroadcastChannel(__CH__);c.postMessage({loaded:__TOKEN__});c.close();}catch(_){}})();\n";
     const WORKER_URL_TTL_MS = 60000; // fallback revoke if the worker never reports in
 
     /** JSON string literal that is also a valid JS literal on every engine (U+2028/2029). */
@@ -244,32 +280,44 @@
                 reportSubtitle(d.url, d.ct || '');
             };
             trackObjectUrls();
-            const mkUrl = (code) => origCreateObjectURL.call(OrigURL, new OrigBlob([code], { type: 'text/javascript' }));
+            const mkUrl = (parts) => origCreateObjectURL.call(OrigURL, new OrigBlob(parts, { type: 'text/javascript' }));
+            // Bytes of a `data:[<mime>][;base64],<payload>` URL, or null when it is malformed.
+            const dataUrlBytes = (u) => {
+                try {
+                    const comma = u.indexOf(',');
+                    if (comma < 0) return null;
+                    const meta = u.slice(5, comma);
+                    const payload = u.slice(comma + 1);
+                    if (/;base64$/i.test(meta)) {
+                        const bin = atob(payload.replace(/\s+/g, ''));
+                        const out = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+                        return out;
+                    }
+                    return decodeURIComponent(payload);
+                } catch (_) { return null; }
+            };
             window.Worker = new Proxy(OrigWorker, {
                 construct(target, args, newTarget) {
                     const urls = [];
                     try {
                         const raw = args[0];
                         const src = raw instanceof OrigURL ? raw.href : String(raw);
-                        if (/^(blob|data):/i.test(src)) {
-                            const isModule = !!(args[1] && args[1].type === 'module');
+                        // The site's source as a Blob part: a tracked blob: URL, or a decoded data: URL.
+                        // Unknown blob: URLs (revoked, or a non-script MIME type) are left alone.
+                        const part = /^blob:/i.test(src) ? scriptBlobs.get(src) : (/^data:/i.test(src) ? dataUrlBytes(src) : null);
+                        if (part) {
                             const token = Math.random().toString(36).slice(2);
                             const vals = { CH: jsStr(channel), BASE: jsStr(location.href), TOKEN: jsStr(token) };
-                            // Private URL for the site's Blob (unknown blob -> the site's own URL).
-                            const blob = scriptBlobs.get(src);
-                            let inner = src;
-                            if (blob) { inner = origCreateObjectURL.call(OrigURL, blob); urls.push(inner); }
-                            let code;
-                            if (isModule) {
-                                // Static imports evaluate in order: prelude module first, then the
-                                // original (a hoisted `import` would otherwise run before the hooks).
-                                const preludeUrl = mkUrl(fill(WORKER_PRELUDE, vals));
-                                urls.push(preludeUrl);
-                                code = 'import ' + jsStr(preludeUrl) + ';\nimport ' + jsStr(inner) + ';\n' + fill(WORKER_LOADED, vals);
-                            } else {
-                                code = fill(WORKER_PRELUDE, vals) + 'try{importScripts(' + jsStr(inner) + ');}finally{' + fill(WORKER_LOADED, vals) + '}\n';
-                            }
-                            const wrappedUrl = mkUrl(code);
+                            // ONE self-contained script: prelude + the site's own bytes + "loaded" ping.
+                            // Loading the original through importScripts()/import of a second blob:
+                            // URL was checked against the page's script-src (blob workers inherit the
+                            // page CSP), so on pages with `worker-src blob:` but a script-src without
+                            // blob: the site's worker died while the unwrapped one ran fine. Blob
+                            // concatenation needs no read of the site's Blob and no extra load. Each
+                            // added piece is a self-contained `;(function(){..})()` so it cannot
+                            // collide with the site's top-level bindings or join its last statement.
+                            const wrappedUrl = mkUrl([fill(WORKER_PRELUDE, vals), part, '\n;' + fill(WORKER_LOADED, vals)]);
                             urls.push(wrappedUrl);
                             let worker = null;
                             try {

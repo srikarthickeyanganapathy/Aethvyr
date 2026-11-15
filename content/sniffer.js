@@ -432,7 +432,7 @@
     const mount = {
         frame: null, session: null, video: null, mode: null, prevMode: null,
         videoStyle: null, timer: null, ro: null, rect: null, dragStart: null, pageLock: null,
-        float: null, raf: 0, lostAt: 0, fix: { x: 0, y: 0 }, lastCss: ''
+        float: null, raf: 0, lostAt: 0, fix: { ax: 0, ay: 0, sx: 1, sy: 1 }, lastCss: ''
     };
     const FRAME_Z = '2147483647';
     const VIDEO_LOST_GRACE_MS = 1500; // a re-rendering site may swap its <video>: wait before going full page
@@ -467,23 +467,37 @@
     }
 
     /**
-     * position:fixed at viewport coordinates. A transform/filter on <html> would make it the
-     * containing block of fixed boxes: the real box is measured and the offset compensated.
+     * position:fixed at viewport coordinates. A transform/filter on <html> makes it the containing
+     * block of fixed boxes, and `zoom` / `transform: scale()` on <html> scales them, so the frame
+     * is modelled as rendered = a + s * css per axis: the real box is measured and both the offset
+     * (a) and the scale (s) are compensated. (Offset-only compensation, used before, put the frame
+     * at the wrong place AND size on a page with `html { zoom: 1.25 }`: the error is multiplicative.)
+     * `extra` may be a function of the current model (for lengths such as clip-path insets).
      */
     function placeFixed(x, y, w, h, extra) {
         const f = mount.frame;
         if (!f) return;
-        const css = (ox, oy) => `position: fixed; left: ${x + ox}px; top: ${y + oy}px; width: ${w}px; height: ${h}px; ${extra || ''}`;
-        mount.lastCss = css(mount.fix.x, mount.fix.y);
+        const css = (m) => `position: fixed; left: ${(x - m.ax) / m.sx}px; top: ${(y - m.ay) / m.sy}px; width: ${w / m.sx}px; height: ${h / m.sy}px; ${(typeof extra === 'function' ? extra(m) : extra) || ''}`;
+        const m = mount.fix;
+        mount.lastCss = css(m);
         setFrameStyle(mount.lastCss);
+        if (!f.isConnected) return;
         const fr = f.getBoundingClientRect();
-        const ex = x - fr.left;
-        const ey = y - fr.top;
-        if (f.isConnected && (Math.abs(ex) > 0.5 || Math.abs(ey) > 0.5) && Math.abs(mount.fix.x + ex) < 1e5 && Math.abs(mount.fix.y + ey) < 1e5) {
-            mount.fix = { x: mount.fix.x + ex, y: mount.fix.y + ey };
-            mount.lastCss = css(mount.fix.x, mount.fix.y);
+        const sx = w >= 2 && fr.width > 0 ? fr.width / (w / m.sx) : m.sx;
+        const sy = h >= 2 && fr.height > 0 ? fr.height / (h / m.sy) : m.sy;
+        const ax = fr.left - sx * ((x - m.ax) / m.sx);
+        const ay = fr.top - sy * ((y - m.ay) / m.sy);
+        const sane = sx > 0.05 && sx < 20 && sy > 0.05 && sy < 20 && Math.abs(ax) < 1e5 && Math.abs(ay) < 1e5;
+        if (sane && (Math.abs(ax - m.ax) > 0.5 || Math.abs(ay - m.ay) > 0.5 || Math.abs(sx - m.sx) > 0.002 || Math.abs(sy - m.sy) > 0.002)) {
+            mount.fix = { ax, ay, sx, sy };
+            mount.lastCss = css(mount.fix);
             setFrameStyle(mount.lastCss);
         }
+    }
+
+    /** page / fill: cover the viewport (measured like the other modes, see placeFixed). */
+    function placePage() {
+        placeFixed(0, 0, innerWidth, innerHeight);
     }
 
     /** Hide (not resize: the player keeps its layout) while the target video is unavailable. */
@@ -505,7 +519,8 @@
      * The visible part of the video inside its scrolling ancestors (an inner scroller would have
      * clipped the old in-flow iframe too). Only containers that actually overflow are used, and
      * the walk stops at a position:fixed ancestor, so a non-scrolling overflow:hidden wrapper never
-     * hides a visible video. Returns null when nothing is visible, else the clip-path CSS ('' = none).
+     * hides a visible video. Returns null when nothing is visible, '' when nothing is clipped, else the
+     * [top, right, bottom, left] insets in viewport px (see clipCss).
      */
     function inlineClip(v, vr) {
         let l = vr.left;
@@ -535,7 +550,13 @@
         const ib = vr.bottom - b;
         const il = l - vr.left;
         if (it < 0.5 && ir < 0.5 && ib < 0.5 && il < 0.5) return '';
-        return `clip-path: inset(${it}px ${ir}px ${ib}px ${il}px);`;
+        return [it, ir, ib, il];
+    }
+
+    /** clip-path for inlineClip()'s insets (viewport px) in the frame's own (possibly scaled) px. */
+    function clipCss(clip) {
+        if (!clip) return '';
+        return (m) => `clip-path: inset(${clip[0] / m.sy}px ${clip[1] / m.sx}px ${clip[2] / m.sy}px ${clip[3] / m.sx}px);`;
     }
 
     /** Keep the iframe exactly on top of the original video (viewport coordinates). */
@@ -561,7 +582,7 @@
         const key = `${vr.left}|${vr.top}|${vr.width}|${vr.height}|${clip}`;
         if (key === mount.rect) return;
         mount.rect = key;
-        placeFixed(vr.left, vr.top, vr.width, vr.height, clip);
+        placeFixed(vr.left, vr.top, vr.width, vr.height, clipCss(clip));
     }
 
     /** rAF-throttled re-layout for scroll / resize / ResizeObserver / transitions. */
@@ -570,20 +591,23 @@
         mount.raf = requestAnimationFrame(() => {
             mount.raf = 0;
             if (mount.mode === 'inline') syncInline();
+            // With a transformed <html> (containing block of fixed boxes) the frame scrolls with
+            // the document, so the floating / full-page frame must be re-measured too.
+            else if (mount.mode === 'mini' && mount.float && !mount.dragStart) applyFloating();
+            else if (mount.mode === 'page' || mount.mode === 'fill') placePage();
         });
     }
 
     function onMountScroll() {
-        if (mount.mode === 'inline') scheduleSync();
+        scheduleSync();
     }
 
     function onMountResize() {
-        if (mount.mode === 'inline') scheduleSync();
-        else if (mount.mode === 'mini' && mount.float && !mount.dragStart) {
+        if (mount.mode === 'mini' && mount.float && !mount.dragStart) {
             // Keep the floating window on screen when the viewport shrinks.
             mount.float = clampRect(mount.float);
-            applyFloating();
         }
+        scheduleSync();
     }
 
     function onMountLayoutEvent(e) {
@@ -672,8 +696,8 @@
             return;
         }
         if (mode === 'page' || mode === 'fill') {
-            setFrameStyle('position: fixed; inset: 0; width: 100vw; height: 100vh;');
             lockPage(true);
+            placePage();
         } else if (mode === 'mini') {
             lockPage(false);
             mount.float = clampRect(mount.float || miniRect(opts.ratio));
@@ -681,11 +705,34 @@
         }
     }
 
+    /**
+     * The frame lives on <html>: while a SITE element is fullscreen (its own player container,
+     * e.g. entered on rotation on mobile, or already fullscreen at mount) the top layer covers
+     * the frame, and the user sees the paused, hidden original video: black. Leave that
+     * fullscreen. The player's own fullscreen (fullscreenElement === the frame) and a fullscreen
+     * <html> (which contains the frame) are left alone.
+     */
+    function onMountFullscreen() {
+        if (!mount.frame) return;
+        const fs = document.fullscreenElement || document.webkitFullscreenElement || null;
+        if (fs && fs !== mount.frame && !fs.contains(mount.frame)) {
+            try {
+                const exit = document.exitFullscreen || document.webkitExitFullscreen;
+                const p = exit && exit.call(document);
+                if (p && p.catch) p.catch(() => { });
+            } catch (_) { /* ignore */ }
+        }
+        mount.rect = null;
+        scheduleSync();
+    }
+
     function unmountPlayer() {
         if (!mount.frame) return;
         if (mount.ro) mount.ro.disconnect();
         clearInterval(mount.timer);
         if (mount.raf) cancelAnimationFrame(mount.raf);
+        document.removeEventListener('fullscreenchange', onMountFullscreen);
+        document.removeEventListener('webkitfullscreenchange', onMountFullscreen);
         window.removeEventListener('resize', onMountResize);
         window.removeEventListener('scroll', onMountScroll, true);
         document.removeEventListener('transitionend', onMountLayoutEvent, true);
@@ -696,7 +743,7 @@
         restoreMedia();
         Object.assign(mount, {
             frame: null, session: null, video: null, mode: null, prevMode: null, ro: null, rect: null, timer: null,
-            float: null, raf: 0, lostAt: 0, fix: { x: 0, y: 0 }, lastCss: '', dragStart: null
+            float: null, raf: 0, lostAt: 0, fix: { ax: 0, ay: 0, sx: 1, sy: 1 }, lastCss: '', dragStart: null
         });
     }
 
@@ -731,8 +778,11 @@
                 if (mount.mode === 'mini' && mount.dragStart) {
                     // Handle sits in the top-left corner: keep the bottom-right corner anchored.
                     const s = mount.dragStart;
-                    const w = Math.min(Math.max(s.w - (+d.dx || 0), 200), innerWidth - 16);
-                    const h = Math.round(w * (s.h / s.w));
+                    const ratio = s.h / s.w;
+                    // Cap by height too: clampRect() would otherwise cut h alone (short landscape
+                    // viewport), breaking the aspect ratio and the bottom-right anchor.
+                    const w = Math.min(Math.max(s.w - (+d.dx || 0), 200), innerWidth - 16, (innerHeight - 16) / ratio);
+                    const h = Math.round(w * ratio);
                     mount.float = clampRect({ x: s.x + s.w - w, y: s.y + s.h - h, w, h });
                     applyFloating();
                 }
@@ -786,6 +836,9 @@
         window.addEventListener('scroll', onMountScroll, { passive: true, capture: true });
         document.addEventListener('transitionend', onMountLayoutEvent, true);
         document.addEventListener('animationend', onMountLayoutEvent, true);
+        document.addEventListener('fullscreenchange', onMountFullscreen);
+        document.addEventListener('webkitfullscreenchange', onMountFullscreen);
+        onMountFullscreen();
         mount.timer = setInterval(() => {
             if (!mount.frame) return;
             if (!mount.frame.isConnected && document.documentElement) {
@@ -894,6 +947,9 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
             positionBadge();
         });
         play.addEventListener('pointerup', () => { if (drag) setTimeout(() => { drag = null; }, 0); });
+        // No pointerup follows a cancelled pointer (touch turned into a gesture, capture
+        // stolen): without this, `drag` stayed set and later hover moves dragged the pill.
+        play.addEventListener('pointercancel', () => { drag = null; });
         play.addEventListener('click', (e) => {
             if (drag && drag.moved) { e.preventDefault(); return; }
             launchFromBadge();
@@ -910,8 +966,21 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         if (!badge.shadow) return;
         const pill = badge.shadow.querySelector('.pill');
         if (pill.hidden) return;
-        const w = pill.offsetWidth || 220;
-        const h = pill.offsetHeight || 44;
+        // `zoom` / transform on <html> scales and offsets fixed boxes (the host lives on <html>):
+        // measure rendered = a + s * css, then compute in viewport px and convert back. Without
+        // this, `html { zoom: 1.25 }` put the clamped pill entirely off-screen on the right.
+        if (!pill.style.left) { pill.style.left = '0px'; pill.style.top = '0px'; }
+        const pr = pill.getBoundingClientRect();
+        const lw = pill.offsetWidth;
+        const lh = pill.offsetHeight;
+        let sx = lw && pr.width ? pr.width / lw : 1;
+        let sy = lh && pr.height ? pr.height / lh : 1;
+        if (!(sx > 0.05 && sx < 20)) sx = 1;
+        if (!(sy > 0.05 && sy < 20)) sy = 1;
+        const ax = pr.left - sx * (parseFloat(pill.style.left) || 0);
+        const ay = pr.top - sy * (parseFloat(pill.style.top) || 0);
+        const w = (lw || 220) * sx;
+        const h = (lh || 44) * sy;
         let x;
         let y;
         if (badge.target && badge.target.isConnected) {
@@ -924,8 +993,8 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         }
         x = Math.min(Math.max(8, x + badge.offset.x), innerWidth - w - 8);
         y = Math.min(Math.max(8, y + badge.offset.y), innerHeight - h - 8);
-        pill.style.left = `${Math.round(x)}px`;
-        pill.style.top = `${Math.round(y)}px`;
+        pill.style.left = `${Math.round((x - ax) / sx)}px`;
+        pill.style.top = `${Math.round((y - ay) / sy)}px`;
     }
 
     let rafPending = false;
@@ -948,6 +1017,8 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         }
         ensureBadge();
         if (!badge.shadow) return;
+        // The page wiped <html>'s children (document.open, root swap): put the host back.
+        if (!badge.host.isConnected && document.documentElement) document.documentElement.appendChild(badge.host);
         const pill = badge.shadow.querySelector('.pill');
         badge.shadow.querySelector('.meta').textContent = s.label ? `• ${s.label}` : '';
         badge.shadow.querySelector('.play').setAttribute('aria-label', `Play this video in Velostream${s.label ? `, ${s.label}` : ''}`);

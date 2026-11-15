@@ -123,6 +123,35 @@
     // Helpers
     // =====================================================================
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    /** RFC 6381 codec string -> readable name for the stats panel. */
+    const codecName = (c) => {
+        const s = String(c || '').toLowerCase();
+        if (/^avc[13]/.test(s)) return 'H.264';
+        if (/^(hvc1|hev1)/.test(s)) return 'HEVC';
+        if (/^(dvh1|dvhe)/.test(s)) return 'Dolby Vision';
+        if (/^av01/.test(s)) return 'AV1';
+        if (/^vp0?9/.test(s)) return 'VP9';
+        if (/^vp0?8/.test(s)) return 'VP8';
+        if (/^mp4a\.40\.(5|29)/.test(s)) return 'HE-AAC';
+        if (/^mp4a\.6b|^mp3/.test(s)) return 'MP3';
+        if (/^mp4a/.test(s)) return 'AAC';
+        if (/^ac-?3/.test(s)) return 'Dolby Digital';
+        if (/^ec-?3/.test(s)) return 'Dolby Digital Plus';
+        return s.toUpperCase();
+    };
+    /**
+     * Chapter title -> skip label. "OP"/"ED" only count as a whole title (optionally numbered) or
+     * as an upper-case word, so names like "Ed's story" or "Operation" are not matched.
+     */
+    const skipKind = (title) => {
+        const s = String(title || '').trim();
+        if (!s) return null;
+        if (/\b(intro|opening|theme\s*song)\b/i.test(s) || /^op\s*\d*$/i.test(s) || /\bOP\d*\b/.test(s)) return 'Intro';
+        if (/\b(recap|previously)\b/i.test(s)) return 'Recap';
+        if (/\b(ending|outro|credits)\b/i.test(s) || /^ed\s*\d*$/i.test(s) || /\bED\d*\b/.test(s)) return 'Credits';
+        if (/\b(preview|next\s+episode)\b/i.test(s)) return 'Preview';
+        return null;
+    };
     /** True while a user gesture allows fullscreen/popup APIs (unknown -> assume yes). */
     const hasActivation = () => !navigator.userActivation || navigator.userActivation.isActive;
 
@@ -808,6 +837,10 @@ button:disabled { opacity: 0.4; cursor: default; }
 
 /* ---------- stage ---------- */
 .stage { position: absolute; inset: 0; overflow: hidden; background: #000; }
+.ambient-canvas { position: absolute; left: -10%; top: -10%; width: 120%; height: 120%; filter: blur(48px) saturate(180%) brightness(0.65); opacity: 0; pointer-events: none; transition: opacity 600ms var(--fs-spring); }
+.root.ambient .ambient-canvas { opacity: 1; }
+.root.ambient .vbox video { background: transparent; }
+.root.audio-only .ambient-canvas { display: none; }
 .vbox { position: absolute; transform-origin: 50% 50%; will-change: transform; overflow: hidden; }
 .vbox video { width: 100%; height: 100%; display: block; background: #000; object-fit: contain; }
 .root.audio-only .vbox video { visibility: hidden; }
@@ -1239,6 +1272,40 @@ input[type="text"] { width: 100%; min-width: 0; }
             overlaySettings(out, this.sessionOverrides, this.profileValues);
             this.settings = out;
             return out;
+        }
+
+        async exportBackup() {
+            const S = window.VelostreamShared;
+            if (!extApi || !S || !S.buildBackup) { this.announce('Backup is not available here', 'warn'); return; }
+            try {
+                this.flushSettings(); // unsent edits first, so the file has them
+                const data = await S.buildBackup(extApi);
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                downloadBlob(this.shadow, blob, S.backupFilename(), true);
+                this.announce('Settings backup saved', 'download');
+            } catch (e) {
+                this.announce(`Backup failed: ${(e && e.message) || e}`, 'warn');
+            }
+        }
+
+        async importBackup(file) {
+            const S = window.VelostreamShared;
+            if (!extApi || !S || !S.restoreBackup) { this.announce('Restore is not available here', 'warn'); return; }
+            if (file.size > 5 * 1024 * 1024) { this.announce('That file is too large to be a Velostream backup', 'warn'); return; }
+            try {
+                // Drop unsent edits: the backup replaces the settings they were made against.
+                clearTimeout(this.saveTimer);
+                this.saveTimer = null;
+                this.pendingPatch = null;
+                const res = await S.restoreBackup(extApi, await file.text());
+                // storage.onChanged brings SETTINGS_CHANGED; bookmarks of this video reload here.
+                await this.loadBookmarks();
+                this.renderMarks();
+                this.announce(`Settings & profiles restored · ${res.profiles} profiles, ${res.bookmarks} bookmarked videos`, 'check');
+                this.refreshPopover();
+            } catch (e) {
+                this.announce(`Import failed: ${(e && e.message) || e}`, 'warn');
+            }
         }
 
         saveSiteProfile() {
@@ -1697,6 +1764,7 @@ input[type="text"] { width: 100%; min-width: 0; }
 </svg>
 <div class="root" role="dialog" aria-modal="true" aria-label="Velostream player" tabindex="-1" data-rm="system">
   <div class="stage">
+    <canvas class="ambient-canvas" width="32" height="18" aria-hidden="true"></canvas>
     <div class="vbox"><video playsinline webkit-playsinline preload="auto" aria-label="Video"></video><canvas class="gl-canvas" hidden aria-hidden="true"></canvas></div>
     <div class="audio-poster" aria-hidden="true">${icon('headphones', 64)}<span>Audio-only mode</span></div>
     <div class="subs" aria-hidden="true"></div>
@@ -1848,9 +1916,13 @@ input[type="text"] { width: 100%; min-width: 0; }
             setHTML(this.$('.btn-fwd'), skipIcon(1, s.seekStep));
             this.$('.btn-back').setAttribute('aria-label', `Seek back ${s.seekStep} seconds`);
             this.$('.btn-fwd').setAttribute('aria-label', `Seek forward ${s.seekStep} seconds`);
+            this.root.classList.toggle('ambient', !!s.ambientMode);
+            if (s.ambientMode) this.later(0, () => this.updateAmbient(true));
             const skip = this.$('.skip-intro');
-            skip.querySelector('span').textContent = `+${s.skipSeconds}s`;
-            skip.setAttribute('aria-label', `Skip intro, forward ${s.skipSeconds} seconds`);
+            if (!skip.dataset.mode) { // a chapter skip ("Skip intro") owns the label while shown
+                skip.querySelector('span').textContent = `+${s.skipSeconds}s`;
+                skip.setAttribute('aria-label', `Skip intro, forward ${s.skipSeconds} seconds`);
+            }
             this.applySubtitleStyle();
             if (this.audio.active) this.audio.apply(s.audio);
             if (s.autoHideMs === 0) this.showControls(true);
@@ -1980,6 +2052,14 @@ input[type="text"] { width: 100%; min-width: 0; }
             on('.btn-cc', 'click', (e) => this.togglePopover('captions', e.currentTarget));
             on('.btn-studio', 'click', (e) => this.togglePopover('studio', e.currentTarget));
             on('.skip-intro', 'click', () => {
+                const target = this.smartSkip;
+                if (target && this.smartSkipChapter(this.video.currentTime)) {
+                    this.seekTo(target.end + 0.05, false);
+                    this.island('skip', `Skipped ${target.kind.toLowerCase()}`);
+                    this.announceOnly(`Skipped ${target.kind.toLowerCase()}`);
+                    this.updateSkipIntro();
+                    return;
+                }
                 const s = this.settings.skipSeconds;
                 this.seekBy(s, false);
                 this.island('skip', `Skipped +${s}s`);
@@ -2031,7 +2111,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             });
             media('durationchange', () => this.renderMarks());
             media('resize', () => { this.layoutVideo(); this.updateQualityBadge(); });
-            media('seeked', () => { this.subs.render(v.currentTime); if (this.gpu) this.gpu.renderOnce(); });
+            media('seeked', () => { this.subs.render(v.currentTime); if (this.gpu) this.gpu.renderOnce(); this.updateAmbient(true); });
             media('loadeddata', () => { if (this.gpu) this.gpu.renderOnce(); });
             this.listen(document, 'visibilitychange', () => { if (!document.hidden && this.gpu && this.gpu.active && !v.paused && !this.audioOnly) this.gpu.start(); });
             media('enterpictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'true'));
@@ -2904,7 +2984,9 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.video.style.objectFit = fit;
             const { zoom, panX, panY, rotate, flip } = this.xf;
             vb.style.transform = `translate(${panX}px, ${panY}px) rotate(${rotate}deg) scale(${zoom * (flip ? -1 : 1)}, ${zoom})`;
-            if (this.gpu && this.gpu.active) this.gpu.layout(bw, bh, fit);
+            // Always keep the canvas rect current (also while the GL context is lost, so a restore
+            // renders in the right place); layout() only renders when the pipeline is active.
+            if (this.gpu) this.gpu.layout(bw, bh, fit);
         }
 
         setZoom(z, announce) {
@@ -3282,22 +3364,91 @@ input[type="text"] { width: 100%; min-width: 0; }
         // -----------------------------------------------------------------
         // Screenshot, burst, export, recording
         // -----------------------------------------------------------------
-        screenshot() {
+        /**
+         * PNG of the current frame at the video's resolution. With `withSubs` the picture is the one
+         * on screen - GPU enhancement output and colour filters included - with the visible primary
+         * and secondary subtitle lines drawn in the user's subtitle style.
+         */
+        screenshot(withSubs = false) {
             const v = this.video;
             if (!v.videoWidth) { this.announce('No video frame yet', 'warn'); return; }
             const c = document.createElement('canvas');
             c.width = v.videoWidth;
             c.height = v.videoHeight;
             try {
-                c.getContext('2d').drawImage(v, 0, 0);
+                const ctx = c.getContext('2d');
+                if (withSubs) {
+                    const gpuOn = !!(this.gpu && this.gpu.active && this.glCanvas && !this.glCanvas.hidden);
+                    // CSS filters (minus the SVG sharpen, which canvas cannot resolve in a shadow root).
+                    const css = ((gpuOn ? this.glCanvas.style.filter : v.style.filter) || '').replace(/url\([^)]*\)/g, '').trim();
+                    if (css) ctx.filter = css;
+                    if (gpuOn) {
+                        // The WebGL canvas does not preserve its buffer: draw a fresh frame and copy it
+                        // in the same task.
+                        this.gpu.draw();
+                        ctx.drawImage(this.glCanvas, 0, 0, c.width, c.height);
+                    } else {
+                        ctx.drawImage(v, 0, 0);
+                    }
+                    ctx.filter = 'none';
+                    this.drawSubtitlesOnto(ctx, c.width, c.height);
+                } else {
+                    ctx.drawImage(v, 0, 0);
+                }
+                ctx.getImageData(0, 0, 1, 1); // throws now (not inside toBlob) on a tainted canvas
                 c.toBlob(blob => {
                     if (!blob) { this.announce('Screenshot failed', 'warn'); return; }
-                    downloadBlob(this.shadow, blob, `velostream-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`, false);
-                    this.announce('Screenshot saved', 'camera');
+                    downloadBlob(this.shadow, blob, `velostream-${fmtTime(v.currentTime).replace(/:/g, '-')}${withSubs ? '-subs' : ''}.png`, false);
+                    this.announce(withSubs ? 'Screenshot with subtitles saved' : 'Screenshot saved', 'camera');
                 }, 'image/png');
             } catch (e) {
                 this.announce('Screenshot blocked: cross-origin video without CORS', 'warn');
             }
+        }
+
+        /** Burn the currently visible subtitle lines into a W×H frame, scaled from the on-screen size. */
+        drawSubtitlesOnto(ctx, W, H) {
+            const t = this.subs.cueTime(this.video.currentTime);
+            const primary = this.subs.source !== 'off' ? SubtitleEngine.activeAt(this.subs.activeCues(), t) : [];
+            const top = this.subs.secondaryCues ? SubtitleEngine.activeAt(this.subs.secondaryCues, t) : [];
+            if (!primary.length && !top.length) return;
+            const st = this.settings.subtitles;
+            // On-screen line height relative to the displayed video height, mapped onto the frame.
+            const shown = this.gpu && this.gpu.contentRect && this.gpu.contentRect.h ? this.gpu.contentRect.h : this.vbox.clientHeight || H;
+            const layerPx = parseFloat(getComputedStyle(this.$('.subs')).fontSize) || 18;
+            const scale = H / Math.max(1, shown);
+            const fontPx = Math.max(12, Math.round(layerPx * (clamp(st.size, 50, 300) / 100) * 1.45 * scale));
+            ctx.font = `600 ${fontPx}px ${(FONTS[st.font] || FONTS.system).css}`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            const lineH = Math.round(fontPx * 1.3);
+            const padX = Math.round(fontPx * 0.35);
+            const drawBlock = (texts, yOf) => {
+                const lines = texts.join('\n').split('\n').map(l => l.trim()).filter(Boolean);
+                lines.forEach((line, i) => {
+                    const y = yOf(i, lines.length);
+                    const w = ctx.measureText(line).width;
+                    const alpha = clamp(st.bgOpacity, 0, 100) / 100;
+                    if (alpha > 0) {
+                        ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+                        ctx.fillRect(Math.round(W / 2 - w / 2 - padX), Math.round(y - lineH / 2), Math.round(w + padX * 2), lineH);
+                    }
+                    if (st.edge === 'outline') {
+                        ctx.lineJoin = 'round';
+                        ctx.lineWidth = Math.max(2, fontPx / 10);
+                        ctx.strokeStyle = '#000';
+                        ctx.strokeText(line, W / 2, y);
+                    }
+                    ctx.save();
+                    if (st.edge === 'shadow') { ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = fontPx / 4; ctx.shadowOffsetY = fontPx / 12; }
+                    ctx.fillStyle = st.color || '#fff';
+                    ctx.fillText(line, W / 2, y);
+                    ctx.restore();
+                });
+            };
+            const bottomGap = H * clamp(st.position, 0, 80) / 100;
+            if (primary.length) drawBlock(primary, (i, n) => H - bottomGap - (n - i - 0.5) * lineH - lineH * 0.2);
+            if (top.length) drawBlock(top, (i) => Math.max(H * 0.09, lineH) + (i + 0.5) * lineH);
         }
 
         /** Snapshot burst: 6 consecutive moments composed into one contact-sheet PNG. */
@@ -3406,12 +3557,26 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.refreshPopover();
         }
 
-        async startExport() {
+        /** A–B loop range as a clip (player time), or null when it can't be saved as one. */
+        clipRange() {
+            const { a, b } = this.loop;
+            if (a == null || b == null || b - a < 0.5 || this.isLive() || !this.stream || this.stream.type !== 'hls') return null;
+            return { start: a, end: b };
+        }
+
+        /** @param {{clip?: {start:number,end:number}}} [opts] save only the A–B range (HLS). */
+        async startExport(opts = {}) {
             if (this.pickingSink || (this.exportState && this.exportState.running)) return;
             if (this.stream.type === 'dash') { this.announce('DASH export is not supported', 'warn'); return; }
+            const clip = opts.clip || null;
             const hls = this.stream.type === 'hls';
             const toMp4 = hls && (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
-            const title = safeFilename(this.$('.title').textContent || 'video').replace(/\.(m3u8|mpd|mp4|ts)$/i, '');
+            let title = safeFilename(this.$('.title').textContent || 'video').replace(/\.(m3u8|mpd|mp4|ts)$/i, '');
+            if (clip) {
+                const r0 = this.seekRange().start;
+                const stamp = t => fmtTime(t - r0).replace(/:/g, '-');
+                title = `${title}-clip-${stamp(clip.start)}-${stamp(clip.end)}`;
+            }
             const st = { running: true, files: {}, status: 'Starting…', pct: 0, toMp4, sink: null, muxer: null, chain: Promise.resolve() };
             this.exportState = st;
             // Ask for the destination while the click's user activation is still valid.
@@ -3427,8 +3592,8 @@ input[type="text"] { width: 100%; min-width: 0; }
                 if (!st.sink) { this.exportState = null; this.announce('Download cancelled', 'download'); this.refreshPopover(); return; }
                 st.outName = st.sink.filename;
             }
-            this.port.send({ type: 'EXPORT_START' });
-            this.announce(this.isLive() ? 'Saving live DVR buffer' : 'Download started', 'download');
+            this.port.send(clip ? { type: 'EXPORT_START', clip } : { type: 'EXPORT_START' });
+            this.announce(clip ? `Saving A–B clip (${fmtTime(clip.end - clip.start)})` : this.isLive() ? 'Saving live DVR buffer' : 'Download started', 'download');
             this.updateDownloadButton();
             this.refreshPopover();
         }
@@ -3586,8 +3751,28 @@ input[type="text"] { width: 100%; min-width: 0; }
             }
             this.subs.render(v.currentTime);
             if (!this.dragging) this.renderTimeline();
+            this.updateAmbient(false);
             this.tickCount = (this.tickCount || 0) + 1;
             if (this.tickCount % 2 === 0 && this.settings) this.checkSmartSkip();
+        }
+
+        /**
+         * Ambient glow: sample the frame into a 32×18 canvas that sits behind the video, blurred and
+         * scaled up by CSS. Runs at the 4 Hz tick, only while playing and visible (force: one frame
+         * after a seek, pause or setting change). Drawing a cross-origin frame only taints this
+         * canvas, which is fine: it is displayed, never read.
+         */
+        updateAmbient(force) {
+            if (!this.settings || !this.settings.ambientMode || this.audioOnly || document.hidden) return;
+            const v = this.video;
+            if (!force && v.paused) return;
+            if (v.readyState < 2 || !v.videoWidth) return;
+            const c = this.ambientCanvas || (this.ambientCanvas = this.$('.ambient-canvas'));
+            if (!c) return;
+            try {
+                const ctx = this.ambientCtx || (this.ambientCtx = c.getContext('2d', { alpha: false }));
+                ctx.drawImage(v, 0, 0, c.width, c.height);
+            } catch (_) { /* frame not ready */ }
         }
 
         onSecond() {
@@ -3601,11 +3786,50 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (live !== this.wasLive) { this.wasLive = live; this.updateDownloadButton(); }
         }
 
+        /**
+         * Chapter-aware skip: inside a chapter titled like an opening, recap, ending or preview
+         * (10 s – 4 min long) the pill offers to jump to that chapter's end. Otherwise the plain
+         * "+N s" skip is offered in the opening stretch of longer on-demand videos.
+         */
         updateSkipIntro() {
             const v = this.video;
             const d = Number.isFinite(v.duration) ? v.duration : 0;
-            // Offer "skip intro" in the opening stretch of longer on-demand videos.
-            this.$('.skip-intro').hidden = !(!this.isLive() && d > 300 && v.currentTime < Math.min(900, d * 0.25));
+            const pill = this.$('.skip-intro');
+            const target = this.smartSkipChapter(v.currentTime);
+            this.smartSkip = target;
+            if (target) {
+                const text = `Skip ${target.kind}`;
+                if (pill.dataset.mode !== text) {
+                    pill.dataset.mode = text;
+                    pill.querySelector('span').textContent = text;
+                    pill.setAttribute('aria-label', `${text}, jump to ${fmtSpoken(target.end - this.seekRange().start)}`);
+                }
+                pill.hidden = false;
+                return;
+            }
+            if (pill.dataset.mode) {
+                delete pill.dataset.mode;
+                const s = this.settings.skipSeconds;
+                pill.querySelector('span').textContent = `+${s}s`;
+                pill.setAttribute('aria-label', `Skip intro, forward ${s} seconds`);
+            }
+            pill.hidden = !(!this.isLive() && d > 300 && v.currentTime < Math.min(900, d * 0.25));
+        }
+
+        /** {kind, end} when t is inside a skippable chapter, else null. */
+        smartSkipChapter(t) {
+            const list = this.chapters;
+            if (!list || !list.length || this.isLive()) return null;
+            const c = this.chapterAt(t);
+            if (!c) return null;
+            const kind = skipKind(c.title);
+            if (!kind) return null;
+            const i = list.indexOf(c);
+            const next = list[i + 1];
+            const end = next ? next.start : this.seekRange().end;
+            const len = end - c.start;
+            if (!(len >= 10 && len <= 240) || end - t < 2) return null;
+            return { kind, end };
         }
 
         sendTelemetry(withVariants) {
@@ -3796,6 +4020,22 @@ input[type="text"] { width: 100%; min-width: 0; }
             }
         }
 
+        /** Ask the browser once per codec/size whether decoding is smooth and hardware-backed. */
+        probeDecoder(codec, w, h, bitrate, fps) {
+            if (!codec || !w || !navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return;
+            const key = `${codec}|${w}x${h}`;
+            if (this.decoderKey === key) return;
+            this.decoderKey = key;
+            this.decoderInfo = 'Checking…';
+            navigator.mediaCapabilities.decodingInfo({
+                type: 'media-source',
+                video: { contentType: `video/mp4; codecs="${codec}"`, width: w, height: h, bitrate: Math.max(1, Math.round(bitrate || 1e6)), framerate: Math.max(1, Math.round(fps || 30)) }
+            }).then(r => {
+                if (this.decoderKey !== key) return;
+                this.decoderInfo = !r.supported ? 'Not supported' : `${r.smooth ? 'Smooth' : 'May stutter'} · ${r.powerEfficient ? 'hardware (power efficient)' : 'software'}`;
+            }, () => { if (this.decoderKey === key) this.decoderInfo = 'Unknown'; });
+        }
+
         renderStats() {
             if (!this.settings || !this.settings.showStats) return;
             const v = this.video;
@@ -3814,12 +4054,41 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (this.player) {
                 try { const st = this.player.getStats(); codecs = st.currentCodecs || ''; streamBw = st.streamBandwidth; } catch (_) { /* ignore */ }
             }
+            const total = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality().totalVideoFrames : 0;
+            const parts = String(codecs).split(',').map(x => x.trim()).filter(Boolean);
+            const vCodec = parts.find(c => /^(avc|hvc|hev|av01|vp0?[89]|dvh)/i.test(c)) || '';
+            const aCodec = parts.find(c => /^(mp4a|opus|ac-?3|ec-?3|flac|vorbis|mp3)/i.test(c)) || '';
+            this.probeDecoder(vCodec, v.videoWidth, v.videoHeight, streamBw, fps);
+            const gpu = this.gpu && this.gpu.active ? this.gpu : null;
+            let gpuText = 'Off';
+            if (gpu) {
+                const g = gpu.guard || {};
+                const ms = g.gpuN ? g.gpu / g.gpuN : (g.frames ? g.cpu / g.frames : 0);
+                const preset = (GPU_PRESETS.find(p => p[0] === this.effectiveShader().preset) || ['', 'On'])[1];
+                gpuText = `${preset} · ${this.glCanvas.width}×${this.glCanvas.height}${ms ? ` · ${ms.toFixed(1)} ms/frame` : ''}`;
+            } else if (this.gpuBlocked) {
+                gpuText = 'Unavailable';
+            }
+            const fx = [];
+            const a = this.settings.audio || {};
+            if (this.rate() !== 1) fx.push(fmtRate(this.rate()));
+            if (a.boost > 100) fx.push(`boost ${a.boost}%`);
+            if (a.preset && a.preset !== 'normal') fx.push(`EQ ${a.preset}`);
+            if (a.channels && a.channels !== 'stereo') fx.push(a.channels);
+            if (a.delayMs) fx.push(`delay ${a.delayMs} ms`);
+            if (Object.keys(DEFAULT_FILTERS).some(k => this.filters[k] !== DEFAULT_FILTERS[k])) fx.push('colour filters');
+            if (this.settings.ambientMode) fx.push('ambient glow');
             const rows = [
+                ['Stream', `${String(this.stream.type || '').toUpperCase()} · ${this.mode === 'mse' ? 'MSE' : `direct${this.audio && this.audio.corsOk ? ' · CORS' : ''}`}`],
                 ['Resolution', v.videoWidth ? `${v.videoWidth}×${v.videoHeight}` : '—'],
                 ['Frame rate', fps ? `${fps.toFixed(1)} fps` : '—'],
-                ['Dropped frames', String(dropped)],
+                ['Dropped frames', total ? `${dropped} (${((dropped / total) * 100).toFixed(1)}%)` : String(dropped)],
                 ['Variant', fmtBitrate(streamBw)],
-                ['Codecs', codecs || '—'],
+                ['Video codec', vCodec ? `${codecName(vCodec)} · ${vCodec}` : '—'],
+                ['Audio codec', aCodec ? `${codecName(aCodec)} · ${aCodec}` : '—'],
+                ['Decoder', this.decoderInfo || '—'],
+                ['GPU enhancement', gpuText],
+                ['Effects', fx.length ? fx.join(', ') : 'None'],
                 ['Bandwidth', fmtBitrate(e.bandwidth)],
                 ['Workers', `${e.activeWorkers || 0} / ${e.concurrency || 0}${e.accelerated ? ' · range ×4' : ''}`],
                 ['Queued', String(e.queued || 0)],
@@ -4287,7 +4556,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 case 'speedUp': this.setRate(this.nextPreset(1)); break;
                 case 'loopA': this.setLoopPoint('a'); break;
                 case 'loopB': this.setLoopPoint('b'); break;
-                case 'screenshot': this.screenshot(); break;
+                case 'screenshot': this.screenshot(e.shiftKey); break; // Shift+S: with subtitles
                 case 'frameBack': this.stepFrame(-1); break;
                 case 'frameFwd': this.stepFrame(1); break;
                 case 'help': if (this.popKind === 'help') this.closePopover(true); else this.openPopover('help', this.$('.btn-studio')); break;
@@ -4539,6 +4808,7 @@ ${this.selectField('dp-shader', 'Shader', GPU_PRESETS, s.shader)}
 ${this.rangeField('dp-shader-str', 'Strength', 0, 100, 5, s.shaderStrength, `${s.shaderStrength}%`)}
 ${this.selectField('dp-maxres', 'Max render resolution', [[1080, '1080p'], [1440, '1440p'], [2160, '2160p (4K)']], s.maxRenderRes)}
 <p class="hint">${esc(gpuState)} WebGL2 shaders run on the graphics chip and pause while the video is paused or hidden. Heavy presets step down automatically if the device cannot keep up.</p>`;
+            html += this.switchField('dp-ambient', 'Ambient glow behind the video', !!s.ambientMode);
             html += '<div class="inline"><label class="sr-only" for="dp-preset-name">Preset name</label><input type="text" id="dp-preset-name" placeholder="Preset name" maxlength="40"><button type="button" class="pillbtn primary" id="dp-preset-save">Save</button><button type="button" class="pillbtn" id="dp-reset">Reset</button></div>';
             (this.settings.filterPresets || []).forEach((p, i) => {
                 html += `<div class="list-row"><span>${esc(p.name)}</span><button type="button" class="pillbtn" id="dp-apply-${i}" data-fp-apply="${i}">Apply</button><button type="button" class="ib" id="dp-del-${i}" data-fp-del="${i}" aria-label="Delete preset ${esc(p.name)}">${icon('trash', 18)}</button></div>`;
@@ -4564,6 +4834,7 @@ ${this.row({ id: 'tl-bm', label: `Bookmark ${fmtTime(this.video.currentTime - r.
             });
             html += `<div class="section-label">Capture</div><div role="menu" aria-label="Capture">
 ${this.row({ id: 'tl-shot', label: 'Snapshot (.png)', meta: 'S', role: 'menuitem', lead: 'camera' })}
+${this.row({ id: 'tl-shot-subs', label: 'Snapshot with subtitles & effects', meta: 'Shift S', role: 'menuitem', lead: 'camera' })}
 ${this.row({ id: 'tl-burst', label: 'Snapshot burst', meta: '6 frames', role: 'menuitem', lead: 'burst' })}
 ${this.row({ id: 'tl-fb', label: 'Previous frame', meta: ',', role: 'menuitem', lead: 'frameBack' })}
 ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead: 'frameFwd' })}</div>`;
@@ -4580,6 +4851,8 @@ ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead
                 html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
                 html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
             } else if (this.stream.type !== 'dash') {
+                const clip = this.clipRange();
+                if (clip) html += this.row({ id: 'tl-export-clip', label: (this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save A–B clip (.mp4)' : 'Save A–B clip segments', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
                 html += this.row({ id: 'tl-export', label: this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
             }
             html += '</div>';
@@ -4652,7 +4925,11 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
 <p class="hint">${this.profile ? `Active: ${esc(fmtRate(this.profile.defaultSpeed || 1))}, ${this.profile.qualityCap ? `${this.profile.qualityCap}p cap` : 'no quality cap'}, GPU ${esc(this.profile.shader || 'off')}, EQ ${esc(this.profile.audioPreset || 'normal')}.` : 'Remember the current speed, quality cap, GPU shader, EQ preset and subtitle size for this site only.'}</p>
 <div role="menu" aria-label="Site profile">${this.row({ id: 'pf-site-save', label: this.profile ? 'Update profile with current setup' : 'Save current setup for this site', role: 'menuitem', lead: 'bookmark' })}${this.profile ? this.row({ id: 'pf-site-del', label: 'Remove site profile', role: 'menuitem', lead: 'trash' }) : ''}</div>
 <div class="section-label">Keyboard</div>${keys}
-<div role="menu" aria-label="Keyboard actions">${this.row({ id: 'pf-keys-reset', label: 'Reset shortcuts', role: 'menuitem', lead: 'rotate' })}${this.row({ id: 'pf-help', label: 'Show all shortcuts', meta: '?', role: 'menuitem', lead: 'help' })}</div>`;
+<div role="menu" aria-label="Keyboard actions">${this.row({ id: 'pf-keys-reset', label: 'Reset shortcuts', role: 'menuitem', lead: 'rotate' })}${this.row({ id: 'pf-help', label: 'Show all shortcuts', meta: '?', role: 'menuitem', lead: 'help' })}</div>
+<div class="section-label">Backup &amp; restore</div>
+<p class="hint">Settings, site profiles, presets, shortcuts, bookmarks and watch history in one .json file.</p>
+<div role="menu" aria-label="Backup and restore">${this.row({ id: 'pf-backup-export', label: 'Export settings (.json)', role: 'menuitem', lead: 'download' })}${this.row({ id: 'pf-backup-import', label: 'Import settings (.json)', role: 'menuitem', lead: 'rotate' })}</div>
+<input type="file" id="pf-backup-file" accept=".json,application/json" hidden>`;
         }
 
         popHelp() {
@@ -4817,6 +5094,7 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 });
                 range('dp-shader-str', v => { this.settings.shaderStrength = v; this.saveSettings({ shaderStrength: v }); this.applyFilters(); }, v => `${v}%`);
                 select('dp-maxres', v => { this.settings.maxRenderRes = +v; this.saveSettings({ maxRenderRes: +v }); this.applyFilters(); });
+                sw('dp-ambient', v => { this.saveSettings({ ambientMode: v }); this.announce(v ? 'Ambient glow on' : 'Ambient glow off', 'sun'); });
                 click('dp-reset', () => { this.filters = { ...DEFAULT_FILTERS }; this.applyFilters(); this.refreshPopover(); this.announce('Display reset', 'sun'); });
                 click('dp-preset-save', () => {
                     const name = byId('dp-preset-name').value.trim() || `Preset ${(this.settings.filterPresets || []).length + 1}`;
@@ -4847,12 +5125,14 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 each('[data-bm-go]', el => { const bm = this.bookmarks[+el.dataset.bmGo]; if (bm) this.seekTo(bm.t, true); });
                 each('[data-bm-del]', el => { this.bookmarks.splice(+el.dataset.bmDel, 1); this.saveBookmarks(); });
                 click('tl-shot', () => this.screenshot());
+                click('tl-shot-subs', () => this.screenshot(true));
                 click('tl-burst', () => this.snapshotBurst());
                 click('tl-fb', () => this.stepFrame(-1));
                 click('tl-ff', () => this.stepFrame(1));
                 click('tl-cancel', () => this.port.send({ type: 'EXPORT_CANCEL' }));
                 click('tl-rec', () => this.onDownloadButton());
                 click('tl-export', () => this.startExport());
+                click('tl-export-clip', () => { const clip = this.clipRange(); if (clip) this.startExport({ clip }); });
                 select('tl-format', v => { this.saveSettings({ exportFormat: v }); this.refreshPopover(); });
                 each('[data-sleep]', el => { const m = el.dataset.sleep; this.setSleep(m === 'eov' ? 'eov' : +m); });
                 select('tl-skip', v => this.saveSettings({ skipSeconds: +v }));
@@ -4905,6 +5185,9 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                     this.announce('Shortcuts reset', 'check');
                 });
                 click('pf-help', () => this.openPopover('help', this.$('.btn-studio')));
+                click('pf-backup-export', () => this.exportBackup());
+                click('pf-backup-import', () => { const f = byId('pf-backup-file'); if (f) f.click(); });
+                { const f = byId('pf-backup-file'); if (f) f.addEventListener('change', () => { const file = f.files && f.files[0]; f.value = ''; if (file) this.importBackup(file); }); }
                 click('pf-site-save', () => this.saveSiteProfile());
                 click('pf-site-del', () => this.removeSiteProfile());
             }
