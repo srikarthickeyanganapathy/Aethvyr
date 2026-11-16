@@ -9,7 +9,7 @@ fixes.
 
 Please **do not open a public issue** for security problems. Use GitHub's private reporting:
 **Security → Report a vulnerability** on
-<https://github.com/srikarthickeyanganapathy/playerstreamextension>.
+<https://github.com/srikarthickeyanganapathy/Velostream>.
 
 Include the browser and version, the Velostream version, steps to reproduce and the impact. You
 should get a first response within 7 days. Please give us a reasonable time to fix the issue before

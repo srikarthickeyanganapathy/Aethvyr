@@ -5,6 +5,14 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.2.1] - 2026-11-16
+
+### Changed
+
+- The GitHub repository was renamed to
+  [srikarthickeyanganapathy/Velostream](https://github.com/srikarthickeyanganapathy/Velostream):
+  support, privacy-policy, security and clone links updated.
+
 ## [2.2.0] - 2026-11-16
 
 ### Added

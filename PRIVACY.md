@@ -66,4 +66,4 @@ Changes to this policy are published in this file and noted in the changelog.
 ## Contact
 
 Open an issue at
-<https://github.com/srikarthickeyanganapathy/playerstreamextension/issues>.
+<https://github.com/srikarthickeyanganapathy/Velostream/issues>.

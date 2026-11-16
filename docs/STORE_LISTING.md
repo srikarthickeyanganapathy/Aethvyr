@@ -35,7 +35,7 @@ unmodified third-party library Shaka Player, which reviewers verify against its 
 | **Categories (Firefox)** | Photos, Music & Videos; Download Management |
 | **Categories (Android)** | Photos & Media |
 | **Tags** | video, player, hls, streaming, download, subtitles, accessibility |
-| **Support website** | `https://github.com/srikarthickeyanganapathy/playerstreamextension` |
+| **Support website** | `https://github.com/srikarthickeyanganapathy/Velostream` |
 | **Support email** | *(optional; leave empty or use a dedicated address)* |
 | **License** | MIT License |
 | **Privacy policy** | Paste [PRIVACY.md](../PRIVACY.md) (optional on AMO because no data is collected, but recommended) |
@@ -106,7 +106,7 @@ How to test:
 1. Open https://shaka-player-demo.appspot.com/ or any page with an HLS stream, start the video.
 2. Click the "Play in Velostream" pill over the video, or the toolbar button and pick the stream.
 3. The player opens over the video. Press "?" for shortcuts; the download button saves an MP4.
-Source and documentation: https://github.com/srikarthickeyanganapathy/playerstreamextension
+Source and documentation: https://github.com/srikarthickeyanganapathy/Velostream
 ```
 
 ### 5. Images
@@ -139,4 +139,4 @@ Source and documentation: https://github.com/srikarthickeyanganapathy/playerstre
 - **Data usage:** tick nothing in the data categories. Certify all three statements: not sold to
   third parties, not used for unrelated purposes, not used for creditworthiness or lending.
 - **Privacy policy URL:** a public link to `PRIVACY.md`, for example
-  `https://github.com/srikarthickeyanganapathy/playerstreamextension/blob/main/PRIVACY.md`.
+  `https://github.com/srikarthickeyanganapathy/Velostream/blob/main/PRIVACY.md`.

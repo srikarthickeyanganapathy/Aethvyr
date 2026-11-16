@@ -5,8 +5,8 @@
 Requirements: **Node.js 18+** and npm. Development uses Chromium 111+ or Firefox 128+ (desktop and Android).
 
 ```bash
-git clone https://github.com/srikarthickeyanganapathy/playerstreamextension.git
-cd playerstreamextension
+git clone https://github.com/srikarthickeyanganapathy/Velostream.git
+cd Velostream
 npm install
 npm run build
 ```

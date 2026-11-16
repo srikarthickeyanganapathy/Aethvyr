@@ -108,7 +108,7 @@ browser-specific manifest. Details in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 ## Project layout
 
 ```
-playerstreamextension/   (repository root)
+Velostream/   (repository root)
 ├── manifest.json            MV3 manifest (the build derives the Chrome and Firefox variants)
 ├── background/              Service worker / event page: the engine
 │   ├── engine.js            detection, sessions, launch, transport, export, message router
