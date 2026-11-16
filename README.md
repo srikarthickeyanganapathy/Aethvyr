@@ -44,7 +44,7 @@ no remote code. See [PRIVACY.md](PRIVACY.md).
 | **Detection** | HLS (`.m3u8`), DASH (`.mpd`) and direct files (MP4/WebM/…) found via network sniffing, `fetch`/XHR hooks, Web Workers (including `blob:` workers), `<video>`/`<source>` scanning and MSE detection, in every frame including cross-origin embeds. Ads and segment playlists are filtered out. |
 | **Playback** | Shaka Player 5 (bundled, never loaded from a CDN). Starts after 0.5 s of media, muted-autoplay fallback with one-tap unmute, auto-resume per video, remembered volume/speed/quality/audio and subtitle language, per-site profiles, auto-replace on chosen sites. |
 | **Pre-buffer engine** | Background service worker downloads ahead with 2–8 adaptive workers, a byte-range accelerator, retries with backoff, an IndexedDB cache read zero-copy by the player, its own ABR, and a live DVR (default 30 min). |
-| **GPU enhancement** | WebGL2 presets: **Fast Sharpen** (CAS), **FSR-style upscale** (Lanczos-2 + RCAS), **Anime4K-lite** line reconstruction, **Deband**. Strength and render-resolution cap, plus a thermal guard that steps down when the GPU cannot keep up. |
+| **GPU enhancement** | WebGL2 presets: **Fast Sharpen** (CAS), **FSR-style upscale** (Lanczos-2 + RCAS), real **Anime4K** neural upscaling (fast and HQ), **De-block**, **Denoise**, **Deband**, plus **Color Studio** grading (looks, gamma, vibrance, temperature, tint, shadows, highlights). Strength and render-resolution cap, and a thermal guard that steps down when the GPU cannot keep up. |
 | **Controls** | Configurable double-tap zones (left/centre/right), swipe for volume, brightness and scrubbing, long-press 2×, pinch zoom, mouse wheel and middle click, remappable keyboard shortcuts, frame stepping, A-B loop, zoom/pan/rotate/mirror, aspect presets. |
 | **Subtitles** | Site subtitles captured automatically (network, `<track>`, in-memory text tracks), SRT/VTT/ASS files, dual subtitles, sync to the next spoken line, timing speed, pause on hover, click to copy, full styling including dyslexia-friendly fonts. |
 | **Audio** | Boost up to 300 %, presets (voice, bass, night) and 5-band EQ, A/V delay, pitch-preserving speed, mono/left/right channel routing, audio-only battery saver. |
@@ -150,4 +150,6 @@ circumvent DRM and never will.
 ## License
 
 [MIT](LICENSE). Bundled [Shaka Player](https://github.com/shaka-project/shaka-player) is Apache-2.0;
-its license ships in every build as `lib/SHAKA-LICENSE.txt`.
+its license ships in every build as `lib/SHAKA-LICENSE.txt`. The Anime4K shaders
+([bloc97/Anime4K](https://github.com/bloc97/Anime4K) v4.0.1) are MIT; their license ships as
+`player/ANIME4K-LICENSE.txt`.

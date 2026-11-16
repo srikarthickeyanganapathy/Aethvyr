@@ -2,23 +2,57 @@
  * Velostream - GPU video shader pipeline (WebGL2), runs in the player extension page.
  *
  * Draws the <video> through WebGL2 into a <canvas> laid exactly over it:
- *   cas      - Contrast Adaptive Sharpening (1 pass, replaces the CPU SVG convolution)
- *   fsr      - Lanczos-2 upscale with anti-ringing + RCAS sharpening (2 passes, FSR 1-style)
- *   anime4k  - Lanczos-2 upscale + gradient "push" line reconstruction (2 passes, Anime4K-lite)
- *   deband   - randomized 4-tap gradient smoothing with dither (1 pass)
+ *   cas        - Contrast Adaptive Sharpening (1 pass, replaces the CPU SVG convolution)
+ *   fsr        - Lanczos-2 upscale with anti-ringing + RCAS sharpening (2 passes, FSR 1-style)
+ *   anime4k    - Anime4K v4 CNN Restore (S) + Upscale x2 (S), from player/anime4k.js; falls back
+ *                to Anime4K-lite (Lanczos-2 + gradient "push") without float render targets
+ *   anime4k-hq - Anime4K v4 CNN Restore (M) + Upscale x2 (M), same fallback
+ *   deblock    - removes 8x8 block edges on the source pixel grid, then a light CAS (2 passes)
+ *   denoise    - edge-preserving bilateral denoise at source size with optional luma-grain
+ *                preservation, then Lanczos-2 to the display (2 passes)
+ *   deband     - randomized 4-tap gradient smoothing with dither (1 pass)
+ * plus optional colour grading (gamma, vibrance, temperature, tint, shadows, highlights) as one
+ * final pass; with preset 'off' and non-neutral colour the pipeline runs colour-only.
+ *
+ * Orientation: the <video> texture has the top of the picture at v = 0; a texture rendered by an
+ * earlier pass has it at v = 1 (GL framebuffer origin is bottom-left). The vertex shader's uFbo
+ * uniform picks the mapping per pass so every pass, and the canvas, stay upright.
  *
  * The canvas is sized min(maxRenderRes, displayed size x devicePixelRatio). Frames are driven by
  * requestVideoFrameCallback (falls back to requestAnimationFrame), so nothing runs while the
  * video is paused, hidden or audio-only; seeks and setting changes render one frame on demand.
- * A thermal guard steps the preset down (fsr/anime4k -> cas -> off) when the GPU cannot keep up.
+ * A thermal guard steps the preset down (STEP_DOWN) when the GPU cannot keep up; colour grading
+ * is cheap and is never stepped down.
  *
- * Exposes window.VelostreamShaders = { VideoShaderPipeline, PRESETS, isSupported }.
+ * Exposes window.VelostreamShaders = { VideoShaderPipeline, PRESETS, COLOR_NEUTRAL, STEP_DOWN,
+ * isSupported }. Load player/anime4k.js (window.VelostreamAnime4K) before this file for the CNN
+ * presets; without it they use Anime4K-lite.
  */
 (function () {
     'use strict';
 
-    const PRESETS = ['off', 'cas', 'fsr', 'anime4k', 'deband'];
-    const STEP_DOWN = { fsr: 'cas', anime4k: 'cas', deband: 'off', cas: 'off' };
+    const PRESETS = ['off', 'cas', 'fsr', 'anime4k', 'anime4k-hq', 'deblock', 'denoise', 'deband'];
+    const STEP_DOWN = Object.freeze({ 'anime4k-hq': 'anime4k', anime4k: 'cas', fsr: 'cas', cas: 'off', deblock: 'off', denoise: 'off', deband: 'off' });
+
+    /** Neutral colour grading values (configure({ color }) units). */
+    const COLOR_NEUTRAL = Object.freeze({ gamma: 1, vibrance: 0, temperature: 0, tint: 0, shadows: 0, highlights: 0 });
+    const COLOR_RANGE = { gamma: [0.5, 2], vibrance: [-100, 100], temperature: [-100, 100], tint: [-100, 100], shadows: [-100, 100], highlights: [-100, 100] };
+
+    /** Missing / invalid keys are neutral; values are clamped to their range. */
+    function normalizeColor(c) {
+        const out = Object.assign({}, COLOR_NEUTRAL);
+        if (!c || typeof c !== 'object') return out;
+        for (const k of Object.keys(COLOR_NEUTRAL)) {
+            if (c[k] === undefined || c[k] === null) continue;
+            const v = Number(c[k]);
+            if (Number.isFinite(v)) out[k] = Math.min(COLOR_RANGE[k][1], Math.max(COLOR_RANGE[k][0], v));
+        }
+        return out;
+    }
+
+    function colorIsNeutral(c) {
+        return Math.abs(c.gamma - 1) < 0.005 && ['vibrance', 'temperature', 'tint', 'shadows', 'highlights'].every(k => Math.abs(c[k]) < 0.5);
+    }
 
     const VS = `#version 300 es
 in vec2 aPos;
@@ -26,6 +60,7 @@ out vec2 vUv;
 // Video textures are uploaded top row first (v = 0 is the top of the picture), while a texture
 // rendered by an earlier pass stores the top of the picture at v = 1 (GL framebuffer origin is
 // bottom-left). uFbo selects the matching mapping so every pass keeps the picture upright.
+// (With uFbo = 0, vUv is the picture coordinate: (0,0) top-left, +y down - the Anime4K passes use that.)
 uniform float uFbo;
 void main() {
     vUv = vec2(aPos.x * 0.5 + 0.5, uFbo > 0.5 ? aPos.y * 0.5 + 0.5 : 0.5 - aPos.y * 0.5);
@@ -110,8 +145,9 @@ void main() {
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }`;
 
-    // Anime4K-lite: push each pixel toward the brighter side of strong luma gradients, which
-    // thins and straightens dark line art after upscaling, then lightly re-darkens the lines.
+    // Anime4K-lite (fallback for the CNN presets): push each pixel toward the brighter side of
+    // strong luma gradients, which thins and straightens dark line art after upscaling, then
+    // lightly re-darkens the lines.
     const FS_A4K = HEADER + `
 void main() {
     float tl = luma(px(vUv, vec2(-1.0, -1.0)));
@@ -159,9 +195,103 @@ void main() {
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }`;
 
+    // Deblock, pass 1 of 2 (source size, reads the <video> texture, so texel row 0 is the top of
+    // the picture). H.264 / VP9 code 8x8 (and 16x16) transform blocks whose edges lie on multiples
+    // of 8 in the SOURCE pixel grid. For the 3 pixels on each side of such an edge: when the step
+    // across it is small (a coding artefact, not a real edge) and both sides are flat, spread the
+    // step linearly over those 6 pixels, much like H.264's in-loop filter.
+    const FS_DEBLOCK = HEADER + `
+vec3 T(ivec2 p) { return texelFetch(uTex, clamp(p, ivec2(0), ivec2(uInSize) - 1), 0).rgb; }
+vec3 fixEdge(ivec2 p, ivec2 dir, int x, int size) {
+    int m = x % 8;
+    int k;       // distance from the block boundary (0 = touching it)
+    int b;       // index of the last pixel before the boundary (p0)
+    float side;  // +1 before the boundary, -1 after it
+    if (m >= 5) { k = 7 - m; b = x + k; side = 1.0; }
+    else if (m <= 2) { k = m; b = x - k - 1; side = -1.0; }
+    else return vec3(0.0);
+    if (b < 2 || b + 3 >= size) return vec3(0.0);
+    ivec2 o = p + dir * (b - x);
+    vec3 p2 = T(o - 2 * dir);
+    vec3 p1 = T(o - dir);
+    vec3 p0 = T(o);
+    vec3 q0 = T(o + dir);
+    vec3 q1 = T(o + 2 * dir);
+    vec3 q2 = T(o + 3 * dir);
+    float jump = abs(luma(q0) - luma(p0));
+    float flatness = max(max(abs(luma(p1) - luma(p0)), abs(luma(p2) - luma(p1))),
+                         max(abs(luma(q1) - luma(q0)), abs(luma(q2) - luma(q1))));
+    float alpha = mix(0.04, 0.12, uStrength);   // larger steps are real edges: keep them
+    float beta = mix(0.008, 0.024, uStrength);  // in-block variation allowed on each side
+    float w = (1.0 - smoothstep(alpha * 0.5, alpha, jump))
+            * (1.0 - smoothstep(beta, beta * 2.0, flatness))
+            * smoothstep(flatness, flatness * 2.0 + 0.004, jump);
+    return (q0 - p0) * (side * float(3 - k) / 7.0 * w);
+}
+void main() {
+    ivec2 p = ivec2(floor(vUv * uInSize));
+    ivec2 size = ivec2(uInSize);
+    vec3 c = T(p) + fixEdge(p, ivec2(1, 0), p.x, size.x) + fixEdge(p, ivec2(0, 1), p.y, size.y);
+    outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
+
+    // Denoise, pass 1 of 2 (source size): 5x5 bilateral filter (spatial sigma ~1.7 px, range sigma
+    // from uStrength), so edges and line art are kept. uGrain re-adds that share of the removed
+    // LUMA detail: film grain survives while the blotchy chroma noise is still removed.
+    const FS_DENOISE = HEADER + `
+uniform float uGrain;
+vec3 T(ivec2 p) { return texelFetch(uTex, clamp(p, ivec2(0), ivec2(uInSize) - 1), 0).rgb; }
+void main() {
+    ivec2 p = ivec2(floor(vUv * uInSize));
+    vec3 c = T(p);
+    float sr = mix(0.02, 0.085, uStrength);
+    float inv = -0.5 / (sr * sr);
+    vec3 sum = c;
+    float wsum = 1.0;
+    for (int j = -2; j <= 2; j++) {
+        for (int i = -2; i <= 2; i++) {
+            if (i == 0 && j == 0) continue;
+            vec3 s = T(p + ivec2(i, j));
+            vec3 d = s - c;
+            float w = exp(dot(d, d) * inv - float(i * i + j * j) * 0.18);
+            sum += s * w;
+            wsum += w;
+        }
+    }
+    vec3 den = sum / wsum;
+    den += vec3(luma(c - den) * uGrain);
+    outColor = vec4(clamp(den, 0.0, 1.0), 1.0);
+}`;
+
+    // Colour grading (final pass): white balance, shadows / highlights, gamma, vibrance.
+    const FS_COLOR = HEADER + `
+uniform vec4 uColorA;  // gamma (0.5..2), vibrance, temperature, tint (-1..1)
+uniform vec2 uColorB;  // shadows, highlights (-1..1)
+void main() {
+    vec3 c = texture(uTex, vUv).rgb;
+    float t = uColorA.z;
+    float m = uColorA.w;
+    // temperature > 0 warmer (more red, less blue), tint > 0 magenta (less green); luma-neutral
+    vec3 gain = vec3(1.0 + 0.12 * t + 0.04 * m, 1.0 - 0.08 * m, 1.0 - 0.12 * t + 0.04 * m);
+    c *= gain / dot(gain, vec3(0.299, 0.587, 0.114));
+    // shadows / highlights: tone curve bumps that keep black and white points (peak at 1/3, 2/3)
+    float l = clamp(luma(c), 0.0, 1.0);
+    c += 0.9 * (uColorB.x * l * (1.0 - l) * (1.0 - l) + uColorB.y * l * l * (1.0 - l));
+    // gamma > 1 brightens the mid-tones
+    c = pow(max(c, vec3(0.0)), vec3(1.0 / uColorA.x));
+    // vibrance: saturate the dull colours more than the already-saturated ones
+    float v = uColorA.y;
+    float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+    float k = v >= 0.0 ? 1.0 + v * (1.0 - clamp(sat, 0.0, 1.0)) : 1.0 + v;
+    c = mix(vec3(luma(c)), c, k);
+    outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
+
     // Plain bilinear blit (used to present an intermediate texture).
     const FS_COPY = HEADER + `
 void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
+
+    const BUILTIN = { cas: FS_CAS, lanczos: FS_LANCZOS, rcas: FS_RCAS, a4k: FS_A4K, deband: FS_DEBAND, copy: FS_COPY, deblock: FS_DEBLOCK, denoise: FS_DENOISE, color: FS_COLOR };
 
     function isSupported() {
         try {
@@ -176,7 +306,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
         /**
          * @param {HTMLVideoElement} video
          * @param {HTMLCanvasElement} canvas
-         * @param {{onStepDown?:(preset:string, reason:string)=>void, onUnavailable?:(reason:string)=>void}} hooks
+         * @param {{onStepDown?:(preset:string, reason:string, from:string)=>void, onUnavailable?:(reason:string)=>void}} hooks
          */
         constructor(video, canvas, hooks = {}) {
             this.video = video;
@@ -184,9 +314,19 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.hooks = hooks;
             this.preset = 'off';
             this.strength = 0.5;
+            this.grain = 0;
+            this.color = Object.assign({}, COLOR_NEUTRAL);
             this.maxRenderRes = 2160;
             this.gl = null;
             this.programs = {};
+            this.targets = new Map();   // name -> { fb, tex, w, h, float, used }
+            this.a4k = {};              // shader chain id -> { status, list, progs, error }
+            this.a4kPlanCache = null;
+            this.a4kTimer = 0;
+            this.floatRT = false;
+            this.parallelExt = null;
+            /** What the last draw actually ran, e.g. "anime4k CNN (restore + upscale x2) + colour". */
+            this.path = '';
             this.running = false;
             this.rvfc = typeof video.requestVideoFrameCallback === 'function';
             this.handle = 0;
@@ -199,7 +339,6 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.vao = null;
             this.vbo = null;
             this.videoTex = null;
-            this.fbo = null;
             this.destroyed = false;
             this.boundRender = (now, meta) => this.onFrame(now, meta);
             // preventDefault() asks the browser to restore the context (GPU reset, driver update,
@@ -219,7 +358,10 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.onContextRestored = () => this.restore();
         }
 
-        get active() { return this.preset !== 'off' && !this.failed && !this.lost && !!this.gl; }
+        /** True when colour grading is not neutral (the pipeline then runs even with preset 'off'). */
+        get colorOn() { return !colorIsNeutral(this.color); }
+
+        get active() { return (this.preset !== 'off' || this.colorOn) && !this.failed && !this.lost && !!this.gl; }
 
         init() {
             // After destroy() the canvas' context has been lost on purpose; getContext() would hand
@@ -248,7 +390,8 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
         setupGl() {
             const gl = this.gl;
             this.programs = {};
-            this.fbo = null;
+            this.targets = new Map();
+            this.a4k = {};
             this.pendingQuery = null;
             const buf = gl.createBuffer();
             this.vbo = buf;
@@ -260,8 +403,26 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
             this.videoTex = this.makeTexture();
             this.timerExt = gl.getExtension('EXT_disjoint_timer_query_webgl2');
-            const src = { cas: FS_CAS, lanczos: FS_LANCZOS, rcas: FS_RCAS, a4k: FS_A4K, deband: FS_DEBAND, copy: FS_COPY };
-            for (const [k, fs] of Object.entries(src)) this.programs[k] = this.link(fs);
+            this.parallelExt = gl.getExtension('KHR_parallel_shader_compile');
+            this.floatRT = this.probeFloatTargets();
+            for (const [k, fs] of Object.entries(BUILTIN)) this.programs[k] = this.link(fs);
+        }
+
+        /** Whether RGBA16F textures can be rendered to (needed by the Anime4K CNN passes). */
+        probeFloatTargets() {
+            const gl = this.gl;
+            if (!gl.getExtension('EXT_color_buffer_float') && !gl.getExtension('EXT_color_buffer_half_float')) return false;
+            const tex = this.makeTexture();
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, 4, 4, 0, gl.RGBA, gl.HALF_FLOAT, null);
+            const fb = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+            const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.deleteFramebuffer(fb);
+            gl.deleteTexture(tex);
+            gl.getError(); // a driver that rejects the format must not leave an error behind
+            return ok;
         }
 
         restore() {
@@ -293,37 +454,49 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             return t;
         }
 
-        link(fsSource) {
+        /** Compiles and links without waiting (KHR_parallel_shader_compile can finish it in the background). */
+        startProgram(fsSource) {
             const gl = this.gl;
-            const shaders = [];
             const p = gl.createProgram();
-            const sh = (type, src) => {
+            const shaders = [];
+            for (const [type, src] of [[gl.VERTEX_SHADER, VS], [gl.FRAGMENT_SHADER, fsSource]]) {
                 const s = gl.createShader(type);
                 shaders.push(s);
                 gl.shaderSource(s, src);
                 gl.compileShader(s);
-                if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) || 'compile error');
-                return s;
-            };
-            try {
-                gl.attachShader(p, sh(gl.VERTEX_SHADER, VS));
-                gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fsSource));
-                gl.bindAttribLocation(p, 0, 'aPos');
-                gl.linkProgram(p);
-                if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) || 'link error');
-            } catch (err) {
-                // Do not leak the half-built program on a compile/link failure.
-                this.deleteProgram({ p, shaders });
-                throw err;
+                gl.attachShader(p, s);
             }
-            const u = n => gl.getUniformLocation(p, n);
-            return { p, shaders, uTex: u('uTex'), uIn: u('uInSize'), uOut: u('uOutSize'), uStr: u('uStrength'), uFrame: u('uFrame'), uFbo: u('uFbo') };
+            gl.bindAttribLocation(p, 0, 'aPos');
+            gl.linkProgram(p);
+            return { p, shaders };
         }
 
-        /** Detaches and deletes a program's shaders, then the program itself. */
+        /** Checks a started program (throws with the compile/link log) and looks up its uniforms. */
+        finishProgram(h, binds = []) {
+            const gl = this.gl;
+            if (!gl.getProgramParameter(h.p, gl.LINK_STATUS)) {
+                const log = h.shaders.map(s => (gl.getShaderParameter(s, gl.COMPILE_STATUS) ? '' : gl.getShaderInfoLog(s))).filter(Boolean).join('\n')
+                    || gl.getProgramInfoLog(h.p) || 'link error';
+                // Do not leak the half-built program on a compile/link failure.
+                this.deleteProgram(h);
+                throw new Error(log);
+            }
+            const p = h.p;
+            const u = n => gl.getUniformLocation(p, n);
+            return {
+                p, shaders: h.shaders, uTex: u('uTex'), uIn: u('uInSize'), uOut: u('uOutSize'), uStr: u('uStrength'), uFrame: u('uFrame'), uFbo: u('uFbo'),
+                uGrain: u('uGrain'), uColorA: u('uColorA'), uColorB: u('uColorB'),
+                binds: binds.map(n => ({ raw: u(`${n}_raw`), size: u(`${n}_size`), pt: u(`${n}_pt`), flip: u(`${n}_flip`) }))
+            };
+        }
+
+        link(fsSource) { return this.finishProgram(this.startProgram(fsSource)); }
+
+        /** Detaches and deletes a program's shaders, then the program itself. Safe to call twice. */
         deleteProgram(prog) {
             const gl = this.gl;
-            if (!gl || !prog) return;
+            if (!gl || !prog || prog.deleted) return;
+            prog.deleted = true;
             const attached = (prog.p && !gl.isContextLost() && gl.getAttachedShaders(prog.p)) || [];
             for (const s of prog.shaders || []) {
                 if (!s) continue;
@@ -340,12 +513,20 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             if (this.hooks.onUnavailable) this.hooks.onUnavailable(reason);
         }
 
-        /** Applies settings; returns true if the GPU path is now active. */
-        configure({ preset, strength, maxRenderRes }) {
+        /**
+         * Applies settings; returns true if the GPU path is now active.
+         * @param {{preset?:string, strength?:number, maxRenderRes?:number, grain?:number,
+         *   color?:{gamma?:number, vibrance?:number, temperature?:number, tint?:number, shadows?:number, highlights?:number}|null}} opts
+         *   color: replaces the grading (missing keys neutral); leave it out to keep the current one.
+         *   grain: 0..100, share of luma grain the denoise preset keeps (default 0).
+         */
+        configure({ preset, strength, maxRenderRes, color, grain } = {}) {
             if (typeof strength === 'number') this.strength = Math.min(1, Math.max(0, strength / 100));
             if (typeof maxRenderRes === 'number' && maxRenderRes > 0) this.maxRenderRes = maxRenderRes;
+            if (typeof grain === 'number' && Number.isFinite(grain)) this.grain = Math.min(1, Math.max(0, grain / 100));
+            if (color !== undefined) this.color = normalizeColor(color);
             const next = PRESETS.includes(preset) ? preset : 'off';
-            if (next !== 'off' && !this.init()) { this.preset = 'off'; return false; }
+            if ((next !== 'off' || this.colorOn) && !this.init()) { this.preset = 'off'; return false; }
             const wasActive = this.active;
             this.preset = next;
             // Stay hidden (the <video> shows through) until a real frame has been drawn: no black flash.
@@ -353,7 +534,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.canvas.hidden = !this.active || !this.drawn;
             this.resetGuard();
             // (While the context is lost nothing runs, and stop() would drop the resume intent.)
-            if (this.active) { this.resize(); this.renderOnce(); } else if (!this.lost) this.stop();
+            if (this.active) { this.resize(); this.renderOnce(); } else if (!this.lost) { this.stop(); this.releaseTargets(); }
             return this.active;
         }
 
@@ -384,33 +565,58 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             const cap = this.maxRenderRes;
             if (h > cap) { w = Math.round(w * cap / h); h = cap; }
             // Never render below the source: sharpening at a lower resolution wastes detail.
-            const vw = this.video.videoWidth;
             const vh = this.video.videoHeight;
             if (vh && h < vh && this.preset === 'cas') { w = Math.round(w * vh / h); h = vh; }
             if (this.canvas.width !== w || this.canvas.height !== h) {
                 this.canvas.width = w;
                 this.canvas.height = h;
-                // The intermediate target is reallocated lazily by ensureFbo() (it compares sizes and
-                // deletes the old framebuffer + texture). Nulling it here used to leak both on resize.
+                // Intermediate targets are reallocated lazily by target() (it compares sizes and
+                // deletes the old framebuffer + texture); ones a frame no longer uses are freed by
+                // sweepTargets() after that frame.
             }
-            void vw;
         }
 
-        ensureFbo(w, h) {
+        // ---- render targets --------------------------------------------------------
+        /** A named framebuffer + texture of the given size/format, (re)allocated on demand. */
+        target(name, w, h, float) {
             const gl = this.gl;
-            if (this.fbo && this.fbo.w === w && this.fbo.h === h) return this.fbo;
-            if (this.fbo) { gl.deleteFramebuffer(this.fbo.fb); gl.deleteTexture(this.fbo.tex); }
-            const tex = this.makeTexture();
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-            const fb = gl.createFramebuffer();
-            gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-            this.fbo = { fb, tex, w, h };
-            return this.fbo;
+            let t = this.targets.get(name);
+            if (t && (t.w !== w || t.h !== h || t.float !== float)) { this.freeTarget(t); t = null; }
+            if (!t) {
+                const tex = this.makeTexture();
+                if (float) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+                else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+                const fb = gl.createFramebuffer();
+                gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                t = { fb, tex, w, h, float, used: 0 };
+                this.targets.set(name, t);
+            }
+            t.used = this.frame;
+            return t;
         }
 
-        pass(prog, tex, inW, inH, target, outW, outH) {
+        freeTarget(t) {
+            const gl = this.gl;
+            if (!gl || gl.isContextLost()) return;
+            gl.deleteFramebuffer(t.fb);
+            gl.deleteTexture(t.tex);
+        }
+
+        /** Frees targets the last frame did not use (preset switch, resize, upscale on/off). */
+        sweepTargets() {
+            for (const [k, t] of this.targets) {
+                if (t.used !== this.frame) { this.freeTarget(t); this.targets.delete(k); }
+            }
+        }
+
+        releaseTargets() {
+            for (const t of this.targets.values()) this.freeTarget(t);
+            this.targets.clear();
+        }
+
+        pass(prog, tex, inW, inH, target, outW, outH, strength = this.strength) {
             const gl = this.gl;
             gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fb : null);
             gl.viewport(0, 0, outW, outH);
@@ -420,13 +626,19 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.uniform1i(prog.uTex, 0);
             gl.uniform2f(prog.uIn, inW, inH);
             gl.uniform2f(prog.uOut, outW, outH);
-            gl.uniform1f(prog.uStr, this.strength);
+            gl.uniform1f(prog.uStr, strength);
             gl.uniform1f(prog.uFbo, tex === this.videoTex ? 0 : 1);
             if (prog.uFrame) gl.uniform1f(prog.uFrame, this.frame % 1000);
+            if (prog.uGrain) gl.uniform1f(prog.uGrain, this.grain);
+            if (prog.uColorA) {
+                const c = this.color;
+                gl.uniform4f(prog.uColorA, c.gamma, c.vibrance / 100, c.temperature / 100, c.tint / 100);
+                gl.uniform2f(prog.uColorB, c.shadows / 100, c.highlights / 100);
+            }
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         }
 
-        /** Uploads the current video frame and runs the preset's passes. */
+        /** Uploads the current video frame and runs the preset's passes (+ the colour pass). */
         draw() {
             if (!this.active) return;
             const v = this.video;
@@ -446,32 +658,177 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
                 this.fail(err && err.name === 'SecurityError' ? 'This video comes from another site without CORS, so the GPU may not read its pixels' : `Frame upload failed: ${err && err.message}`);
                 return;
             }
-            const P = this.programs;
             this.frame++;
+            const grade = this.colorOn;
+            // The preset renders straight to the canvas, or into a W x H target the colour pass reads.
+            const out = grade && this.preset !== 'off' ? this.target('grade', W, H, this.floatRT) : null;
+            let path = this.renderPreset(vw, vh, W, H, out);
+            if (grade) {
+                if (out) this.pass(this.programs.color, out.tex, W, H, null, W, H);
+                else this.pass(this.programs.color, this.videoTex, vw, vh, null, W, H);
+                path = path ? `${path} + colour` : 'colour only';
+            }
+            this.path = path;
+            this.sweepTargets();
+            if (!this.drawn) { this.drawn = true; this.canvas.hidden = false; }
+        }
+
+        /** Runs the preset into `out` (null = canvas); returns a short description of the path. */
+        renderPreset(vw, vh, W, H, out) {
+            const P = this.programs;
+            const video = this.videoTex;
             switch (this.preset) {
                 case 'cas':
-                    this.pass(P.cas, this.videoTex, vw, vh, null, W, H);
-                    break;
+                    this.pass(P.cas, video, vw, vh, out, W, H);
+                    return 'cas';
                 case 'deband':
-                    this.pass(P.deband, this.videoTex, vw, vh, null, W, H);
-                    break;
-                case 'fsr':
-                case 'anime4k': {
+                    this.pass(P.deband, video, vw, vh, out, W, H);
+                    return 'deband';
+                case 'fsr': {
                     // Displayed at or below the source size there is nothing to upscale: one
-                    // sharpening/line pass straight from the video (half the GPU work, no resampling).
+                    // sharpening pass straight from the video (half the GPU work, no resampling).
                     if (W <= vw * 1.05 && H <= vh * 1.05) {
-                        this.pass(this.preset === 'fsr' ? P.cas : P.a4k, this.videoTex, vw, vh, null, W, H);
-                        break;
+                        this.pass(P.cas, video, vw, vh, out, W, H);
+                        return 'fsr (cas only, no upscale)';
                     }
-                    const up = this.ensureFbo(W, H);
-                    this.pass(P.lanczos, this.videoTex, vw, vh, up, W, H);
-                    this.pass(this.preset === 'fsr' ? P.rcas : P.a4k, up.tex, W, H, null, W, H);
-                    break;
+                    const up = this.target('up', W, H, false);
+                    this.pass(P.lanczos, video, vw, vh, up, W, H);
+                    this.pass(P.rcas, up.tex, W, H, out, W, H);
+                    return 'fsr';
                 }
+                case 'deblock': {
+                    const src = this.target('src', vw, vh, false);
+                    this.pass(P.deblock, video, vw, vh, src, vw, vh);
+                    this.pass(P.cas, src.tex, vw, vh, out, W, H, 0.1 + 0.3 * this.strength);
+                    return 'deblock';
+                }
+                case 'denoise': {
+                    const src = this.target('src', vw, vh, this.floatRT);
+                    this.pass(P.denoise, video, vw, vh, src, vw, vh);
+                    this.pass(P.lanczos, src.tex, vw, vh, out, W, H);
+                    return 'denoise';
+                }
+                case 'anime4k':
+                case 'anime4k-hq':
+                    return this.drawAnime4K(vw, vh, W, H, out);
                 default:
-                    break;
+                    return '';
             }
-            if (!this.drawn) { this.drawn = true; this.canvas.hidden = false; }
+        }
+
+        // ---- Anime4K CNN -----------------------------------------------------------
+        /** The Anime4K shader files the current preset runs (VelostreamAnime4K.CHAINS). */
+        a4kChain() { return window.VelostreamAnime4K.CHAINS[this.preset]; }
+
+        /** The chain's compiled pass programs, or null while compiling / when unavailable. */
+        a4kPrograms(chain) {
+            const A = window.VelostreamAnime4K;
+            if (!A || !this.floatRT) return null;
+            const id = chain.join('+');
+            let e = this.a4k[id];
+            if (!e) {
+                // Compiled on first use only: the CNN shaders are large and most sessions never need them.
+                e = this.a4k[id] = { status: 'compiling', list: [], progs: null, error: '' };
+                try {
+                    for (const p of A.passes(chain)) e.list.push({ key: p.key, binds: p.binds, h: this.startProgram(p.source) });
+                } catch (err) {
+                    this.a4kFailed(e, err);
+                }
+            }
+            if (e.status !== 'compiling') return e.progs;
+            const gl = this.gl;
+            const ext = this.parallelExt;
+            if (ext && !e.list.every(x => gl.getProgramParameter(x.h.p, ext.COMPLETION_STATUS_KHR))) {
+                this.pollA4k();
+                return null;
+            }
+            try {
+                const progs = {};
+                for (const x of e.list) progs[x.key] = this.finishProgram(x.h, x.binds);
+                e.progs = progs;
+                e.status = 'ready';
+            } catch (err) {
+                this.a4kFailed(e, err);
+            }
+            return e.progs;
+        }
+
+        a4kFailed(e, err) {
+            for (const x of e.list) this.deleteProgram(x.h);
+            e.list = [];
+            e.progs = null;
+            e.status = 'failed';
+            e.error = (err && err.message) || String(err);
+            console.warn('[Velostream] Anime4K CNN unavailable, using Anime4K-lite:', e.error);
+        }
+
+        /** While shaders compile in the background and no frame loop runs, re-render when ready. */
+        pollA4k() {
+            if (this.a4kTimer || this.running) return;
+            this.a4kTimer = setTimeout(() => {
+                this.a4kTimer = 0;
+                if (this.active && !this.running) this.renderOnce();
+            }, 50);
+        }
+
+        freeA4k() {
+            for (const e of Object.values(this.a4k)) for (const x of e.list) this.deleteProgram(x.h);
+            this.a4k = {};
+        }
+
+        drawAnime4K(vw, vh, W, H, out) {
+            const chain = window.VelostreamAnime4K ? this.a4kChain() : null;
+            const progs = chain && this.a4kPrograms(chain);
+            if (!progs) {
+                const e = chain && this.a4k[chain.join('+')];
+                const why = !chain ? 'anime4k.js not loaded' : !this.floatRT ? 'no float render targets'
+                    : e && e.status === 'failed' ? 'shader error' : 'compiling';
+                this.drawA4kLite(vw, vh, W, H, out);
+                return `anime4k-lite (${why})`;
+            }
+            const key = `${chain.join('+')}|${vw}x${vh}|${W}x${H}`;
+            if (!this.a4kPlanCache || this.a4kPlanCache.key !== key) this.a4kPlanCache = { key, plan: window.VelostreamAnime4K.plan(chain, vw, vh, W, H) };
+            const plan = this.a4kPlanCache.plan;
+            const gl = this.gl;
+            const slot = i => this.target(`a4k${i}`, plan.slots[i].w, plan.slots[i].h, true);
+            for (const s of plan.steps) {
+                const prog = progs[s.key];
+                const t = slot(s.out);
+                gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb);
+                gl.viewport(0, 0, s.w, s.h);
+                gl.useProgram(prog.p);
+                gl.uniform1f(prog.uFbo, 0); // vUv = picture coordinate, (0,0) top-left as in mpv
+                s.binds.forEach((b, i) => {
+                    const loc = prog.binds[i];
+                    const src = b.slot < 0 ? null : slot(b.slot);
+                    const w = src ? src.w : vw;
+                    const h = src ? src.h : vh;
+                    gl.activeTexture(gl.TEXTURE0 + i);
+                    gl.bindTexture(gl.TEXTURE_2D, src ? src.tex : this.videoTex);
+                    gl.uniform1i(loc.raw, i);
+                    gl.uniform2f(loc.size, w, h);
+                    gl.uniform2f(loc.pt, 1 / w, 1 / h);
+                    gl.uniform1f(loc.flip, src ? 1 : 0);
+                });
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            }
+            gl.activeTexture(gl.TEXTURE0);
+            // Present: Lanczos-2 from the network's output (source size, or 2x) to the display size.
+            const res = plan.result < 0 ? null : slot(plan.result);
+            this.pass(this.programs.lanczos, res ? res.tex : this.videoTex, plan.resultW, plan.resultH, out, W, H);
+            return `${this.preset} CNN (${plan.upscaled ? 'restore + upscale x2' : 'restore'})`;
+        }
+
+        /** Anime4K-lite: Lanczos-2 upscale + gradient push (no float targets needed). */
+        drawA4kLite(vw, vh, W, H, out) {
+            const P = this.programs;
+            if (W <= vw * 1.05 && H <= vh * 1.05) {
+                this.pass(P.a4k, this.videoTex, vw, vh, out, W, H);
+                return;
+            }
+            const up = this.target('up', W, H, false);
+            this.pass(P.lanczos, this.videoTex, vw, vh, up, W, H);
+            this.pass(P.a4k, up.tex, W, H, out, W, H);
         }
 
         renderOnce() {
@@ -567,11 +924,12 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.resetGuard(false);
             this.guard.strikes = strikes;
             // Two overloaded windows in a row (6 s) before stepping down: no reaction to one spike.
+            // 'off' has no entry: colour-only mode is never stepped down (it is one cheap pass).
             if (strikes >= 2 && STEP_DOWN[this.preset] !== undefined) {
                 const from = this.preset;
                 const to = STEP_DOWN[from];
                 const reason = frameMs > 14 ? `${frameMs.toFixed(1)} ms per frame` : `${dropped} dropped frames`;
-                this.configure({ preset: to });
+                this.configure({ preset: to }); // (colour grading is kept)
                 if (this.hooks.onStepDown) this.hooks.onStepDown(to, reason, from);
             }
         }
@@ -579,6 +937,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
         /** Frees every GPU object and loses the context. Idempotent; safe before init() or after a context loss. */
         destroy() {
             this.stop();
+            if (this.a4kTimer) { clearTimeout(this.a4kTimer); this.a4kTimer = 0; }
             if (this.destroyed) return;
             this.destroyed = true;
             this.canvas.removeEventListener('webglcontextlost', this.onContextLost);
@@ -595,7 +954,8 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
                         gl.useProgram(null);
                         if (this.pendingQuery) gl.deleteQuery(this.pendingQuery);
                         if (this.videoTex) gl.deleteTexture(this.videoTex);
-                        if (this.fbo) { gl.deleteFramebuffer(this.fbo.fb); gl.deleteTexture(this.fbo.tex); }
+                        this.releaseTargets();
+                        this.freeA4k();
                         for (const prog of Object.values(this.programs)) this.deleteProgram(prog);
                         if (this.vao) gl.deleteVertexArray(this.vao);
                         if (this.vbo) gl.deleteBuffer(this.vbo);
@@ -606,7 +966,8 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             }
             this.pendingQuery = null;
             this.videoTex = null;
-            this.fbo = null;
+            this.targets = new Map();
+            this.a4k = {};
             this.programs = {};
             this.vao = null;
             this.vbo = null;
@@ -615,5 +976,5 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
         }
     }
 
-    window.VelostreamShaders = Object.freeze({ VideoShaderPipeline, PRESETS, isSupported });
+    window.VelostreamShaders = Object.freeze({ VideoShaderPipeline, PRESETS, COLOR_NEUTRAL, STEP_DOWN, isSupported });
 })();

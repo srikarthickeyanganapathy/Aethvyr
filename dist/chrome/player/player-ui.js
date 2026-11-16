@@ -36,7 +36,7 @@
     const UI_SCALES = [[0.85, '85%'], [1, '100%'], [1.25, '125%'], [1.5, '150%']];
     const AUTOHIDE = [[2000, '2 seconds'], [3000, '3 seconds'], [5000, '5 seconds'], [0, 'Never']];
     const EXTERNAL_APPS = [['potplayer', 'PotPlayer', 'Windows'], ['vlc', 'VLC', 'needs vlc:// handler on desktop'], ['mpv', 'mpv', 'needs mpv:// handler'], ['iina', 'IINA', 'macOS'], ['android', 'Android video app', 'MX Player, VLC…']];
-    const GPU_PRESETS = [['off', 'Off'], ['cas', 'Fast Sharpen (CAS)'], ['fsr', 'Upscale + sharpen (FSR-style)'], ['anime4k', 'Anime line reconstruction'], ['deband', 'Deband (smooth gradients)']];
+    const GPU_PRESETS = [['off', 'Off'], ['cas', 'Fast Sharpen (CAS)'], ['fsr', 'Upscale + sharpen (FSR-style)'], ['anime4k', 'Anime4K (fast)'], ['anime4k-hq', 'Anime4K HQ (strong GPU)'], ['deblock', 'De-block + sharpen (low-res fix)'], ['denoise', 'Denoise (keeps detail)'], ['deband', 'Deband (smooth gradients)']];
     const PREBUFFER_WINDOWS = [[30, '30 seconds'], [60, '1 minute'], [300, '5 minutes'], [900, '15 minutes'], [1800, '30 minutes'], [86400, 'Whole video']];
     const CACHE_CAPS = [[256, '256 MB'], [512, '512 MB'], [1024, '1 GB'], [2048, '2 GB'], [4096, '4 GB'], [5120, '5 GB']];
     /** Settings sub-objects that are merged field by field (never replaced wholesale). */
@@ -70,7 +70,7 @@
         volUp: 'Volume up', volDown: 'Volume down', mute: 'Mute', fullscreen: 'Fullscreen',
         pip: 'Picture in Picture', captions: 'Subtitles', speedDown: 'Slower', speedUp: 'Faster',
         loopA: 'Loop point A', loopB: 'Loop point B', screenshot: 'Screenshot',
-        frameBack: 'Previous frame', frameFwd: 'Next frame', help: 'Shortcut help'
+        frameBack: 'Previous frame', frameFwd: 'Next frame', help: 'Shortcut help', transcript: 'Transcript'
     };
     const STUDIO_TABS = [['quality', 'Quality'], ['audio', 'Audio'], ['display', 'Display'], ['tools', 'Tools'], ['prefs', 'Prefs']];
 
@@ -123,6 +123,18 @@
     // Helpers
     // =====================================================================
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    /** Escaped text with case-insensitive matches of q wrapped in <mark>. */
+    const highlight = (text, q) => {
+        if (!q) return esc(text);
+        const lower = text.toLowerCase();
+        let out = '';
+        let i = 0;
+        for (let j = lower.indexOf(q); j !== -1; j = lower.indexOf(q, i)) {
+            out += `${esc(text.slice(i, j))}<mark>${esc(text.slice(j, j + q.length))}</mark>`;
+            i = j + q.length;
+        }
+        return out + esc(text.slice(i));
+    };
     /** RFC 6381 codec string -> readable name for the stats panel. */
     const codecName = (c) => {
         const s = String(c || '').toLowerCase();
@@ -557,12 +569,28 @@
                 const gain = ctx.createGain();
                 const analyser = ctx.createAnalyser();
                 analyser.fftSize = 512;
+                analyser.smoothingTimeConstant = 0.75;
+                // Loudness normalizer: slow auto-gain (driven from tickLoudness) + a peak limiter
+                // after it, so lifted quiet dialogue never clips and explosions are tamed.
+                const normGain = ctx.createGain();
+                const normLimit = ctx.createDynamicsCompressor();
+                normLimit.threshold.value = -12;
+                normLimit.knee.value = 8;
+                normLimit.ratio.value = 6;
+                normLimit.attack.value = 0.004;
+                normLimit.release.value = 0.3;
+                const out = ctx.createGain(); // processing exit; the spatial stage reads from it
+                const post = ctx.createGain(); // after the spatial stage; channel routing hangs off it
                 this.ctx = ctx;
-                this.nodes = { source, delay, eq, comp, gain, analyser, compressing: null };
+                this.nodes = { source, delay, eq, comp, gain, analyser, normGain, normLimit, out, post, compressing: null, normalizing: null, spatialKey: null };
                 source.connect(delay);
                 delay.connect(eq[0]);
                 for (let i = 0; i < eq.length - 1; i++) eq[i].connect(eq[i + 1]);
-                gain.connect(analyser);
+                gain.connect(analyser);           // measured before the normalizer (no feedback)
+                normGain.connect(normLimit);
+                this._routeNorm(false);
+                this._routeSpatial({ width: 100, crossfeed: false, dialogue: 0 });
+                this.loud = { energy: 0, primed: false };
                 this.channels = null;
                 this._routeChannels('stereo');
                 this._route(false);
@@ -585,12 +613,146 @@
             n.compressing = compress;
         }
 
+        /** gain -> out directly, or gain -> normGain -> normLimit -> out. */
+        _routeNorm(on) {
+            const n = this.nodes;
+            if (!n || n.normalizing === on) return;
+            try { n.gain.disconnect(n.out); } catch (_) { /* not connected */ }
+            try { n.gain.disconnect(n.normGain); } catch (_) { /* not connected */ }
+            try { n.normLimit.disconnect(); } catch (_) { /* not connected */ }
+            if (on) {
+                n.gain.connect(n.normGain);
+                n.normLimit.connect(n.out);
+            } else {
+                n.gain.connect(n.out);
+                n.normGain.gain.value = 1;
+                if (this.loud) this.loud.primed = false;
+            }
+            n.normalizing = on;
+        }
+
+        /**
+         * Smart loudness, called ~4×/s: track the programme level (energy average over ~3 s, gated
+         * below -45 dBFS so silence and pauses do not pull the gain up) and steer normGain toward a
+         * -20 dBFS RMS target (≈ -16 LUFS for typical dialogue), within ±12 dB, with a slow time
+         * constant so speech does not "pump". The limiter after it catches transients.
+         */
+        tickLoudness() {
+            const n = this.nodes;
+            if (!n || !n.normalizing || !this.ctx || this.video.paused) return;
+            const level = this.rms();
+            const db = 20 * Math.log10(Math.max(level, 1e-6));
+            if (db < -45) return; // silence / pause: hold the current gain
+            const L = this.loud;
+            const e = level * level;
+            L.energy = L.primed ? L.energy * 0.92 + e * 0.08 : e;
+            L.primed = true;
+            const progDb = 10 * Math.log10(Math.max(L.energy, 1e-12));
+            const wantDb = clamp(-20 - progDb, -12, 12);
+            n.normGain.gain.setTargetAtTime(Math.pow(10, wantDb / 20), this.ctx.currentTime, 1.2);
+        }
+
+        /**
+         * Spatial stage between `out` and `post`:
+         *   width     L' = a·L + b·R, R' = a·R + b·L with a = (1+w)/2, b = (1-w)/2 (mid/side scaling;
+         *             w = 0 mono, 1 as recorded, 2 extra wide);
+         *   dialogue  the centre (mid = (L+R)/2) band-passed around 2 kHz and added back to both
+         *             sides, so voices lift without touching music/effects panned to the sides;
+         *   crossfeed each side delayed 0.3 ms, low-passed at 700 Hz and mixed into the other at
+         *             -9 dB (Bauer-style), so hard-panned headphone mixes stop sounding "inside the head".
+         * Neutral settings bypass the stage entirely (out -> post), costing nothing.
+         */
+        _routeSpatial(a) {
+            const n = this.nodes;
+            if (!n) return;
+            const w = clamp((+a.width || 100) / 100, 0, 2);
+            const dlg = clamp(+a.dialogue || 0, 0, 100) / 100;
+            const cf = !!a.crossfeed;
+            const neutral = Math.abs(w - 1) < 0.005 && !dlg && !cf;
+            const key = neutral ? 'bypass' : 'spatial';
+            const ctx = this.ctx;
+            if (n.spatialKey !== key) {
+                try { n.out.disconnect(n.post); } catch (_) { /* not connected */ }
+                if (n.sp) { for (const node of Object.values(n.sp)) { try { node.disconnect(); } catch (_) { /* ignore */ } } }
+                n.sp = null;
+                if (neutral) {
+                    n.out.connect(n.post);
+                } else {
+                    const up = ctx.createGain(); // upmix mono sources to L=R before splitting
+                    up.channelCount = 2;
+                    up.channelCountMode = 'explicit';
+                    up.channelInterpretation = 'speakers';
+                    const split = ctx.createChannelSplitter(2);
+                    const merge = ctx.createChannelMerger(2);
+                    const ll = ctx.createGain();
+                    const rl = ctx.createGain();
+                    const rr = ctx.createGain();
+                    const lr = ctx.createGain();
+                    const midL = ctx.createGain();
+                    const midR = ctx.createGain();
+                    const mid = ctx.createGain();
+                    mid.channelCount = 1;
+                    mid.channelCountMode = 'explicit';
+                    const band = ctx.createBiquadFilter();
+                    band.type = 'bandpass';
+                    band.frequency.value = 2000;
+                    band.Q.value = 0.8;
+                    const dGain = ctx.createGain();
+                    const dL = ctx.createDelay(0.01);
+                    const dR = ctx.createDelay(0.01);
+                    dL.delayTime.value = 0.0003;
+                    dR.delayTime.value = 0.0003;
+                    const lpL = ctx.createBiquadFilter();
+                    const lpR = ctx.createBiquadFilter();
+                    lpL.type = lpR.type = 'lowpass';
+                    lpL.frequency.value = lpR.frequency.value = 700;
+                    const cfL = ctx.createGain();
+                    const cfR = ctx.createGain();
+                    n.out.connect(up);
+                    up.connect(split);
+                    split.connect(ll, 0); split.connect(rl, 1); ll.connect(merge, 0, 0); rl.connect(merge, 0, 0);
+                    split.connect(rr, 1); split.connect(lr, 0); rr.connect(merge, 0, 1); lr.connect(merge, 0, 1);
+                    split.connect(midL, 0); split.connect(midR, 1); midL.connect(mid); midR.connect(mid);
+                    mid.connect(band); band.connect(dGain); dGain.connect(merge, 0, 0); dGain.connect(merge, 0, 1);
+                    split.connect(dL, 0); dL.connect(lpL); lpL.connect(cfL); cfL.connect(merge, 0, 1);
+                    split.connect(dR, 1); dR.connect(lpR); lpR.connect(cfR); cfR.connect(merge, 0, 0);
+                    merge.connect(n.post);
+                    n.sp = { up, split, merge, ll, rl, rr, lr, midL, midR, mid, band, dGain, dL, dR, lpL, lpR, cfL, cfR };
+                }
+                n.spatialKey = key;
+            }
+            if (!n.sp) return;
+            const t = ctx.currentTime;
+            const sp = n.sp;
+            const A = (1 + w) / 2;
+            const B = (1 - w) / 2;
+            sp.ll.gain.setTargetAtTime(A, t, 0.05);
+            sp.rr.gain.setTargetAtTime(A, t, 0.05);
+            sp.rl.gain.setTargetAtTime(B, t, 0.05);
+            sp.lr.gain.setTargetAtTime(B, t, 0.05);
+            sp.midL.gain.value = 0.5;
+            sp.midR.gain.value = 0.5;
+            sp.dGain.gain.setTargetAtTime(dlg * 2.5, t, 0.05); // up to about +9 dB at 2 kHz on the centre
+            const c = cf ? 0.35 : 0;
+            sp.cfL.gain.setTargetAtTime(c, t, 0.05);
+            sp.cfR.gain.setTargetAtTime(c, t, 0.05);
+        }
+
+        /** Frequency magnitudes (0-255) for the visualizer, or null without an audio graph. */
+        spectrum() {
+            if (!this.nodes) return null;
+            const a = this.nodes.analyser;
+            if (!this.freq || this.freq.length !== a.frequencyBinCount) this.freq = new Uint8Array(a.frequencyBinCount);
+            a.getByteFrequencyData(this.freq);
+            return this.freq;
+        }
+
         /** Output channel mode: stereo (as is), mono (downmix), left / right only (on both speakers). */
         _routeChannels(mode) {
             const n = this.nodes;
             if (!n || this.channels === mode) return;
             const ctx = this.ctx;
-            try { n.gain.disconnect(ctx.destination); } catch (_) { /* not connected */ }
+            try { n.post.disconnect(ctx.destination); } catch (_) { /* not connected */ }
             if (n.chan) { for (const node of Object.values(n.chan)) { try { node.disconnect(); } catch (_) { /* ignore */ } } }
             n.chan = null;
             if (mode === 'mono') {
@@ -598,20 +760,20 @@
                 down.channelCount = 1;
                 down.channelCountMode = 'explicit';
                 down.channelInterpretation = 'speakers';
-                n.gain.connect(down);
+                n.post.connect(down);
                 down.connect(ctx.destination);
                 n.chan = { down };
             } else if (mode === 'left' || mode === 'right') {
                 const split = ctx.createChannelSplitter(2);
                 const merge = ctx.createChannelMerger(2);
                 const ch = mode === 'left' ? 0 : 1;
-                n.gain.connect(split);
+                n.post.connect(split);
                 split.connect(merge, ch, 0);
                 split.connect(merge, ch, 1);
                 merge.connect(ctx.destination);
                 n.chan = { split, merge };
             } else {
-                n.gain.connect(ctx.destination);
+                n.post.connect(ctx.destination);
             }
             this.channels = mode;
         }
@@ -619,6 +781,8 @@
         apply(audio) {
             if (!this.ctx) return;
             this._routeChannels(audio.channels || 'stereo');
+            this._routeNorm(!!audio.loudnessNorm);
+            this._routeSpatial({ width: audio.width ?? 100, crossfeed: !!audio.crossfeed, dialogue: audio.dialogue || 0 });
             const preset = AUDIO_PRESETS[audio.preset] || AUDIO_PRESETS.normal;
             const gains = audio.preset === 'custom' ? (audio.eq || [0, 0, 0, 0, 0]) : preset.eq;
             const n = this.nodes;
@@ -850,6 +1014,25 @@ button:disabled { opacity: 0.4; cursor: default; }
 .audio-poster { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px; color: var(--fs-text-2); }
 .audio-poster svg { width: 64px; height: 64px; color: var(--fs-accent); }
 .root.audio-only .audio-poster { display: flex; }
+.transcript { position: absolute; z-index: 10; right: max(calc(var(--u) * 16), env(safe-area-inset-right)); top: calc(max(calc(var(--u) * 20), env(safe-area-inset-top)) + 56px); bottom: calc(var(--deck-h, 110px) + 12px); width: min(calc(var(--u) * 340), calc(100% - 32px)); display: flex; flex-direction: column; border-radius: 20px; padding: 12px; gap: 8px; color: var(--fs-text); }
+.transcript[hidden], .root.mini .transcript, .root.locked .transcript { display: none; }
+.tr-head { display: flex; align-items: center; gap: 8px; }
+.tr-head h2 { flex: 1; margin: 0; font-size: 15px; font-weight: 600; }
+.tr-count { font-size: 12px; color: var(--fs-text-2); }
+.tr-tools { display: flex; align-items: center; gap: 8px; }
+.tr-search { flex: 1; min-width: 0; height: 36px; padding: 0 14px; border-radius: 9999px; border: var(--fs-glass-border); background: rgba(255, 255, 255, 0.08); color: var(--fs-text); font: inherit; font-size: 14px; }
+.tr-search:focus-visible { outline: 2px solid var(--fs-accent); outline-offset: 2px; }
+.tr-follow[aria-pressed="false"] { opacity: 0.6; }
+.tr-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; overscroll-behavior: contain; scroll-behavior: smooth; }
+.root[data-rm="on"] .tr-list { scroll-behavior: auto; }
+.tr-row { display: grid; grid-template-columns: auto 1fr; gap: 8px; width: 100%; text-align: left; padding: 8px 10px; border: 0; border-radius: 12px; background: transparent; color: var(--fs-text-2); font: inherit; font-size: 14px; line-height: 1.4; cursor: pointer; }
+.tr-row:hover { background: rgba(255, 255, 255, 0.08); }
+.tr-row:focus-visible { outline: 2px solid var(--fs-accent); outline-offset: -2px; }
+.tr-row.active { background: rgba(255, 255, 255, 0.14); color: var(--fs-text); }
+.tr-row .tr-time { font-variant-numeric: tabular-nums; color: var(--fs-accent); font-size: 12px; padding-top: 2px; }
+.tr-row mark { background: var(--fs-accent); color: #fff; border-radius: 4px; padding: 0 2px; }
+.audio-viz { width: min(280px, 70%); height: 80px; }
+.audio-viz[hidden] { display: none; }
 .gesture { position: absolute; inset: 0; touch-action: none; }
 .subs { position: absolute; left: 6%; right: 6%; display: flex; flex-direction: column; align-items: center; gap: 4px; pointer-events: none; text-align: center; z-index: 4; transition: transform 300ms var(--fs-spring); }
 .subs.subs-top { top: max(56px, 9%); bottom: auto !important; transform: none !important; }
@@ -1149,6 +1332,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.stream = init.stream;
             this.rawSettings = cloneSettings(settingsMsg.settings);
             this.recomputeSettings();
+            if (!this.settings.hwTier) this.applyHardwareTier(false); // first run on this device
             if (this.profile) this.island('studio', `Site profile · ${this.profile.host}`, null, 2500);
             this.tabId = init.tabId;
             this.sessionId = init.sessionId;
@@ -1171,6 +1355,57 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.checkResume();
             this.autoSelectCaptured();
             this.loadChapters();
+        }
+
+        /**
+         * Rough device class from CPU cores, memory (Chromium only), touch + screen size and the
+         * WebGL renderer. Low: phones/tablets with little memory, software or weak mobile GPUs.
+         * High: desktops with many cores, plenty of memory and a discrete-class GPU.
+         */
+        detectHardwareTier() {
+            const cores = navigator.hardwareConcurrency || 4;
+            const mem = navigator.deviceMemory || 0; // 0 = unknown (Firefox)
+            const coarse = matchMedia('(pointer: coarse)').matches;
+            const small = Math.min(screen.width || 0, screen.height || 0) < 600;
+            let gpu = 1;
+            let renderer = '';
+            try {
+                const gl = document.createElement('canvas').getContext('webgl2');
+                if (!gl) gpu = 0;
+                else {
+                    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+                    renderer = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || '');
+                    if (/SwiftShader|llvmpipe|Microsoft Basic Render|Mali-[T4]|Adreno \(TM\) [3-5]\d\d|PowerVR/i.test(renderer)) gpu = 0;
+                    else if (/RTX|GTX 1[6-9]|Radeon RX|Radeon Pro|Arc A|Apple M\d/i.test(renderer)) gpu = 2;
+                    const lose = gl.getExtension('WEBGL_lose_context');
+                    if (lose) lose.loseContext();
+                }
+            } catch (_) { gpu = 0; }
+            let tier = 'standard';
+            if ((mem && mem <= 2) || cores <= 2 || gpu === 0 || (coarse && small && (cores <= 4 || (mem && mem <= 4)))) tier = 'low';
+            else if (!coarse && cores >= 8 && (!mem || mem >= 8) && gpu === 2) tier = 'high';
+            return { tier, cores, mem, coarse, renderer };
+        }
+
+        /**
+         * Tune the engine/player buffers to the device. On first run only settings still at their
+         * defaults are changed (never a value the user picked); `force` (Prefs › Re-detect) applies
+         * the tier's values regardless.
+         */
+        applyHardwareTier(force) {
+            const info = this.detectHardwareTier();
+            const D = window.VelostreamShared.DEFAULT_SETTINGS;
+            const TUNE = {
+                low: { maxWorkers: 3, cacheSizeMB: 512, mseBufferAhead: 30, mseBufferBehind: 15, maxRenderRes: 1080 },
+                standard: {},
+                high: { maxWorkers: 8, cacheSizeMB: 4096, mseBufferAhead: 60 }
+            }[info.tier];
+            const patch = { hwTier: info.tier };
+            const raw = this.rawSettings || {};
+            for (const [k, v] of Object.entries(TUNE)) if (force || raw[k] === D[k]) patch[k] = v;
+            this.saveSettings(patch);
+            this.hwInfo = info;
+            if (force) this.announce(`Device tier: ${info.tier}${Object.keys(patch).length > 1 ? ' · settings re-tuned' : ''}`, 'studio');
         }
 
         /** Splits captured site tracks into subtitles and chapters; true when chapters changed. */
@@ -1702,7 +1937,23 @@ input[type="text"] { width: 100%; min-width: 0; }
                     break;
                 }
                 case 'INIT':
+                    if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
                     if (this.resolveInit) { this.resolveInit(msg); this.resolveInit = null; }
+                    break;
+                case 'STREAMS': {
+                    const before = (this.tabStreams || []).map(s => s.id).join();
+                    this.tabStreams = Array.isArray(msg.streams) ? msg.streams : [];
+                    if (this.popKind === 'studio' && before !== this.tabStreams.map(s => s.id).join()) this.refreshPopover();
+                    break;
+                }
+                case 'STREAM_SWITCHED':
+                    this.finishStreamSwitch(msg);
+                    break;
+                case 'SWITCH_FAILED':
+                    this.switching = false;
+                    this.hideIsland();
+                    this.setStatus(this.video.paused ? 'paused' : 'playing');
+                    this.announce(msg.error || 'Could not switch stream', 'warn');
                     break;
                 case 'STATS':
                     this.engineStats = msg.stats;
@@ -1766,7 +2017,7 @@ input[type="text"] { width: 100%; min-width: 0; }
   <div class="stage">
     <canvas class="ambient-canvas" width="32" height="18" aria-hidden="true"></canvas>
     <div class="vbox"><video playsinline webkit-playsinline preload="auto" aria-label="Video"></video><canvas class="gl-canvas" hidden aria-hidden="true"></canvas></div>
-    <div class="audio-poster" aria-hidden="true">${icon('headphones', 64)}<span>Audio-only mode</span></div>
+    <div class="audio-poster" aria-hidden="true">${icon('headphones', 64)}<span>Audio-only mode</span><canvas class="audio-viz" width="280" height="80" hidden></canvas></div>
     <div class="subs" aria-hidden="true"></div>
     <div class="subs subs-top" aria-hidden="true"></div>
     <div class="gesture" aria-hidden="true"></div>
@@ -1777,6 +2028,22 @@ input[type="text"] { width: 100%; min-width: 0; }
   <div class="sr-only" aria-live="polite" aria-atomic="true" id="fs-live"></div>
   <div class="island" aria-hidden="true"><span class="i-icon"></span><span class="i-text"></span><span class="i-bar"><i></i></span></div>
   <div class="stats glass elevated" role="group" aria-label="Stream statistics"><dl></dl></div>
+  <aside class="transcript glass elevated" hidden aria-labelledby="tr-title">
+    <div class="tr-head">
+      <h2 id="tr-title">Transcript</h2>
+      <span class="tr-count num" aria-live="polite"></span>
+      <button type="button" class="ib tr-close" aria-label="Close transcript">${icon('close', 18)}</button>
+    </div>
+    <div class="tr-tools">
+      <label class="sr-only" for="tr-search">Search transcript</label>
+      <input type="search" id="tr-search" class="tr-search" placeholder="Search transcript…" autocomplete="off" spellcheck="false">
+      <button type="button" class="pillbtn tr-follow" aria-pressed="true">Follow</button>
+      <button type="button" class="ib tr-copy" aria-label="Copy transcript text">${icon('copy', 18)}</button>
+      <button type="button" class="ib tr-export" aria-label="Save transcript as .srt">${icon('download', 18)}</button>
+    </div>
+    <ol class="tr-list" aria-label="Transcript lines"></ol>
+    <p class="tr-empty hint" hidden></p>
+  </aside>
 
   <div class="chrome">
     <header class="topgrid">
@@ -2146,6 +2413,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (!document.pictureInPictureEnabled) this.$('.btn-pip').hidden = true;
 
             this.bindTimeline();
+            this.bindTranscript();
             this.bindGestures();
             this.bindSubtitleInteraction();
             this.bindKeyboard();
@@ -2498,15 +2766,25 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (this.gpu) { if (on) this.gpu.stop(); else if (this.gpu.active && !this.video.paused) this.gpu.start(); }
             this.$('.btn-audio-only').setAttribute('aria-pressed', String(on));
             if (this.player && this.mode === 'mse') {
+                // Switching to / from an audio-only rendition makes Shaka rebuild its media
+                // pipeline, which can leave the element paused: resume if it was playing.
+                const v = this.video;
+                if (!v.paused) {
+                    const gen = (this.audioOnlyGen = (this.audioOnlyGen || 0) + 1);
+                    const resume = () => { if (gen === this.audioOnlyGen && !this.closed && v.paused && !v.ended) v.play().catch(() => { }); };
+                    v.addEventListener('canplay', resume, { once: true });
+                    this.later(600, resume);
+                }
                 if (on) {
                     this.prevAbr = { auto: this.abrAuto, id: this.lockedVariantId };
                     const tracks = this.currentVariants();
                     const audioOnlyTrack = tracks.find(t => !t.videoCodec && !t.height);
                     const lowest = audioOnlyTrack || tracks.slice().sort((a, b) => a.bandwidth - b.bandwidth)[0];
-                    if (lowest) this.selectQuality(lowest.id, false);
+                    // No buffer flush: audio-only saves data from the next segment on, without a stall.
+                    if (lowest) this.selectQuality(lowest.id, false, false);
                 } else if (this.prevAbr) {
                     if (this.prevAbr.auto) this.selectQuality('auto', false);
-                    else if (this.prevAbr.id != null) this.selectQuality(this.prevAbr.id, false);
+                    else if (this.prevAbr.id != null) this.selectQuality(this.prevAbr.id, false, false);
                 }
             }
             this.announce(on ? 'Audio-only battery saver on' : 'Audio-only mode off', 'headphones');
@@ -2721,7 +2999,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             chip.hidden = !chip.textContent;
         }
 
-        selectQuality(id, announce = true) {
+        /** @param {boolean} [clearBuffer] false: switch from the next segment (no rebuffer). */
+        selectQuality(id, announce = true, clearBuffer = true) {
             if (!this.player) return;
             if (id === 'auto') {
                 this.abrAuto = true;
@@ -2733,7 +3012,8 @@ input[type="text"] { width: 100%; min-width: 0; }
                 if (!t) return;
                 this.abrAuto = false;
                 this.lockedVariantId = id;
-                this.player.selectVariantTrack(t, true);
+                // Re-selecting the playing track with clearBuffer would only throw the buffer away.
+                if (!t.active) this.player.selectVariantTrack(t, clearBuffer);
                 this.port.send({ type: 'SET_QUALITY', mode: 'lock', variantId: id });
                 if (announce) this.announce(`${this.qualityName(t)} (${fmtBitrate(t.bandwidth)})`, 'studio');
             }
@@ -3038,9 +3318,21 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (this.vbox) this.vbox.classList.remove('gl-on');
         }
 
+        /** Color Studio values in pipeline units (gamma as a factor), or null when neutral. */
+        gpuColor() {
+            const c = (this.settings && this.settings.color) || {};
+            const v = {
+                gamma: (c.gamma ?? 100) / 100, vibrance: c.vibrance || 0, temperature: c.temperature || 0,
+                tint: c.tint || 0, shadows: c.shadows || 0, highlights: c.highlights || 0
+            };
+            const neutral = Math.abs(v.gamma - 1) < 0.005 && !v.vibrance && !v.temperature && !v.tint && !v.shadows && !v.highlights;
+            return neutral ? null : v;
+        }
+
         applyGpu() {
             const want = this.effectiveShader();
-            if (want.preset === 'off' && !this.gpu) return;
+            const color = this.gpuBlocked ? null : this.gpuColor();
+            if (want.preset === 'off' && !color && !this.gpu) return;
             if (!this.gpu) {
                 if (!window.VelostreamShaders || !this.glCanvas) { this.gpuBlocked = 'unavailable'; return; }
                 // A destroyed pipeline called WEBGL_lose_context on its canvas, and getContext()
@@ -3055,7 +3347,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 this.glCanvasUsed = true;
                 this.gpu =new window.VelostreamShaders.VideoShaderPipeline(this.video, this.glCanvas, {
                     onStepDown: (to) => {
-                        const names = { cas: 'Fast Sharpen', off: 'Off' };
+                        const names = { cas: 'Fast Sharpen', off: 'Off', anime4k: 'Anime4K (fast)' };
                         this.gpuOverride = to;   // this session only; the saved choice is kept
                         this.island('studio', `GPU load high · Stepped down to ${names[to] || to}`, null, 3500);
                         this.applyFilters();
@@ -3071,7 +3363,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                     }
                 });
             }
-            const on = this.gpu.configure({ preset: want.preset, strength: want.strength, maxRenderRes: this.settings.maxRenderRes || 2160 });
+            const on = this.gpu.configure({ preset: want.preset, strength: want.strength, maxRenderRes: this.settings.maxRenderRes || 2160, color: color || {} });
             this.vbox.classList.toggle('gl-on', on);
             if (on) {
                 this.layoutVideo();
@@ -3752,6 +4044,9 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.subs.render(v.currentTime);
             if (!this.dragging) this.renderTimeline();
             this.updateAmbient(false);
+            if (this.audio.active) this.audio.tickLoudness();
+            this.updateViz();
+            if (this.transcriptOpen) { this.renderTranscript(false); this.updateTranscriptActive(false); }
             this.tickCount = (this.tickCount || 0) + 1;
             if (this.tickCount % 2 === 0 && this.settings) this.checkSmartSkip();
         }
@@ -3773,6 +4068,226 @@ input[type="text"] { width: 100%; min-width: 0; }
                 const ctx = this.ambientCtx || (this.ambientCtx = c.getContext('2d', { alpha: false }));
                 ctx.drawImage(v, 0, 0, c.width, c.height);
             } catch (_) { /* frame not ready */ }
+        }
+
+        // -----------------------------------------------------------------
+        // Transcript drawer: every cue of the active subtitle track, live highlight, search, export
+        // -----------------------------------------------------------------
+        bindTranscript() {
+            const d = this.$('.transcript');
+            if (!d) return;
+            this.trFollow = true;
+            this.listen(d.querySelector('.tr-close'), 'click', () => this.toggleTranscript(false));
+            const search = d.querySelector('.tr-search');
+            let timer = 0;
+            this.listen(search, 'input', () => { clearTimeout(timer); timer = setTimeout(() => this.renderTranscript(true), 120); });
+            this.listen(search, 'keydown', (e) => {
+                if (e.key !== 'Enter') return;
+                e.preventDefault();
+                const first = d.querySelector('.tr-row');
+                if (first) first.focus();
+            });
+            const follow = d.querySelector('.tr-follow');
+            this.listen(follow, 'click', () => this.setTranscriptFollow(!this.trFollow, true));
+            this.listen(d.querySelector('.tr-copy'), 'click', () => {
+                const cues = this.subs.activeCues() || [];
+                if (!cues.length) return;
+                this.copyText(cues.map(c => `[${fmtTime(this.cueMediaTime(c.start) - this.seekRange().start)}] ${c.text.replace(/\n/g, ' ')}`).join('\n'), 'Transcript copied');
+            });
+            this.listen(d.querySelector('.tr-export'), 'click', () => this.exportTranscriptSrt());
+            const list = d.querySelector('.tr-list');
+            // A manual scroll pauses following the spoken line; "Follow" resumes it.
+            const manual = () => { if (this.trFollow) this.setTranscriptFollow(false, false); };
+            this.listen(list, 'wheel', manual, { passive: true });
+            this.listen(list, 'touchmove', manual, { passive: true });
+            this.listen(list, 'keydown', (e) => { if (/^(Arrow(Up|Down)|Page(Up|Down)|Home|End)$/.test(e.key)) manual(); });
+            this.listen(list, 'click', (e) => {
+                const row = e.target.closest && e.target.closest('.tr-row');
+                if (!row) return;
+                const cues = this.subs.activeCues() || [];
+                const c = cues[+row.dataset.i];
+                if (!c) return;
+                this.seekTo(this.cueMediaTime(c.start) + 0.01, true);
+                if (this.video.paused) this.subs.render(this.video.currentTime);
+            });
+            // Keep page shortcuts out of the drawer (typing in search, arrowing the list).
+            this.listen(d, 'keydown', (e) => { if (e.key !== 'Escape' && e.key !== 'Tab') e.stopPropagation(); });
+        }
+
+        /** Subtitle-file time -> media time (inverse of SubtitleEngine.cueTime). */
+        cueMediaTime(t) { return t * (this.subs.speed || 1) + this.subs.offset; }
+
+        setTranscriptFollow(on, announce) {
+            this.trFollow = on;
+            const b = this.$('.tr-follow');
+            if (b) b.setAttribute('aria-pressed', String(on));
+            if (announce) this.announceOnly(on ? 'Following the spoken line' : 'Stopped following');
+            if (on) this.updateTranscriptActive(true);
+        }
+
+        toggleTranscript(on = !this.transcriptOpen) {
+            const d = this.$('.transcript');
+            if (!d) return;
+            this.transcriptOpen = !!on;
+            d.hidden = !on;
+            if (on) {
+                this.trSig = '';
+                this.renderTranscript(true);
+                this.setTranscriptFollow(true, false);
+                this.showControls(true);
+                d.querySelector('.tr-search').focus({ preventScroll: true });
+                this.announceOnly('Transcript opened');
+            } else {
+                this.announceOnly('Transcript closed');
+                if (this.root.contains(this.shadow.activeElement) || d.contains(this.shadow.activeElement)) this.$('.btn-cc').focus({ preventScroll: true });
+                this.scheduleHide();
+            }
+            if (this.popKind === 'captions') this.refreshPopover();
+        }
+
+        renderTranscript(force) {
+            if (!this.transcriptOpen) return;
+            const d = this.$('.transcript');
+            const cues = this.subs.source !== 'off' ? (this.subs.activeCues() || []) : [];
+            const q = d.querySelector('.tr-search').value.trim().toLowerCase();
+            const last = cues[cues.length - 1];
+            const sig = `${this.subs.source}|${cues.length}|${cues[0] ? cues[0].start : ''}|${last ? last.end : ''}|${this.subs.offset}|${this.subs.speed}|${q}`;
+            if (!force && sig === this.trSig) return;
+            this.trSig = sig;
+            const list = d.querySelector('.tr-list');
+            const empty = d.querySelector('.tr-empty');
+            const count = d.querySelector('.tr-count');
+            if (!cues.length) {
+                setHTML(list, '');
+                empty.hidden = false;
+                empty.textContent = this.subs.source === 'off' ? 'Turn on subtitles (C) to see the transcript.' : 'No subtitle lines loaded yet.';
+                count.textContent = '';
+                this.trActive = -1;
+                return;
+            }
+            empty.hidden = true;
+            const r0 = this.seekRange().start;
+            const parts = [];
+            let matches = 0;
+            for (let i = 0; i < cues.length; i++) {
+                const text = cues[i].text.replace(/\n/g, ' ');
+                if (q && !text.toLowerCase().includes(q)) continue;
+                matches++;
+                parts.push(`<li><button type="button" class="tr-row" data-i="${i}"><span class="tr-time">${fmtTime(Math.max(0, this.cueMediaTime(cues[i].start) - r0))}</span><span class="tr-text">${highlight(text, q)}</span></button></li>`);
+            }
+            setHTML(list, parts.join(''));
+            count.textContent = q ? `${matches} / ${cues.length}` : `${cues.length} lines`;
+            if (q && !matches) { empty.hidden = false; empty.textContent = `No lines contain “${d.querySelector('.tr-search').value.trim()}”.`; }
+            this.trActive = -1;
+            this.updateTranscriptActive(true);
+        }
+
+        /** Highlight the line being spoken (or the last one before now) and keep it in view. */
+        updateTranscriptActive(force) {
+            if (!this.transcriptOpen) return;
+            const cues = this.subs.activeCues() || [];
+            if (!cues.length) return;
+            const t = this.subs.cueTime(this.video.currentTime);
+            let lo = 0;
+            let hi = cues.length - 1;
+            let idx = -1;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (cues[mid].start <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+            }
+            if (idx === this.trActive && !force) return;
+            const list = this.$('.tr-list');
+            const prev = list.querySelector('.tr-row.active');
+            if (prev) { prev.classList.remove('active'); prev.removeAttribute('aria-current'); }
+            this.trActive = idx;
+            if (idx < 0) return;
+            const row = list.querySelector(`.tr-row[data-i="${idx}"]`);
+            if (!row) return;
+            row.classList.add('active');
+            row.setAttribute('aria-current', 'true');
+            if (!this.trFollow) return;
+            // Scroll the list only (scrollIntoView could also scroll the page around the player).
+            const top = row.offsetTop - list.offsetTop;
+            if (top < list.scrollTop + 8 || top + row.offsetHeight > list.scrollTop + list.clientHeight - 8) {
+                list.scrollTop = Math.max(0, top - list.clientHeight / 3);
+            }
+        }
+
+        exportTranscriptSrt() {
+            const cues = this.subs.activeCues() || [];
+            if (!cues.length) { this.announce('No subtitle lines to save', 'warn'); return; }
+            const ts = (s) => {
+                const ms = Math.max(0, Math.round(s * 1000));
+                const p = (n, w) => String(n).padStart(w, '0');
+                return `${p(Math.floor(ms / 3600000), 2)}:${p(Math.floor(ms / 60000) % 60, 2)}:${p(Math.floor(ms / 1000) % 60, 2)},${p(ms % 1000, 3)}`;
+            };
+            // Times as heard in this video: the subtitle offset and speed are baked in.
+            const srt = cues.map((c, i) => `${i + 1}\n${ts(this.cueMediaTime(c.start))} --> ${ts(this.cueMediaTime(c.end))}\n${c.text}\n`).join('\n');
+            const name = `${safeFilename(this.$('.title').textContent || 'video')}.srt`;
+            downloadBlob(this.shadow, new Blob([srt], { type: 'application/x-subrip' }), name, true);
+            this.announce('Transcript saved as .srt', 'download');
+        }
+
+        /**
+         * Audio-only visualizer: 24 mirrored pill bars from the analyser spectrum. Runs on rAF only
+         * while audio-only + playing + visible + the Web Audio graph exists; with reduced motion it
+         * redraws at the 4 Hz tick instead. Hidden when there is no audio graph (non-CORS file or
+         * before the first tap), since then there is nothing to measure.
+         */
+        updateViz() {
+            const c = this.vizCanvas || (this.vizCanvas = this.$('.audio-viz'));
+            if (!c) return;
+            const run = this.audioOnly && this.audio.active && !this.video.paused && !document.hidden;
+            c.hidden = !(this.audioOnly && this.audio.active);
+            if (!run) { if (this.vizRaf) { cancelAnimationFrame(this.vizRaf); this.vizRaf = 0; } return; }
+            const s = this.settings || {};
+            const reduced = s.reducedMotion === 'on' || (s.reducedMotion !== 'off' && matchMedia('(prefers-reduced-motion: reduce)').matches);
+            if (reduced) { if (this.vizRaf) { cancelAnimationFrame(this.vizRaf); this.vizRaf = 0; } this.drawViz(); return; }
+            if (this.vizRaf) return;
+            const loop = () => {
+                this.vizRaf = 0;
+                if (this.closed || !(this.audioOnly && this.audio.active && !this.video.paused && !document.hidden)) return;
+                this.drawViz();
+                this.vizRaf = requestAnimationFrame(loop);
+            };
+            this.vizRaf = requestAnimationFrame(loop);
+        }
+
+        drawViz() {
+            const c = this.vizCanvas;
+            const spec = this.audio.spectrum();
+            if (!c || !spec) return;
+            const dpr = Math.min(2, window.devicePixelRatio || 1);
+            const W = Math.round(c.clientWidth * dpr) || 280;
+            const H = Math.round(c.clientHeight * dpr) || 80;
+            if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+            const ctx = this.vizCtx || (this.vizCtx = c.getContext('2d'));
+            ctx.clearRect(0, 0, W, H);
+            if (!this.vizColor || this.vizColorAt !== this.settings.theme) {
+                this.vizColor = getComputedStyle(this.root).getPropertyValue('--fs-accent').trim() || '#0A84FF';
+                this.vizColorAt = this.settings.theme;
+            }
+            ctx.fillStyle = this.vizColor;
+            const bars = 24;
+            const gap = W / bars * 0.35;
+            const bw = W / bars - gap;
+            // Log-spaced bins from ~60 Hz to ~12 kHz (bin width = sampleRate / fftSize).
+            const n = spec.length;
+            const lo = 2;
+            const hi = Math.max(lo + bars, Math.floor(n * 0.55));
+            for (let i = 0; i < bars; i++) {
+                const a = Math.floor(lo * Math.pow(hi / lo, i / bars));
+                const b = Math.max(a + 1, Math.floor(lo * Math.pow(hi / lo, (i + 1) / bars)));
+                let m = 0;
+                for (let k = a; k < b && k < n; k++) m = Math.max(m, spec[k]);
+                const h = Math.max(bw, (m / 255) * H * 0.92);
+                const x = i * (bw + gap) + gap / 2;
+                const y = (H - h) / 2; // mirrored around the centre line
+                const r = Math.min(bw / 2, h / 2);
+                ctx.beginPath();
+                if (ctx.roundRect) ctx.roundRect(x, y, bw, h, r); else ctx.rect(x, y, bw, h);
+                ctx.fill();
+            }
         }
 
         onSecond() {
@@ -4064,8 +4579,11 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (gpu) {
                 const g = gpu.guard || {};
                 const ms = g.gpuN ? g.gpu / g.gpuN : (g.frames ? g.cpu / g.frames : 0);
-                const preset = (GPU_PRESETS.find(p => p[0] === this.effectiveShader().preset) || ['', 'On'])[1];
-                gpuText = `${preset} · ${this.glCanvas.width}×${this.glCanvas.height}${ms ? ` · ${ms.toFixed(1)} ms/frame` : ''}`;
+                const eff = this.effectiveShader().preset;
+                const preset = eff === 'off' ? 'Colour grading only' : (GPU_PRESETS.find(p => p[0] === eff) || ['', 'On'])[1];
+                // The pipeline reports what really ran (e.g. the Anime4K-lite fallback, "+ colour").
+                const pathNote = gpu.path && eff !== 'off' && !/^colour only$/.test(gpu.path) ? ` (${gpu.path})` : '';
+                gpuText = `${preset}${pathNote} · ${this.glCanvas.width}×${this.glCanvas.height}${ms ? ` · ${ms.toFixed(1)} ms/frame` : ''}`;
             } else if (this.gpuBlocked) {
                 gpuText = 'Unavailable';
             }
@@ -4076,8 +4594,16 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (a.preset && a.preset !== 'normal') fx.push(`EQ ${a.preset}`);
             if (a.channels && a.channels !== 'stereo') fx.push(a.channels);
             if (a.delayMs) fx.push(`delay ${a.delayMs} ms`);
+            if (a.loudnessNorm) fx.push(this.audio.active ? 'smart loudness' : 'smart loudness (waiting for first tap)');
+            if ((a.width ?? 100) !== 100) fx.push(`width ${a.width}%`);
+            if (a.dialogue) fx.push(`dialogue +${a.dialogue}%`);
+            if (a.crossfeed) fx.push('crossfeed');
             if (Object.keys(DEFAULT_FILTERS).some(k => this.filters[k] !== DEFAULT_FILTERS[k])) fx.push('colour filters');
             if (this.settings.ambientMode) fx.push('ambient glow');
+            if (this.gpuColor()) {
+                const cp = window.VelostreamShared.COLOR_PRESETS[(this.settings.color || {}).preset];
+                fx.push(`look ${cp ? cp.label : 'custom'}`);
+            }
             const rows = [
                 ['Stream', `${String(this.stream.type || '').toUpperCase()} · ${this.mode === 'mse' ? 'MSE' : `direct${this.audio && this.audio.corsOk ? ' · CORS' : ''}`}`],
                 ['Resolution', v.videoWidth ? `${v.videoWidth}×${v.videoHeight}` : '—'],
@@ -4511,6 +5037,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 e.preventDefault();
                 if (this.capturingKey) { this.capturingKey = null; this.refreshPopover(); }
                 else if (this.popKind) this.closePopover(true);
+                else if (this.transcriptOpen) this.toggleTranscript(false);
                 else if (this.$('.resume').classList.contains('show')) this.dismissResume(false);
                 else if (this.locked) this.$('.unlock-pill').classList.add('show');
                 else if (this.mini) this.setMini(false);
@@ -4552,6 +5079,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 case 'fullscreen': this.toggleFullscreen(); break;
                 case 'pip': this.togglePip(); break;
                 case 'captions': this.toggleCaptions(); break;
+                case 'transcript': this.toggleTranscript(); break;
                 case 'speedDown': this.setRate(this.nextPreset(-1)); break;
                 case 'speedUp': this.setRate(this.nextPreset(1)); break;
                 case 'loopA': this.setLoopPoint('a'); break;
@@ -4694,6 +5222,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             });
             if (this.subs.externalCues && this.subs.capturedIndex == null) html += this.row({ id: 'cc-ext', label: this.subs.externalName, meta: 'File', checked: this.subs.source === 'external', data: 'data-sub="external"' });
             html += this.row({ id: 'cc-load', label: 'Load .srt, .vtt or .ass file…', role: 'menuitem', lead: 'upload' });
+            html += this.row({ id: 'cc-transcript', label: this.transcriptOpen ? 'Hide transcript' : 'Transcript & search', meta: 'T', role: 'menuitem', lead: 'captions' });
             html += '</div><input type="file" id="cc-file" accept=".srt,.vtt,.ass,.ssa,text/vtt,application/x-subrip" hidden>';
             const off = this.subs.offset;
             html += `<div class="section-label">Sync offset</div><div class="stepper"><button type="button" class="ib" id="cc-off-minus" aria-label="Subtitles earlier by 0.1 seconds">${icon('frameBack', 18)}</button><output class="num">${off >= 0 ? '+' : ''}${off.toFixed(1)} s</output><button type="button" class="ib" id="cc-off-plus" aria-label="Subtitles later by 0.1 seconds">${icon('frameFwd', 18)}</button></div>`;
@@ -4734,8 +5263,86 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
         }
 
         tabQuality() {
-            if (this.mode !== 'mse') return `<p class="hint">Quality selection is available for HLS and DASH streams. This is a direct media file.</p>${this.bufferSection()}`;
-            return this.qualitySection() + this.bufferSection();
+            const streams = this.streamsSection();
+            if (this.mode !== 'mse') return `${streams}<p class="hint">Quality selection is available for HLS and DASH streams. This is a direct media file.</p>${this.bufferSection()}`;
+            return streams + this.qualitySection() + this.bufferSection();
+        }
+
+        /** Other playable streams detected on this page (only when there is more than one). */
+        streamsSection() {
+            const list = this.tabStreams || [];
+            if (list.length < 2) return '';
+            const cur = this.stream ? this.stream.id : null;
+            const label = s => [s.type === 'progressive' ? 'File' : s.type.toUpperCase(), s.maxHeight ? `${s.maxHeight}p` : '', s.live ? 'Live' : s.duration ? fmtTime(s.duration) : ''].filter(Boolean).join(' · ');
+            let html = '<div class="section-label" id="lbl-streams">Streams on this page</div><div role="menu" aria-labelledby="lbl-streams">';
+            list.forEach((s, i) => {
+                html += this.row({ id: `qs-${i}`, label: s.title || label(s), meta: s.title ? label(s) : s.host, checked: s.id === cur, data: `data-stream="${esc(s.id)}"` });
+            });
+            return `${html}</div>`;
+        }
+
+        /** Ask the engine to switch this session to another stream of the page (no iframe reload). */
+        switchToStream(id) {
+            if (!id || (this.stream && this.stream.id === id) || this.switching) return;
+            if (this.exportState && this.exportState.running) { this.announce('Finish or cancel the download first', 'warn'); return; }
+            this.saveHistory(true);
+            this.switching = true;
+            this.closePopover(false);
+            this.setStatus('loading');
+            this.island('studio', 'Switching stream…', null, 0);
+            this.port.send({ type: 'SWITCH_STREAM', streamId: id });
+            this.later(15000, () => { if (this.switching) { this.switching = false; this.hideIsland(); this.announce('Switching timed out', 'warn'); } });
+        }
+
+        async finishStreamSwitch(msg) {
+            if (!msg.stream) return;
+            this.switching = false;
+            const v = this.video;
+            const prevType = this.stream ? this.stream.type : '';
+            this.stream = msg.stream;
+            if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
+            // Per-stream state starts over.
+            this.loop = { a: null, b: null };
+            this.chapters = [];
+            this.imageTrackId = undefined;
+            this.thumbKey = null;
+            this.exportState = null;
+            this.freshTried = false;
+            this.netRecoveries = [];
+            this.corsUnavailable = false;
+            this.variantsSig = '';
+            this.lastHeight = 0;
+            this.decoderKey = null;
+            this.smartSkip = null;
+            this.lastQuality = {};
+            this.subs.clearShaka();
+            if (this.subs.source === 'shaka') this.subs.source = 'off';
+            // Unload the old media. Shaka is torn down when the next stream is a plain file (it
+            // must not keep the element), and reused for the next HLS/DASH stream.
+            if (this.player && (this.stream.type === 'progressive' || prevType === 'progressive')) {
+                try { await this.player.destroy(); } catch (_) { /* ignore */ }
+                this.player = null;
+            } else if (this.player) {
+                try { await this.player.unload(); } catch (_) { /* ignore */ }
+            }
+            if (prevType === 'progressive') { v.removeAttribute('src'); v.removeAttribute('crossorigin'); v.load(); }
+            let domain = '';
+            try { domain = new URL(this.stream.url).hostname; } catch (_) { /* opaque */ }
+            this.$('.domain').textContent = domain;
+            await this.loadBookmarks();
+            this.renderMarks();
+            this.hideIsland();
+            try {
+                await this.load(undefined);
+            } catch (e) {
+                this.showError('Cannot play this stream', String((e && e.message) || e));
+                return;
+            }
+            this.checkResume();
+            this.loadChapters();
+            this.updateDownloadButton();
+            this.announce(`Now playing ${this.stream.title || (this.stream.type === 'progressive' ? 'the file' : `the ${this.stream.type.toUpperCase()} stream`)}`, 'play');
+            this.refreshPopover();
         }
 
         bufferSection() {
@@ -4786,7 +5393,14 @@ ${this.switchField('bf-pause', 'Pause background prefetch', !!this.prefetchPause
             html += `<div class="section-label">Audio delay (lip sync)</div><div class="stepper"><button type="button" class="ib" id="au-d-minus" aria-label="Less audio delay, 50 milliseconds"${allowed ? '' : ' disabled'}>${icon('frameBack', 18)}</button><output class="num">${a.delayMs} ms</output><button type="button" class="ib" id="au-d-plus" aria-label="More audio delay, 50 milliseconds"${allowed ? '' : ' disabled'}>${icon('frameFwd', 18)}</button></div><p class="hint">Delays sound when it arrives before the picture (0–1000 ms).</p>`;
             html += `<div class="section-label">Output</div>
 ${this.selectField('au-ch', 'Channels', [['stereo', 'Stereo'], ['mono', 'Mono (downmix)'], ['left', 'Left channel only'], ['right', 'Right channel only']], a.channels || 'stereo')}
-${this.switchField('au-pitch', 'Keep voice pitch when speeding up', a.preservesPitch !== false)}`;
+${this.switchField('au-pitch', 'Keep voice pitch when speeding up', a.preservesPitch !== false)}
+${this.switchField('au-norm', 'Smart loudness normalization', !!a.loudnessNorm)}
+<p class="hint">Keeps the volume even: lifts quiet dialogue slowly and limits sudden loud peaks, without the pumping of Night mode.</p>
+<div class="section-label">Spatial &amp; dialogue</div>
+${this.rangeField('au-width', 'Stereo width', 0, 200, 5, a.width ?? 100, `${a.width ?? 100}%`)}
+${this.rangeField('au-dialogue', 'Dialogue boost', 0, 100, 5, a.dialogue || 0, `${a.dialogue || 0}%`)}
+${this.switchField('au-crossfeed', 'Headphone crossfeed', !!a.crossfeed)}
+<p class="hint">Width: 0% is mono, 100% as recorded, 200% extra wide. Dialogue boost lifts voices in the centre of the mix. Crossfeed blends the sides a little for a more natural sound on headphones.</p>`;
             return html;
         }
 
@@ -4801,13 +5415,24 @@ ${this.switchField('au-pitch', 'Keep voice pitch when speeding up', a.preservesP
             const s = this.settings;
             const eff = this.effectiveShader();
             const gpuState = this.gpuBlocked ? `Unavailable: ${this.gpuBlocked}.`
-                : this.gpu && this.gpu.active ? `Active: ${GPU_PRESETS.find(p => p[0] === eff.preset)[1]} at ${this.glCanvas.width}×${this.glCanvas.height}${this.gpuOverride ? ' (stepped down for GPU load)' : ''}.`
+                : this.gpu && this.gpu.active ? `Active: ${eff.preset === 'off' ? 'colour grading only' : ((GPU_PRESETS.find(p => p[0] === eff.preset) || ['', eff.preset])[1])} at ${this.glCanvas.width}×${this.glCanvas.height}${this.gpuOverride ? ' (stepped down for GPU load)' : ''}.`
                     : 'Off.';
             html += `<div class="section-label">GPU enhancement</div>
 ${this.selectField('dp-shader', 'Shader', GPU_PRESETS, s.shader)}
 ${this.rangeField('dp-shader-str', 'Strength', 0, 100, 5, s.shaderStrength, `${s.shaderStrength}%`)}
 ${this.selectField('dp-maxres', 'Max render resolution', [[1080, '1080p'], [1440, '1440p'], [2160, '2160p (4K)']], s.maxRenderRes)}
 <p class="hint">${esc(gpuState)} WebGL2 shaders run on the graphics chip and pause while the video is paused or hidden. Heavy presets step down automatically if the device cannot keep up.</p>`;
+            const cs = s.color || {};
+            const CP = window.VelostreamShared.COLOR_PRESETS;
+            html += `<div class="section-label">Color Studio</div>
+${this.selectField('dp-cpreset', 'Look', Object.entries(CP).map(([k, p]) => [k, p.label]).concat([['custom', 'Custom']]), cs.preset || 'neutral')}
+${this.rangeField('dp-c-gamma', 'Gamma', 50, 200, 5, cs.gamma ?? 100, `${((cs.gamma ?? 100) / 100).toFixed(2)}`)}
+${this.rangeField('dp-c-vibrance', 'Vibrance', -100, 100, 5, cs.vibrance || 0, `${cs.vibrance || 0}`)}
+${this.rangeField('dp-c-temperature', 'Temperature', -100, 100, 5, cs.temperature || 0, `${cs.temperature || 0}`)}
+${this.rangeField('dp-c-tint', 'Tint', -100, 100, 5, cs.tint || 0, `${cs.tint || 0}`)}
+${this.rangeField('dp-c-shadows', 'Shadows', -100, 100, 5, cs.shadows || 0, `${cs.shadows || 0}`)}
+${this.rangeField('dp-c-highlights', 'Highlights', -100, 100, 5, cs.highlights || 0, `${cs.highlights || 0}`)}
+<p class="hint">${this.gpuBlocked ? `Needs GPU enhancement, which is unavailable here (${esc(this.gpuBlocked)}).` : 'Graded on the GPU, on top of the colour sliders above. Vibrance boosts dull colours more than vivid ones; Temperature warms or cools; Shadows and Highlights lift or recover the dark and bright parts.'}</p>`;
             html += this.switchField('dp-ambient', 'Ambient glow behind the video', !!s.ambientMode);
             html += '<div class="inline"><label class="sr-only" for="dp-preset-name">Preset name</label><input type="text" id="dp-preset-name" placeholder="Preset name" maxlength="40"><button type="button" class="pillbtn primary" id="dp-preset-save">Save</button><button type="button" class="pillbtn" id="dp-reset">Reset</button></div>';
             (this.settings.filterPresets || []).forEach((p, i) => {
@@ -4926,6 +5551,9 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
 <div role="menu" aria-label="Site profile">${this.row({ id: 'pf-site-save', label: this.profile ? 'Update profile with current setup' : 'Save current setup for this site', role: 'menuitem', lead: 'bookmark' })}${this.profile ? this.row({ id: 'pf-site-del', label: 'Remove site profile', role: 'menuitem', lead: 'trash' }) : ''}</div>
 <div class="section-label">Keyboard</div>${keys}
 <div role="menu" aria-label="Keyboard actions">${this.row({ id: 'pf-keys-reset', label: 'Reset shortcuts', role: 'menuitem', lead: 'rotate' })}${this.row({ id: 'pf-help', label: 'Show all shortcuts', meta: '?', role: 'menuitem', lead: 'help' })}</div>
+<div class="section-label">Device</div>
+<p class="hint">Detected as a ${esc({ low: 'low-end device (smaller buffers, fewer downloads, saves memory and battery)', standard: 'standard device', high: 'high-end device (more parallel downloads, bigger cache)' }[s.hwTier] || 'device not detected yet')}. Only settings you had not changed were adjusted.</p>
+<div role="menu" aria-label="Device">${this.row({ id: 'pf-hw', label: 'Re-detect and re-tune for this device', meta: s.hwTier || '', role: 'menuitem', lead: 'rotate' })}</div>
 <div class="section-label">Backup &amp; restore</div>
 <p class="hint">Settings, site profiles, presets, shortcuts, bookmarks and watch history in one .json file.</p>
 <div role="menu" aria-label="Backup and restore">${this.row({ id: 'pf-backup-export', label: 'Export settings (.json)', role: 'menuitem', lead: 'download' })}${this.row({ id: 'pf-backup-import', label: 'Import settings (.json)', role: 'menuitem', lead: 'rotate' })}</div>
@@ -4993,6 +5621,7 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 });
                 const file = byId('cc-file');
                 click('cc-load', () => file.click());
+                click('cc-transcript', () => { this.closePopover(false); this.toggleTranscript(); });
                 file.addEventListener('change', () => this.loadSubtitleFile(file.files[0]));
                 click('cc-off-minus', () => this.setSubOffset(this.subs.offset - 0.1));
                 click('cc-off-plus', () => this.setSubOffset(this.subs.offset + 0.1));
@@ -5039,6 +5668,7 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
         bindStudioTab(byId, click, each, range, select, sw) {
             const tab = this.studioTab;
             if (tab === 'quality') {
+                each('[data-stream]', el => this.switchToStream(el.dataset.stream));
                 each('[data-q]', el => this.selectQuality(el.dataset.q === 'auto' ? 'auto' : +el.dataset.q));
                 select('q-cap', v => { this.setQualityCap(+v); this.announce(`Resolution cap ${+v ? `${v}p` : 'off'}`, 'studio'); });
                 const shakaBuf = () => { if (this.player) { try { this.configureShaka(); } catch (_) { /* player gone */ } } };
@@ -5077,6 +5707,10 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 const delay = d => { const val = clamp(this.settings.audio.delayMs + d, 0, 1000); audio({ delayMs: val }); this.island('wave', `Audio delay ${val} ms`); this.refreshPopover(); };
                 select('au-ch', v => { audio({ channels: v }); this.announce({ stereo: 'Stereo', mono: 'Mono', left: 'Left channel', right: 'Right channel' }[v], 'wave'); });
                 sw('au-pitch', v => { audio({ preservesPitch: v }); this.applyPitch(v); });
+                sw('au-norm', v => { audio({ loudnessNorm: v }); this.announce(v ? 'Smart loudness on' : 'Smart loudness off', 'wave'); });
+                range('au-width', v => audio({ width: v }), v => `${v}%`);
+                range('au-dialogue', v => audio({ dialogue: v }), v => `${v}%`);
+                sw('au-crossfeed', v => { audio({ crossfeed: v }); this.announce(v ? 'Headphone crossfeed on' : 'Headphone crossfeed off', 'headphones'); });
                 click('au-d-minus', () => delay(-50));
                 click('au-d-plus', () => delay(50));
             } else if (tab === 'display') {
@@ -5094,6 +5728,23 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 });
                 range('dp-shader-str', v => { this.settings.shaderStrength = v; this.saveSettings({ shaderStrength: v }); this.applyFilters(); }, v => `${v}%`);
                 select('dp-maxres', v => { this.settings.maxRenderRes = +v; this.saveSettings({ maxRenderRes: +v }); this.applyFilters(); });
+                select('dp-cpreset', v => {
+                    const p = window.VelostreamShared.COLOR_PRESETS[v];
+                    const next = { ...this.settings.color, preset: v };
+                    if (p) { const { label, ...vals } = p; Object.assign(next, vals); void label; }
+                    this.saveSettings({ color: next });
+                    this.applyFilters();
+                    this.announce(`Look: ${p ? p.label : 'Custom'}`, 'sun');
+                    this.refreshPopover();
+                });
+                for (const k of ['gamma', 'vibrance', 'temperature', 'tint', 'shadows', 'highlights']) {
+                    range(`dp-c-${k}`, v => {
+                        this.saveSettings({ color: { ...this.settings.color, [k]: v, preset: 'custom' } });
+                        this.applyFilters();
+                        const sel = byId('dp-cpreset');
+                        if (sel) sel.value = 'custom';
+                    }, v => (k === 'gamma' ? (v / 100).toFixed(2) : String(v)));
+                }
                 sw('dp-ambient', v => { this.saveSettings({ ambientMode: v }); this.announce(v ? 'Ambient glow on' : 'Ambient glow off', 'sun'); });
                 click('dp-reset', () => { this.filters = { ...DEFAULT_FILTERS }; this.applyFilters(); this.refreshPopover(); this.announce('Display reset', 'sun'); });
                 click('dp-preset-save', () => {
@@ -5185,6 +5836,7 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                     this.announce('Shortcuts reset', 'check');
                 });
                 click('pf-help', () => this.openPopover('help', this.$('.btn-studio')));
+                click('pf-hw', () => { this.applyHardwareTier(true); this.refreshPopover(); });
                 click('pf-backup-export', () => this.exportBackup());
                 click('pf-backup-import', () => { const f = byId('pf-backup-file'); if (f) f.click(); });
                 { const f = byId('pf-backup-file'); if (f) f.addEventListener('change', () => { const file = f.files && f.files[0]; f.value = ''; if (file) this.importBackup(file); }); }

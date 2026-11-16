@@ -147,6 +147,8 @@ clone is not available).
 | E → P | `STATS`, `ABR_SWITCH {variantId}`, `SUBTITLES`, `FATAL` | Engine → UI updates. |
 | P → E | `SEEK`, `SET_QUALITY`, `PREFETCH {enabled}`, `PURGE_CACHE` | Playback control. |
 | P → E / E → P | `FIND_FRESH {url, since}` / `FRESH {url}` | Find a newer signed link for the same video. |
+| E → P | `STREAMS {streams, current}` (also in `INIT.streams`) | Playable non-ad streams of the tab, for the in-player stream switcher. |
+| P → E / E → P | `SWITCH_STREAM {streamId}` / `STREAM_SWITCHED {stream, streams}` or `SWITCH_FAILED` | In-place switch: the session aborts its requests, clears its cache, builds a fresh downloader + ABR for the new stream and persists the new stream id (used if the worker restarts). The player unloads and loads without remounting. |
 | P → E | `EXPORT_START [{clip: {start, end}}]`, `RECORD_START`, `RECORD_STOP`, `EXPORT_CANCEL` | Downloads. `clip` (player time, HLS only) keeps the segments overlapping the A–B range, mapped through the downloader's timeline offset. |
 | E → P | `EXPORT_BEGIN`, `EXPORT_CHUNK`, `EXPORT_PROGRESS`, `EXPORT_FILE_DONE`, `EXPORT_ERROR` | Download data and progress. |
 | P → E | `CLOSE` | End the session and restore the site player. |
@@ -212,19 +214,33 @@ rotation and mirroring apply identically.
   nothing runs while the video is paused or hidden. Seeks and setting changes render one frame on
   demand. The canvas stays hidden until its first frame is drawn, so there is no black flash.
 - Each frame is uploaded with `texImage2D(video)`. Passes:
-  - `cas`: 1 pass.
-  - `deband`: 1 pass.
-  - `fsr`: Lanczos-2 (with anti-ringing) into an FBO, then RCAS.
-  - `anime4k`: Lanczos-2 into an FBO, then gradient push.
-  - When the output is not larger than the source, `fsr` and `anime4k` run a single pass instead.
+  - `cas`: 1 pass. `deband`: 1 pass.
+  - `fsr`: Lanczos-2 (with anti-ringing) into an FBO, then RCAS; a single CAS pass when the output
+    is not larger than the source.
+  - `anime4k` / `anime4k-hq`: the Anime4K v4.0.1 CNNs (MIT, bloc97), embedded unmodified as mpv
+    hook GLSL in `player/anime4k.js` and translated at run time to WebGL2 passes (`parseHooks`,
+    `evalExpr` for the size/condition expressions, `fragmentSource`, `plan` for render-target
+    liveness). Restore S/M (4/8 passes at source size) → Upscale ×2 S/M (4/9 passes, then
+    depth-to-space at 2×) → Lanczos-2 to the canvas. Restore only when the output is not more than
+    1.2× the source. Intermediates are RGBA16F (signed activations); without float render targets
+    or if `anime4k.js` is missing, the older one-pass *Anime4K-lite* path runs. CNN programs compile
+    on first use (`KHR_parallel_shader_compile` where available) with the lite path drawn meanwhile.
+  - `deblock`: block-grid-aligned deblocking at source size, then a light CAS. `denoise`: 5×5
+    bilateral at source size (optional `grain` 0–100 re-adds luma detail), then Lanczos-2.
+  - **Colour grading** (`configure({color})`: gamma factor, vibrance, temperature, tint, shadows,
+    highlights): one final pass when non-neutral; with preset `off` the pipeline runs colour-only.
+    `pipeline.path` names what actually ran (e.g. `anime4k-hq CNN (restore + upscale x2) + colour`).
 - **Orientation:** video textures have the picture's top at v = 0; FBO textures have it at v = 1.
   The vertex shader's `uFbo` uniform selects the matching mapping per pass.
 - Canvas size: the displayed size × devicePixelRatio, capped by *max render resolution*. CAS never
   renders below the source resolution.
 - **Thermal guard:** 3 s windows. The first window after start, seek or preset change is
   discarded. GPU time comes from `EXT_disjoint_timer_query_webgl2` (CPU time when it is missing),
-  together with dropped-frame counts. Two overloaded windows in a row step the preset down
-  (`fsr`/`anime4k` → `cas` → `off`) for the session.
+  together with dropped-frame counts. Two overloaded windows in a row step the preset down for the
+  session: `anime4k-hq` → `anime4k` → `cas` → `off`; `fsr` → `cas` → `off`; `deblock`,
+  `denoise`, `deband` → `off`. Colour-only grading is never stepped down.
+- Context loss hides the canvas; restore rebuilds every program and render target. `destroy()`
+  frees all textures, framebuffers, programs, shaders, buffers and vertex arrays.
 - Cross-origin direct files without CORS make `texImage2D` throw `SecurityError`. The pipeline
   reports itself unavailable and the plain video is shown.
 

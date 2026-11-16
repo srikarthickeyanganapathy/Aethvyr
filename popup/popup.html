@@ -92,7 +92,10 @@
             <summary><span class="section-title">Continue watching</span><span id="history-count" class="count num">0</span></summary>
             <ul id="history-list" class="history-list"></ul>
             <p id="history-empty" class="muted">Videos you watch in Velostream appear here with their position.</p>
-            <button type="button" id="history-clear" class="btn btn-quiet small">Clear history</button>
+            <div class="btn-row">
+                <button type="button" id="open-library" class="btn btn-quiet small">Open library</button>
+                <button type="button" id="history-clear" class="btn btn-quiet small">Clear history</button>
+            </div>
         </details>
 
         <details id="settings" class="card fold">
@@ -140,6 +143,12 @@
                     </div>
                     <label class="field"><span>Stats for nerds</span><input type="checkbox" role="switch" name="showStats"></label>
                     <label class="field"><span>Ambient glow</span><input type="checkbox" role="switch" name="ambientMode"></label>
+                    <label class="field"><span>Sync across my devices</span><input type="checkbox" role="switch" name="syncEnabled" aria-describedby="sync-status"></label>
+                    <p id="sync-status" class="muted small-print">Uses your browser account's sync (Google or Mozilla). Off by default.</p>
+                    <div class="btn-row" role="group" aria-label="Sync actions">
+                        <button type="button" id="sync-now" class="btn btn-quiet small">Sync now</button>
+                        <button type="button" id="sync-clear" class="btn btn-quiet small">Delete synced data</button>
+                    </div>
                     <label class="field"><span>On-page Play button</span><input type="checkbox" role="switch" name="quickLaunchBadge"></label>
                 </fieldset>
                 <fieldset>

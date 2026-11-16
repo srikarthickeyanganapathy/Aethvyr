@@ -12,6 +12,9 @@ Other storage keys:
 | `fs_settings` | `storage.local` | Everything on this page |
 | `fs_history` | `storage.local` | Per-video position history (newest 200) for *Continue watching* |
 | `fs_bm_*` | `storage.local` | Bookmarks per video |
+| `fs_library` | `storage.local` | Library: `{favorites: [historyKey], collections: [{id, name, keys, createdAt}]}` (max 500 favorites, 50 collections × 500 videos) |
+| `fs_sync_state`, `fs_sync_status` | `storage.local` | Sync bookkeeping (device id, change times, tombstones) and the status line shown in the popup; not part of backups |
+| `vs_meta`, `vs_set_*`, `vs_hist_*`, `vs_lib_*`, `vs_bm_*` | `storage.sync` | Only with sync on: chunked, compressed copies of synced settings, history, library and bookmarks (about 90 KB budget) |
 | `tab_<id>` | `storage.session` | Detected streams, subtitles and DRM flags of a tab (survives service-worker restarts, cleared when the tab closes) |
 | `VelostreamDB` | IndexedDB | Segment cache, cleared when a player session ends |
 
@@ -27,6 +30,7 @@ Other storage keys:
 | `autoHideMs` | `3000` | Controls auto-hide delay; `0` never hides |
 | `showStats` | `false` | *Stats for nerds* overlay |
 | `ambientMode` | `false` | Ambient glow from the video behind the letterbox bars |
+| `syncEnabled` | `false` | Opt-in sync through the browser account. Not synced: `syncEnabled`, `settingsVersion`, `uiScale`, `maxWorkers`, `cacheSizeMB`, `maxBufferSec`, `mseBufferAhead`, `mseBufferBehind`, `rebufferingGoal`, `rangeAccel`, `dvrMinutes`, `maxRenderRes`, `shader`, `shaderStrength`, `qualityCap`, `memory.volume`, `memory.muted`, `memory.qualityHeight` (device-specific) |
 | `quickLaunchBadge` | `true` | On-page *Play in Velostream* pill |
 
 ## Playback
@@ -110,6 +114,19 @@ Other storage keys:
 | `audio.delayMs` | `0` | 0–1000 |
 | `audio.preservesPitch` | `true` | |
 | `audio.channels` | `stereo` | `stereo`, `mono`, `left`, `right` |
+| `audio.loudnessNorm` | `false` | Smart loudness: auto-gain toward -20 dBFS RMS (±12 dB, gated below -45 dBFS) plus a peak limiter |
+| `audio.width` | `100` | 0–200 % stereo width (mid/side scaling; 0 = mono) |
+| `audio.dialogue` | `0` | 0–100: centre-channel 2 kHz band boost, up to about +9 dB |
+| `audio.crossfeed` | `false` | Headphone crossfeed (0.3 ms delay, 700 Hz low-pass, -9 dB into the other side) |
+
+## Color Studio and device
+
+| Setting | Default | Values |
+|---------|---------|--------|
+| `color.preset` | `neutral` | `neutral`, `anime`, `cinema`, `natural`, `night`, `custom` |
+| `color.gamma` | `100` | 50–200 (%, 100 = neutral) |
+| `color.vibrance`, `color.temperature`, `color.tint`, `color.shadows`, `color.highlights` | `0` | −100…100 |
+| `hwTier` | `''` | `low`, `standard`, `high` once detected on first run (not synced between devices) |
 
 ## Profiles, presets and keys
 
@@ -119,7 +136,7 @@ Other storage keys:
 - `keymap`: action → key. Defaults: `playPause` Space, `playPauseAlt` k, `seekBack` ←,
   `seekBackAlt` j, `seekFwd` →, `seekFwdAlt` l, `volUp` ↑, `volDown` ↓, `mute` m, `fullscreen` f,
   `pip` p, `captions` c, `speedDown` <, `speedUp` >, `loopA` [, `loopB` ], `screenshot` s,
-  `frameBack` `,`, `frameFwd` `.`, `help` ?.
+  `frameBack` `,`, `frameFwd` `.`, `help` ?, `transcript` t.
 
 ## Migrations
 

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en" class="lib-root">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Velostream Library</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/library.css">
+</head>
+
+<body class="lib-page">
+    <a class="skip-link" href="#main">Skip to videos</a>
+    <div id="app" class="lib" data-accent="blue">
+        <header class="app-header lib-header">
+            <img class="app-icon" src="../icons/icon-48.png" alt="" width="28" height="28">
+            <div class="lib-heading">
+                <h1>Velostream Library</h1>
+                <p id="summary" class="muted num lib-summary">Loading your library…</p>
+            </div>
+            <button type="button" id="export-backup" class="btn small">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 19h14"/></svg>Export backup
+            </button>
+        </header>
+
+        <div id="announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+        <p id="message" class="message" role="alert" hidden></p>
+
+        <div class="lib-layout">
+            <nav class="lib-nav" aria-label="Library sections">
+                <ul class="lib-tabs">
+                    <li><a href="#continue" data-view="continue"><span>Continue watching</span><span class="count num" data-count="continue">0</span></a></li>
+                    <li><a href="#recent" data-view="recent"><span>Recently watched</span><span class="count num" data-count="recent">0</span></a></li>
+                    <li><a href="#favorites" data-view="favorites"><span>Favorites</span><span class="count num" data-count="favorites">0</span></a></li>
+                    <li><a href="#collections" data-view="collections"><span>Collections</span><span class="count num" data-count="collections">0</span></a></li>
+                    <li><a href="#bookmarked" data-view="bookmarked"><span>Bookmarked</span><span class="count num" data-count="bookmarked">0</span></a></li>
+                </ul>
+            </nav>
+
+            <main id="main" class="lib-main" tabindex="-1" aria-labelledby="view-title">
+                <div class="lib-toolbar" role="search" aria-label="Filter videos">
+                    <div class="lib-search">
+                        <label for="search" class="sr-only">Search by title or site</label>
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+                        <input type="search" id="search" placeholder="Search title or site…" autocomplete="off" spellcheck="false" aria-describedby="result-count">
+                    </div>
+                    <div class="lib-sort">
+                        <label for="sort">Sort</label>
+                        <select id="sort">
+                            <option value="recent">Recent</option>
+                            <option value="title">Title</option>
+                            <option value="progress">Progress</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="lib-view-head">
+                    <h2 id="view-title" class="lib-view-title">Recently watched</h2>
+                    <p id="result-count" class="muted num"></p>
+                </div>
+
+                <form id="new-collection" class="card lib-new" hidden novalidate>
+                    <label for="new-collection-name" class="section-title">New collection</label>
+                    <div class="lib-new-row">
+                        <input type="text" id="new-collection-name" class="lib-input" maxlength="60" placeholder="e.g. Watch later" autocomplete="off">
+                        <button type="submit" class="btn btn-primary small">Create</button>
+                    </div>
+                </form>
+
+                <div id="view"></div>
+            </main>
+        </div>
+        <footer class="foot muted"><span id="version" class="num"></span> · Everything here stays on this device.</footer>
+    </div>
+
+    <dialog id="dialog" class="lib-dialog" aria-labelledby="dialog-title" aria-describedby="dialog-text">
+        <form method="dialog" id="dialog-form" novalidate>
+            <h2 id="dialog-title" class="card-title"></h2>
+            <p id="dialog-text" class="muted"></p>
+            <div id="dialog-name-field" class="lib-dialog-field" hidden>
+                <label for="dialog-name">Name</label>
+                <input type="text" id="dialog-name" class="lib-input" maxlength="60" autocomplete="off">
+                <p id="dialog-error" class="lib-error" hidden></p>
+            </div>
+            <label id="dialog-check-field" class="lib-check" hidden>
+                <input type="checkbox" id="dialog-check">
+                <span id="dialog-check-label"></span>
+            </label>
+            <div class="btn-row">
+                <button type="button" id="dialog-cancel" class="btn">Cancel</button>
+                <button type="submit" id="dialog-ok" class="btn btn-primary" value="ok">OK</button>
+            </div>
+        </form>
+    </dialog>
+
+    <script src="../common/shared.js"></script>
+    <script src="js/library.js"></script>
+</body>
+
+</html>

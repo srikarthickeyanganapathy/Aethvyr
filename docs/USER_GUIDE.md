@@ -65,7 +65,7 @@ speed, subtitles, **Studio**, download and full screen.
 | **Speed** | 0.25×–4×. The chosen speed becomes the default for the next video. Pitch is kept natural unless you turn *Keep voice pitch when speeding up* off. |
 | **Mini player** | Docks the video in a corner of the page so you can keep browsing. Drag to move, drag the corner to resize. |
 | **Lock** | Blocks touches (for pockets and kids). Tap the unlock pill to release. |
-| **Audio-only** | Drops to the lowest-bitrate stream and stops video rendering to save battery and data. |
+| **Audio-only** | Drops to the lowest-bitrate stream and stops video rendering to save battery and data. A frequency visualizer in your accent colour plays while audio-only is on (static redraws only with reduced motion). |
 | **Sleep timer** | Stops after a time or at the end of the video, fading the volume out. |
 | **Skip intro / recap / credits** | When the stream has chapters, the pill reads **Skip Intro**, **Skip Recap**, **Skip Credits** or **Skip Preview** inside a chapter named like an opening (*Opening*, *Intro*, *OP*), recap, ending (*Ending*, *Credits*, *ED*) or preview that is 10 s – 4 min long, and jumps to that chapter's end. Otherwise it offers +30/60/85/90 s near the start. *Smart skip* fast-forwards through black, silent stretches. |
 | **Ambient glow** | Studio → Display (or the popup): a soft glow in the video's colours fills the letterbox bars. Updates about 4 times a second, only while playing. |
@@ -115,7 +115,8 @@ Keyboard**.
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Volume ±5 % | <kbd>M</kbd> | Mute |
 | <kbd><</kbd> / <kbd>></kbd> | Slower / faster | <kbd>S</kbd> / <kbd>Shift</kbd>+<kbd>S</kbd> | Snapshot / with subtitles & effects |
 | <kbd>,</kbd> / <kbd>.</kbd> | Previous / next frame | <kbd>[</kbd> / <kbd>]</kbd> | Set loop A / B |
-| <kbd>?</kbd> | Shortcuts & gestures | <kbd>Esc</kbd> | Close menu, then the player |
+| <kbd>?</kbd> | Shortcuts & gestures | <kbd>Esc</kbd> | Close menu or transcript, then the player |
+| <kbd>T</kbd> | Transcript & search | | |
 
 Keys pressed inside the player never reach the site's own shortcut handlers.
 
@@ -127,6 +128,8 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 
 ### Quality
 
+- **Streams on this page** (when the page has more than one playable stream): switch to another
+  one inside the same player, without closing it. Your position in the current one is saved.
 - **Quality**: Auto (Velostream's own adaptive bitrate) or a fixed resolution, and a quality cap
   (for example *never above 720p* on mobile data).
 - **Buffer & network**:
@@ -144,10 +147,24 @@ Studio is the settings panel inside the player (sliders button). It has five tab
   300 %.
 - **Audio delay (lip sync)**: 0–1000 ms.
 - **Output**: stereo, mono downmix, left only or right only, and *Keep voice pitch when speeding up*.
+- **Smart loudness normalization**: keeps the volume even across scenes and videos. It slowly lifts
+  quiet dialogue toward a steady level (up to +12 dB) and lowers loud passages (down to −12 dB),
+  ignoring silences, and a limiter catches sudden peaks. Gentler than Night mode, which squashes
+  everything.
+- **Spatial & dialogue**:
+  - *Stereo width*: 0 % is mono, 100 % as recorded, up to 200 % for a wider stage.
+  - *Dialogue boost*: lifts the voice band (around 2 kHz) in the centre of the mix only, so
+    speech gets clearer without making music and effects louder.
+  - *Headphone crossfeed*: blends a little of each side, delayed and softened, into the other
+    ear, so hard-panned mixes stop sounding "inside your head" on headphones.
 
 ### Display
 
 - **GPU enhancement**: preset, strength and maximum render resolution (see below).
+- **Color Studio**: GPU colour grading with looks (*Neutral, Anime, Cinema, Natural, Night*) and
+  sliders for gamma, vibrance (boosts dull colours more than vivid ones), temperature, tint,
+  shadows and highlights. Works with or without an enhancement preset, on top of the colour sliders
+  below. Needs WebGL2.
 - **Ambient glow** behind the video.
 - Colour: brightness, contrast, saturation, hue, warmth and sharpness, with saveable presets.
 - **Aspect ratio**: fit, fill, cover, 16:9, 4:3 or 21:9. Zoom, **Rotate 90°**, **Mirror** and
@@ -171,6 +188,11 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 - **Accent** colour and **Interface size** (85–150 %).
 - **Playback** defaults: speed, seek step, resume, auto full screen, controls auto-hide.
 - **Gestures**, **Mouse**, **Keyboard** (see above).
+- **Device**: on first run Velostream classifies the device as low-end, standard or high-end
+  (CPU cores, memory, touch screen size and GPU). Low-end devices get smaller buffers, a 512 MB
+  cache, 3 parallel downloads and a 1080p GPU render cap; high-end desktops get 8 downloads, a 4 GB
+  cache and a longer RAM buffer. Only settings you had not changed are adjusted. *Re-detect and
+  re-tune* applies the tier's values again.
 - **Site profile**: remember speed, quality cap, GPU preset and strength, EQ preset and subtitle
   size for the current site only. While a profile is active, changing those settings affects only
   the current session; use *Update profile with current setup* to keep them for the site.
@@ -199,6 +221,11 @@ Open the **CC** button (*Subtitles & Audio*).
 - **Subtitle style**: font (including dyslexia-friendly and Atkinson Hyperlegible), size, colour,
   background opacity, edge style and position.
 - **Audio track**: pick the language or commentary track; your choice is remembered.
+- **Transcript & search** (<kbd>T</kbd>, or *Transcript & search* in this menu): a side panel with
+  every line of the current subtitle track. The line being spoken is highlighted and kept in view
+  (*Follow*; scrolling yourself pauses it). Type to search the whole video: matches are
+  highlighted and counted, and clicking any line jumps there. Copy the text, or save it as an
+  `.srt` with your sync offset applied.
 
 ---
 
@@ -212,16 +239,26 @@ exactly over the video.
 | **Off** | Native browser rendering | Battery |
 | **Fast Sharpen** (CAS) | Contrast-adaptive sharpening in one pass | Soft or low-bitrate video |
 | **FSR upscale** | Lanczos-2 upscale with anti-ringing, then RCAS sharpening | Low resolution shown on a big screen |
-| **Anime4K-lite** | Lanczos-2 upscale, then pushes line art toward clean edges | Animation |
+| **Anime4K (fast)** | The real Anime4K neural networks (Restore S + Upscale ×2 S): cleans up compression and blur, then doubles the resolution | Animation on phones and laptops |
+| **Anime4K HQ** | The larger Anime4K networks (Restore M + Upscale ×2 M), noticeably sharper line art | Animation on a dedicated or recent integrated GPU |
+| **De-block + sharpen** | Smooths the 8×8 block edges of low-bitrate video where both sides are flat, then lightly sharpens | 360p–720p web video |
+| **Denoise** | Edge-preserving (bilateral) noise removal; *grain* can be kept | Old, dark or noisy video |
 | **Deband** | Smooths colour banding in flat areas, with dithering | Gradients, skies, dark scenes |
+
+Measured on an Intel integrated GPU (848×480 source shown at 1080p): Fast Sharpen 0.3 ms per frame,
+De-block 0.3 ms, Deband 0.6 ms, Denoise 1.5 ms, FSR 2.6 ms, Anime4K 3.1 ms, Anime4K HQ 5.5 ms.
 
 - **Strength** scales the effect. **Max render resolution** caps the canvas size; lower it on
   weak GPUs.
-- FSR and Anime4K only upscale when the video is shown **larger than its source**. Otherwise they
-  run a single sharpening pass, because there is nothing to upscale.
+- FSR and Anime4K only upscale when the video is shown **larger than its source** (Anime4K: more
+  than 1.2×). Otherwise FSR runs a single sharpening pass and Anime4K runs only its Restore network.
+- Anime4K needs half-float render targets. Where the GPU does not offer them it automatically uses
+  the older *Anime4K-lite* shader instead; *Stats for nerds* shows which path is running. The
+  networks compile in the background the first time, with Anime4K-lite shown meanwhile.
 - The **thermal guard** watches frame time and dropped frames. If the GPU cannot keep up for about
-  6 s, it steps down (FSR/Anime4K → Fast Sharpen → Off) for this session only and tells you. Your
-  saved choice is kept.
+  6 s, it steps down (Anime4K HQ → Anime4K → Fast Sharpen → Off; FSR → Fast Sharpen → Off;
+  De-block, Denoise, Deband → Off) for this session only and tells you. Your saved choice is kept.
+  Color Studio grading is never stepped down (it is very cheap).
 - When the sharpness slider is above 0 and no preset is chosen, Fast Sharpen is used
   automatically. Colour filters apply on top.
 - GPU enhancement is unavailable when WebGL2 is missing, and for **direct files from another
@@ -280,8 +317,43 @@ Signed links expire. Run the command soon after copying it.
 - **Now playing**: download or close the open player.
 - **Detected streams**: with type, resolution, duration, live/DRM badges. *Rescan* and *Clear*.
 - **This site**: *Always play in Velostream*.
-- **Play any stream link**, **Continue watching**, and global **Settings** (appearance,
-  playback, engine).
+- **Play any stream link**, **Continue watching** (with *Open library*), and global **Settings**
+  (appearance, playback, engine, sync, backup).
+
+---
+
+## Library
+
+*Popup → Continue watching → Open library* opens a full page with every video you played in
+Velostream:
+
+- **Continue watching** (started, not finished), **Recently watched**, **Favorites** (star any
+  video), **Collections** and **Bookmarked**. Sections can be linked directly
+  (`library.html#favorites`).
+- **Search** by title or site, and **sort** by recent, title or progress.
+- Each card shows progress, when you watched it and its bookmarks. *Open* opens the page; the
+  player resumes where you stopped.
+- **Collections**: create, rename, delete, and add a video to several collections.
+- **Remove from history** asks first, and deletes the video's bookmarks only if you tick that box.
+
+Everything stays on your device and is included in backups.
+
+---
+
+## Sync across devices
+
+Off by default. Turn on *Settings → Sync across my devices* in the popup on each device. Velostream
+then keeps these in step through your **browser account's sync** (Google for Chrome/Edge, Mozilla
+for Firefox), with no Velostream server involved:
+
+- settings (but not device-specific ones such as volume, interface size, buffer/cache sizes and
+  GPU enhancement);
+- watch positions of your recent videos, their bookmarks, and your library.
+
+Changes upload about 10–60 seconds after you make them, and other devices pick them up when their
+browser syncs. *Sync now* forces a round trip; *Delete synced data* removes Velostream's copy
+from your account. Browser sync storage is small (about 100 KB), so with very long video addresses
+only the most recent videos sync. See the [privacy policy](../PRIVACY.md#optional-sync-across-your-devices).
 - On Firefox: **Allow access to websites**, when site access has not been granted yet.
 
 ---

@@ -18,9 +18,15 @@ import { BufferManager, sweepOrphans } from './buffer-manager.js';
 import { SegmentDownloader, sniffMedia } from './downloader.js';
 import { ABRController } from './abr-controller.js';
 import { parsePlaylist, ivForSegment, decryptAes128 } from './hls-parser.js';
+import { initSync } from './sync.js';
 
 const S = globalThis.VelostreamShared;
 const api = S.api;
+
+// Opt-in cross-device sync (browser account storage.sync). Started synchronously so its
+// storage/message listeners exist on every service-worker wake; it is inert unless
+// settings.syncEnabled is true and never throws into the engine.
+try { initSync({ api, S }); } catch (e) { console.warn('[Engine] sync unavailable:', e && e.message); }
 
 const MAX_STREAMS_PER_TAB = 40;
 const PROXY_TIMEOUT_MS = 60000;
@@ -186,11 +192,28 @@ async function updateIcon(tabId) {
 // which frames own a <video>, and whether the player is already open.
 // ----------------------------------------------------------------------------
 const notifyTimers = new Map();
+/** What the in-player stream switcher needs about each playable stream of a tab. */
+function streamSummaries(tab) {
+    return visibleStreams(tab).filter(s => !s.isAd).slice(0, 20).map(s => {
+        let host = '';
+        try { host = new URL(s.frameUrl || s.url).hostname; } catch (_) { /* opaque */ }
+        const p = s.probe && s.probe.status === 'done' ? s.probe : null;
+        return {
+            id: s.id, url: s.url, type: s.type, title: s.title || '', host, frameId: s.frameId,
+            maxHeight: p ? p.maxHeight || 0 : 0, duration: p ? p.duration || 0 : 0, live: !!(p && p.live),
+            isMaster: !!(p && p.isMaster), drm: !!(tab.drm), detectedAt: s.detectedAt
+        };
+    });
+}
+
 function notifyFrames(tabId) {
     clearTimeout(notifyTimers.get(tabId));
     notifyTimers.set(tabId, setTimeout(() => {
         notifyTimers.delete(tabId);
         const tab = tabs.get(tabId);
+        // The open player's stream switcher follows newly detected / probed streams.
+        const open = tab && tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
+        if (open) open.post({ type: 'STREAMS', streams: streamSummaries(tab), current: open.stream.id });
         const list = tab ? visibleStreams(tab).filter(s => !s.isAd) : [];
         const best = list[0];
         api.tabs.sendMessage(tabId, {
@@ -1013,35 +1036,59 @@ class Session {
         this.closing = false;
         this.disconnectTimer = null;
 
-        this.abr = new ABRController();
-        this.abr.setMaxHeight(settings.qualityCap);
         this.buffer = new BufferManager(tabId, id, {
             capBytes: settings.cacheSizeMB * 1024 * 1024,
             isProtected: key => this.downloader.isProtected(key)
         });
+        this.buffer.init().catch(err => console.warn('[Engine] Buffer init failed:', err));
+        this.persistTimer = null;
+        this.lastPersistAt = 0;
+        this.setupPipeline();
+
+        this.statsTimer = setInterval(() => this.pushStats(), 1000);
+        this.abrTimer = setInterval(() => this.runAbr(), 2000);
+    }
+
+    /** Fresh ABR + downloader for the current stream (construction and stream switches). */
+    setupPipeline() {
+        this.abr = new ABRController();
+        this.abr.setMaxHeight(this.qualityCap ?? settings.qualityCap);
         this.downloader = new SegmentDownloader({
-            transport: makeTransport(tabId, () => this.stream),
+            transport: makeTransport(this.tabId, () => this.stream),
             buffer: this.buffer,
             abr: this.abr,
             getSettings: () => settings
         });
-        this.buffer.init().catch(err => console.warn('[Engine] Buffer init failed:', err));
-
         // Observe every playlist the downloader learns (player manifest loads go through
         // downloader.load -> ingestPlaylist) so it can be re-taught after a worker restart.
         this.playlistLog = new Map(); // url -> {url, type, live, text|null}
         this.textsDirty = false;
-        this.persistTimer = null;
-        this.lastPersistAt = 0;
         const ingest = this.downloader.ingestPlaylist.bind(this.downloader);
         this.downloader.ingestPlaylist = (url, text) => {
             const parsed = ingest(url, text);
             if (parsed && !this.closing) this.notePlaylist(url, text, parsed);
             return parsed;
         };
+    }
 
-        this.statsTimer = setInterval(() => this.pushStats(), 1000);
-        this.abrTimer = setInterval(() => this.runAbr(), 2000);
+    /**
+     * Play another stream of the same tab in this session without remounting the player: stop
+     * everything in flight, drop this session's cached segments and start a fresh pipeline.
+     */
+    async switchStream(stream) {
+        if (this.exportJob) this.exportJob.controller.abort();
+        this.recording = null;
+        for (const c of this.requests.values()) { try { c.abort(); } catch (_) { /* gone */ } }
+        this.requests.clear();
+        this.downloader.destroy();
+        await this.buffer.clearStream().catch(() => { });
+        if (this.closing) return;
+        this.stream = stream;
+        this.abrAuto = true;
+        this.activeVariantId = null;
+        this.setupPipeline();
+        this.persistState({ soon: true });
+        if (stream.type === 'progressive') await ensureRefererRule(stream.url, stream.frameUrl || '').catch(() => { });
     }
 
     notePlaylist(url, text, parsed) {
@@ -1514,7 +1561,15 @@ api.runtime.onConnect.addListener((port) => {
             // Reattach (bridge reconnect after SW restart or transient disconnect).
             session = sessions.get(msg.sessionId) || null;
             if (!session) {
-                const stream = tab.streams.get(msg.streamId);
+                // The player's URL names the stream it opened with; after an in-place switch the
+                // persisted session state knows the current one.
+                let streamId = msg.streamId;
+                if (msg.resumed) {
+                    const key = sessionKey(msg.sessionId);
+                    const meta = (await api.storage.session.get(key).catch(() => ({})))[key];
+                    if (meta && meta.streamId && tab.streams.has(meta.streamId)) streamId = meta.streamId;
+                }
+                const stream = tab.streams.get(streamId);
                 if (!stream || (tab.playerSessionId && tab.playerSessionId !== msg.sessionId)) {
                     port.postMessage({ type: 'FATAL', error: 'Stream session not found. Re-open the player from the popup.' });
                     return;
@@ -1542,7 +1597,7 @@ api.runtime.onConnect.addListener((port) => {
             // the site's Referer/Origin so hot-link protection accepts them.
             if (session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
             const pageUrl = await api.tabs.get(tabId).then(t => (t && t.url) || '', () => '');
-            session.post({ type: 'INIT', sessionId: session.id, tabId: session.tabId, stream: session.stream, resumed: !!msg.resumed, subtitles: tab.subtitles || [], drm: tab.drm || null, pageUrl });
+            session.post({ type: 'INIT', sessionId: session.id, tabId: session.tabId, stream: session.stream, resumed: !!msg.resumed, subtitles: tab.subtitles || [], drm: tab.drm || null, pageUrl, streams: streamSummaries(tab) });
         }
     }
 
@@ -1611,6 +1666,15 @@ api.runtime.onConnect.addListener((port) => {
                 await session.buffer.clearStream().catch(() => { });
                 session.downloader.seek(+msg.time || (session.telemetry && session.telemetry.currentTime) || 0);
                 session.post({ type: 'PURGED', time: +msg.time || 0 });
+                break;
+            }
+            case 'SWITCH_STREAM': {
+                const tab = await getTab(session.tabId);
+                const next = tab.streams.get(msg.streamId);
+                if (!next) { session.post({ type: 'SWITCH_FAILED', error: 'That stream is no longer available. Rescan the page.' }); break; }
+                if (next.id !== session.stream.id) await session.switchStream(next);
+                if (session.closing) break;
+                session.post({ type: 'STREAM_SWITCHED', stream: session.stream, streams: streamSummaries(tab) });
                 break;
             }
             case 'FIND_FRESH': {

@@ -625,8 +625,40 @@
             renderHistory();
             announce('History cleared');
         });
+        $('open-library').addEventListener('click', () => {
+            api.tabs.create({ url: api.runtime.getURL('popup/library.html') });
+            window.close();
+        });
+        // Sync status line (written by background/sync.js).
+        const renderSyncStatus = (st) => {
+            const el = $('sync-status');
+            if (!el) return;
+            const base = "Uses your browser account's sync (Google or Mozilla). Off by default.";
+            if (!settings.syncEnabled || !st || st.state === 'off') { el.textContent = base; return; }
+            if (st.state === 'error') { el.textContent = `Sync problem: ${st.error || 'unknown error'}`; return; }
+            const ago = st.lastSyncAt ? Math.max(0, Math.round((Date.now() - st.lastSyncAt) / 60000)) : null;
+            el.textContent = ago === null ? 'Sync is on. Waiting for the first sync…' : `Sync is on · last synced ${ago < 1 ? 'just now' : `${ago} min ago`}.`;
+        };
+        api.storage.local.get('fs_sync_status').then(r => renderSyncStatus(r.fs_sync_status)).catch(() => { });
+        $('sync-now').addEventListener('click', async () => {
+            if (!settings.syncEnabled) { showMessage('Turn on "Sync across my devices" first.'); return; }
+            const res = await api.runtime.sendMessage({ action: 'SYNC_NOW' }).catch(e => ({ ok: false, error: e && e.message }));
+            if (res && res.ok) { announce('Synced'); showMessage('Synced with your browser account.', true); } else showMessage(`Sync failed: ${(res && res.error) || 'unknown error'}`);
+        });
+        $('sync-clear').addEventListener('click', async () => {
+            // Another device with sync on would upload its copy again on its next change.
+            const msg = settings.syncEnabled
+                ? 'Delete Velostream data from your browser account? Sync stays on here, so this device uploads its data again. Turn sync off on all devices first to remove it for good.'
+                : 'Delete Velostream data from your browser account? Devices that still have sync on will upload theirs again.';
+            if (!window.confirm(msg)) return;
+            const res = await api.runtime.sendMessage({ action: 'SYNC_CLEAR' }).catch(e => ({ ok: false, error: e && e.message }));
+            if (res && res.ok) { announce('Synced data deleted'); showMessage('Velostream data deleted from your browser account.', true); } else showMessage(`Could not delete: ${(res && res.error) || 'unknown error'}`);
+        });
         api.storage.onChanged.addListener((changes, area) => {
             if (area !== 'local') return;
+            if (changes.fs_sync_status || changes[S.SETTINGS_KEY]) {
+                api.storage.local.get('fs_sync_status').then(r => renderSyncStatus(r.fs_sync_status)).catch(() => { });
+            }
             if (changes[S.SETTINGS_KEY]) {
                 settings = S.mergeSettings(changes[S.SETTINGS_KEY].newValue);
                 // Refresh every control except the one being edited (it used to leave the whole form stale).
