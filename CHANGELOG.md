@@ -5,6 +5,23 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.4.0] - 2026-11-16
+
+### Added
+
+- **DASH download.** On-demand MPEG-DASH streams can be saved: MP4 DASH as one `.mp4` with video
+  and audio merged (best quality within the quality cap, in the audio language being played),
+  WebM/VP9 DASH as the original video and audio files. A–B clips work for DASH too. Every MPD
+  segment layout is supported because the plan comes from the manifest the player already
+  parsed. DRM-protected and live DASH cannot be saved.
+- **Seek previews for video files.** Direct MP4/WebM files, which have no thumbnail track, now
+  show preview frames on the seek bar, generated in the background from the file
+  (*Prefs → Playback → Seek previews for video files*).
+- **Picture-in-Picture with subtitles.** With subtitles on, the PiP window shows them in your
+  subtitle style and keeps updating in background tabs; the PiP buttons control the player
+  (*Prefs → Playback → Subtitles in Picture-in-Picture*). Direct files from servers without CORS
+  use plain PiP.
+
 ## [2.3.0] - 2026-11-16
 
 ### Added

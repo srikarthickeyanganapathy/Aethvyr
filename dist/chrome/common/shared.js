@@ -72,6 +72,8 @@
         autoResume: 'always',        // always | ask | off  (resume each video where you left it)
         skipSeconds: 85,             // "Skip intro" pill: 30 | 60 | 85 | 90
         smartSkip: false,            // fast-forward through black + silent stretches
+        fileThumbnails: true,        // seek-bar previews generated from direct video files
+        pipSubtitles: true,          // Picture-in-Picture shows the subtitles (drawn into the PiP frame)
         quickLaunchBadge: true,      // on-page "Play in Velostream" pill
         autoSites: [],               // hostnames where detected videos open in Velostream automatically
         // Last-used player state, restored for every video (like a native app remembers it)

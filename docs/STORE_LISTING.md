@@ -68,7 +68,7 @@ CONTROLS
 • Make it yours: five skins (glass, cinema, theater, floating pill, compact), minimal / standard / pro controls, seek bar styles, and show, hide or reorder buttons
 
 SAVE
-• Download on-demand video as one MP4 (segments remuxed, audio merged, no re-encoding)
+• Download on-demand HLS and DASH video as one MP4 (segments remuxed, audio merged, no re-encoding), or just an A–B clip
 • Record live streams, take snapshots
 • Open in VLC, mpv, PotPlayer or an Android app, or copy a ready yt-dlp / ffmpeg command
 

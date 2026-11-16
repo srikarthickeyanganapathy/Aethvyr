@@ -1170,6 +1170,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 /* ---------- Player look: density, buttons, scrubber, skins ----------
    Glass + Standard is the original design and needs none of these rules. Every skin keeps the
    same DOM and focus order (zones are moved in the DOM, never with CSS order) and 32px+ targets. */
+.pip-proxy { position: absolute; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
 .pro-group { display: none; align-items: center; gap: 2px; }
 .root[data-density="pro"]:not([data-simple="true"]) .pro-group { display: flex; }
 .pro-group .ib { width: max(40px, calc(var(--u) * 40)); height: max(40px, calc(var(--u) * 40)); }
@@ -2033,6 +2034,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.net.clear();
             if (this.resizeObserver) this.resizeObserver.disconnect();
             this.destroyGpu();
+            this.resetFileThumbs();
+            this.stopSubsPip();
             try { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => { }); } catch (_) { /* ignore */ }
             try { if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); } catch (_) { /* ignore */ }
             try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (_) { /* ignore */ }
@@ -3073,10 +3076,105 @@ input[type="text"] { width: 100%; min-width: 0; }
         async togglePip() {
             try {
                 if (document.pictureInPictureElement) await document.exitPictureInPicture();
+                else if (this.wantsSubsPip()) await this.startSubsPip();
                 else await this.video.requestPictureInPicture();
             } catch (e) {
+                this.stopSubsPip();
                 this.announce(`Picture in Picture unavailable: ${e.message}`, 'warn');
             }
+        }
+
+        /** Subtitles in PiP need a showing subtitle track and a frame the page may read. */
+        wantsSubsPip() {
+            if (this.settings.pipSubtitles === false || this.audioOnly || !HTMLCanvasElement.prototype.captureStream) return false;
+            const s = this.subs;
+            if (!((s.source !== 'off' && s.activeCues() && s.activeCues().length) || (s.secondaryCues && s.secondaryCues.length))) return false;
+            const v = this.video;
+            if (!v.videoWidth) return false;
+            try {
+                const c = document.createElement('canvas');
+                c.width = c.height = 1;
+                const x = c.getContext('2d');
+                x.drawImage(v, 0, 0, 1, 1);
+                x.getImageData(0, 0, 1, 1); // throws for a cross-origin file without CORS
+                return true;
+            } catch (_) {
+                return false;
+            }
+        }
+
+        /**
+         * Picture-in-Picture with subtitles: browsers do not draw the page's subtitle layer in the
+         * PiP window, so the frame and the current lines are drawn into a canvas whose stream plays
+         * in a hidden proxy <video>, and that proxy goes into PiP. A worker clocks the drawing so
+         * it keeps going while the tab is in the background. Sound stays on the real video;
+         * the PiP play/pause buttons reach it through the Media Session handlers (and, where a
+         * browser toggles the proxy itself, through its play/pause events).
+         */
+        async startSubsPip() {
+            const v = this.video;
+            const W = Math.min(1280, v.videoWidth);
+            const H = Math.max(2, Math.round(W * v.videoHeight / v.videoWidth / 2) * 2);
+            const c = document.createElement('canvas');
+            c.width = W;
+            c.height = H;
+            const ctx = c.getContext('2d');
+            const draw = () => {
+                try {
+                    ctx.drawImage(v, 0, 0, W, H);
+                    this.drawSubtitlesOnto(ctx, W, H, { pip: true });
+                } catch (_) { /* frame not ready */ }
+            };
+            draw();
+            const stream = c.captureStream(30);
+            const pv = document.createElement('video');
+            pv.className = 'pip-proxy';
+            pv.muted = true;
+            pv.playsInline = true;
+            pv.setAttribute('aria-hidden', 'true');
+            pv.srcObject = stream;
+            this.root.appendChild(pv);
+            const sp = { pv, stream, c, ticker: null, offs: [] };
+            this.subsPip = sp;
+            await pv.play();
+            await pv.requestPictureInPicture();
+            if (this.subsPip !== sp) return;
+            try {
+                sp.ticker = new Worker('pip-ticker.js');
+                sp.ticker.onmessage = () => { if (this.subsPip === sp) draw(); };
+                sp.ticker.postMessage({ fps: 30 });
+            } catch (_) {
+                // No worker: fall back to page timers (slower while the tab is hidden).
+                const id = setInterval(() => { if (this.subsPip === sp) draw(); }, 33);
+                sp.offs.push(() => clearInterval(id));
+            }
+            const on = (target, type, fn) => { target.addEventListener(type, fn); sp.offs.push(() => target.removeEventListener(type, fn)); };
+            on(pv, 'leavepictureinpicture', () => this.stopSubsPip());
+            on(pv, 'pause', () => { if (this.subsPip === sp && !v.paused) v.pause(); });
+            on(pv, 'play', () => { if (this.subsPip === sp && v.paused) v.play().catch(() => { }); });
+            on(v, 'play', () => { if (pv.paused) pv.play().catch(() => { }); this.setPipPlaybackState('playing'); });
+            on(v, 'pause', () => { this.setPipPlaybackState('paused'); });
+            this.setPipPlaybackState(v.paused ? 'paused' : 'playing');
+            this.$('.btn-pip').setAttribute('aria-pressed', 'true');
+            this.announce('Picture in Picture with subtitles', 'pip');
+        }
+
+        setPipPlaybackState(state) {
+            try { if ('mediaSession' in navigator) navigator.mediaSession.playbackState = state; } catch (_) { /* unsupported */ }
+        }
+
+        stopSubsPip() {
+            const sp = this.subsPip;
+            if (!sp) return;
+            this.subsPip = null;
+            for (const off of sp.offs) { try { off(); } catch (_) { /* ignore */ } }
+            if (sp.ticker) { try { sp.ticker.terminate(); } catch (_) { /* ignore */ } }
+            try { if (document.pictureInPictureElement === sp.pv) document.exitPictureInPicture().catch(() => { }); } catch (_) { /* ignore */ }
+            for (const t of sp.stream.getTracks()) t.stop();
+            sp.pv.srcObject = null;
+            sp.pv.remove();
+            const btn = this.$('.btn-pip');
+            if (btn) btn.setAttribute('aria-pressed', 'false');
         }
 
         setLocked(on) {
@@ -4036,7 +4134,7 @@ input[type="text"] { width: 100%; min-width: 0; }
         }
 
         /** Burn the currently visible subtitle lines into a W×H frame, scaled from the on-screen size. */
-        drawSubtitlesOnto(ctx, W, H) {
+        drawSubtitlesOnto(ctx, W, H, opts = {}) {
             const t = this.subs.cueTime(this.video.currentTime);
             const primary = this.subs.source !== 'off' ? SubtitleEngine.activeAt(this.subs.activeCues(), t) : [];
             const top = this.subs.secondaryCues ? SubtitleEngine.activeAt(this.subs.secondaryCues, t) : [];
@@ -4046,7 +4144,10 @@ input[type="text"] { width: 100%; min-width: 0; }
             const shown = this.gpu && this.gpu.contentRect && this.gpu.contentRect.h ? this.gpu.contentRect.h : this.vbox.clientHeight || H;
             const layerPx = parseFloat(getComputedStyle(this.$('.subs')).fontSize) || 18;
             const scale = H / Math.max(1, shown);
-            const fontPx = Math.max(12, Math.round(layerPx * (clamp(st.size, 50, 300) / 100) * 1.45 * scale));
+            // PiP windows are small: size the text to the frame (about 5.5% of its height at 100%).
+            const fontPx = opts.pip
+                ? Math.max(14, Math.round(H * 0.055 * clamp(st.size, 50, 300) / 100))
+                : Math.max(12, Math.round(layerPx * (clamp(st.size, 50, 300) / 100) * 1.45 * scale));
             ctx.font = `600 ${fontPx}px ${(FONTS[st.font] || FONTS.system).css}`;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
@@ -4189,17 +4290,113 @@ input[type="text"] { width: 100%; min-width: 0; }
         /** A–B loop range as a clip (player time), or null when it can't be saved as one. */
         clipRange() {
             const { a, b } = this.loop;
-            if (a == null || b == null || b - a < 0.5 || this.isLive() || !this.stream || this.stream.type !== 'hls') return null;
+            if (a == null || b == null || b - a < 0.5 || this.isLive() || !this.stream || !['hls', 'dash'].includes(this.stream.type)) return null;
             return { start: a, end: b };
         }
 
-        /** @param {{clip?: {start:number,end:number}}} [opts] save only the A–B range (HLS). */
+        /**
+         * DASH export plan from the manifest Shaka already parsed (every addressing mode:
+         * SegmentTemplate, SegmentTimeline, SegmentList, SegmentBase byte ranges). Picks the best
+         * MP4 video within the quality cap and the audio language being played, unencrypted only.
+         * Returns [{role, segs:[{uri, range, start, duration, map}]}] in the engine's HLS segment
+         * shape, so the engine fetches it through the site's headers and the existing fMP4 export.
+         */
+        async dashExportPlan(clip) {
+            const p = this.player;
+            if (!p || typeof p.getManifest !== 'function' || !p.getManifest()) throw new Error('The stream is not loaded yet.');
+            if (this.isLive()) throw new Error('Saving live DASH streams is not supported.');
+            const m = p.getManifest();
+            const isMp4 = s => !!s && /mp4/i.test(s.mimeType || '');
+            const clear = v => !(v.drmInfos && v.drmInfos.length) && !(v.video && v.video.encrypted) && !(v.audio && v.audio.encrypted);
+            let cands = (m.variants || []).filter(clear);
+            if (!cands.length) throw new Error('This DASH stream is DRM-protected and cannot be saved.');
+            // MP4 variants merge into one .mp4. Shaka keeps one codec family per manifest, so a
+            // stream played as VP9/WebM has only WebM left: those are saved as the original files.
+            cands = cands.filter(v => v.video || v.audio);
+            const mp4Only = cands.filter(v => (!v.video || isMp4(v.video)) && (!v.audio || isMp4(v.audio)));
+            const mp4 = mp4Only.length > 0;
+            if (mp4) cands = mp4Only;
+            const cap = this.qualityCap || Infinity;
+            const capped = cands.filter(v => !v.video || (v.video.height || 0) <= cap);
+            if (capped.length) cands = capped;
+            const active = (p.getVariantTracks() || []).find(t => t.active);
+            const playing = active && (m.variants || []).find(v => v.id === active.id);
+            const lang = playing && playing.audio ? playing.audio.language : null;
+            const sameLang = cands.filter(v => !lang || !v.audio || v.audio.language === lang);
+            if (sameLang.length) cands = sameLang;
+            const bw = s => (s ? s.bandwidth || 0 : 0);
+            cands.sort((a, b) => (bw(b.video) - bw(a.video)) || (bw(b.audio) - bw(a.audio)));
+            const best = cands[0];
+            const streams = [];
+            if (best.video) streams.push([best.video, 'main']);
+            if (best.audio && best.audio !== best.video && !best.video?.isAudioMuxedInVideo) streams.push([best.audio, 'audio']);
+            // The init reference has no exported getUris(): find its URI getter by shape.
+            const initUri = (init) => {
+                for (const val of Object.values(init)) {
+                    if (typeof val !== 'function' || val.length) continue;
+                    try {
+                        const out = val.call(init);
+                        if (Array.isArray(out) && out.length && typeof out[0] === 'string' && /^https?:/i.test(out[0])) return out[0];
+                    } catch (_) { /* not the getter */ }
+                }
+                return null;
+            };
+            const parts = [];
+            for (const [s, role] of streams) {
+                if (!s.segmentIndex) await s.createSegmentIndex();
+                const segs = [];
+                for (const ref of s.segmentIndex) {
+                    if (!ref) continue;
+                    const start = ref.getStartTime();
+                    const end = ref.getEndTime();
+                    if (clip && !(start < clip.end && end > clip.start)) continue;
+                    const uri = (ref.getUris() || [])[0];
+                    if (!uri) continue;
+                    const sb = ref.getStartByte() || 0;
+                    const eb = ref.getEndByte();
+                    const range = eb != null ? `bytes=${sb}-${eb}` : sb ? `bytes=${sb}-` : null;
+                    let map = null;
+                    const init = ref.initSegmentReference;
+                    if (init) {
+                        const iu = initUri(init);
+                        if (!iu) throw new Error('Could not read the DASH init segment.');
+                        const isb = init.getStartByte() || 0;
+                        const ieb = init.getEndByte();
+                        map = { uri: iu, byteRange: ieb != null ? { offset: isb, length: ieb - isb + 1 } : null };
+                    }
+                    segs.push({ uri, range, start, duration: Math.max(0, end - start), map });
+                }
+                if (!segs.length) throw new Error(clip ? 'No segments in the A–B range.' : 'This DASH stream has no segments to save.');
+                const webm = /webm/i.test(s.mimeType || '');
+                const audio = role === 'audio';
+                parts.push({ role, segs, ext: webm ? (audio ? 'weba' : 'webm') : (audio ? 'm4a' : 'mp4'), mime: s.mimeType || (audio ? 'audio/mp4' : 'video/mp4') });
+            }
+            if (!parts.length) throw new Error('This DASH stream has nothing to save.');
+            return { parts, mp4, height: best.video ? best.video.height || 0 : 0 };
+        }
+
+        /** @param {{clip?: {start:number,end:number}}} [opts] save only the A–B range (HLS / DASH). */
         async startExport(opts = {}) {
             if (this.pickingSink || (this.exportState && this.exportState.running)) return;
-            if (this.stream.type === 'dash') { this.announce('DASH export is not supported', 'warn'); return; }
             const clip = opts.clip || null;
             const hls = this.stream.type === 'hls';
-            const toMp4 = hls && (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
+            const dash = this.stream.type === 'dash';
+            // DASH: build the plan first (it decides between one merged .mp4 and original files).
+            let dashPlan = null;
+            if (dash) {
+                try {
+                    this.pickingSink = true;
+                    dashPlan = await this.dashExportPlan(clip);
+                } catch (err) {
+                    this.announce(err.message || String(err), 'warn');
+                    return;
+                } finally {
+                    this.pickingSink = false;
+                }
+                if (this.closed) return;
+            }
+            const toMp4 = dash ? dashPlan.mp4 && !!window.VelostreamMux
+                : hls && (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
             let title = safeFilename(this.$('.title').textContent || 'video').replace(/\.(m3u8|mpd|mp4|ts)$/i, '');
             if (clip) {
                 const r0 = this.seekRange().start;
@@ -4209,8 +4406,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             const st = { running: true, files: {}, status: 'Starting…', pct: 0, toMp4, sink: null, muxer: null, chain: Promise.resolve() };
             this.exportState = st;
             // Ask for the destination while the click's user activation is still valid.
-            if (toMp4 || !hls) {
-                const ext = toMp4 ? 'mp4' : ((/\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(this.stream.url) || ['', 'mp4'])[1]);
+            if (toMp4 || (!hls && !dash) || (dash && dashPlan.parts.length === 1)) {
+                const ext = toMp4 ? 'mp4' : dash ? dashPlan.parts[0].ext : ((/\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(this.stream.url) || ['', 'mp4'])[1]);
                 this.pickingSink = true;
                 try {
                     st.sink = await ExportSink.pick(this.shadow, `${title}.${ext}`, toMp4 ? 'video/mp4' : '');
@@ -4221,7 +4418,12 @@ input[type="text"] { width: 100%; min-width: 0; }
                 if (!st.sink) { this.exportState = null; this.announce('Download cancelled', 'download'); this.refreshPopover(); return; }
                 st.outName = st.sink.filename;
             }
-            this.port.send(clip ? { type: 'EXPORT_START', clip } : { type: 'EXPORT_START' });
+            if (dash) {
+                if (!toMp4 && dashPlan.parts.length > 1) this.announce('WebM stream: saving the original video and audio files', 'download');
+                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts } });
+            } else {
+                this.port.send(clip ? { type: 'EXPORT_START', clip } : { type: 'EXPORT_START' });
+            }
             this.announce(clip ? `Saving A–B clip (${fmtTime(clip.end - clip.start)})` : this.isLive() ? 'Saving live DVR buffer' : 'Download started', 'download');
             this.updateDownloadButton();
             this.refreshPopover();
@@ -4799,6 +5001,7 @@ input[type="text"] { width: 100%; min-width: 0; }
         /** Thumbnail preview from an image track (EXT-X-IMAGE-STREAM-INF / DASH thumbnails). */
         updateTipThumb(t) {
             const box = this.$('.tip-thumb');
+            if (this.mode === 'native') { this.fileThumb(t, box); return; }
             if (!this.player || this.mode !== 'mse' || !this.player.getImageTracks) { box.hidden = true; return; }
             if (this.imageTrackId === undefined) {
                 try {
@@ -4822,12 +5025,102 @@ input[type="text"] { width: 100%; min-width: 0; }
                     const scale = w / (th.width || w);
                     box.style.width = `${w}px`;
                     box.style.height = `${Math.round((th.height || 90) * scale)}px`;
+                    const stale = box.querySelector('canvas'); // a file preview from an earlier stream
+                    if (stale) stale.remove();
                     box.style.backgroundImage = `url("${url}")`;
                     box.style.backgroundSize = th.imageWidth ? `${th.imageWidth * scale}px ${th.imageHeight * scale}px` : 'cover';
                     box.style.backgroundPosition = `-${(th.positionX || 0) * scale}px -${(th.positionY || 0) * scale}px`;
                     box.hidden = false;
                 } catch (_) { box.hidden = true; }
             }, 60);
+        }
+
+        /**
+         * Seek previews for direct video files (which carry no thumbnail track): a hidden, muted
+         * second <video> on the same URL seeks to the hovered time and the frame is copied into a
+         * small canvas, about 200 per video (one per 1/200 of the duration, at least 1 s apart).
+         * Only the most recent hover is generated (older requests are dropped), a stuck seek
+         * times out after 4 s, and the nearest finished preview is shown meanwhile. The helper
+         * element loads without CORS: its frames are only displayed, never read back.
+         */
+        fileThumb(t, box) {
+            const v = this.video;
+            const dur = v.duration;
+            if (this.settings.fileThumbnails === false || !Number.isFinite(dur) || dur <= 0 || !this.stream) { box.hidden = true; return; }
+            const T = this.thumbGen || (this.thumbGen = { cache: new Map(), want: null, busy: false, el: null, failed: false, step: 1, box: null });
+            if (T.failed) { box.hidden = true; return; }
+            T.step = Math.max(1, dur / 200);
+            T.box = box;
+            const key = clamp(Math.round(t / T.step), 0, Math.floor(dur / T.step));
+            T.want = key;
+            let near = T.cache.get(key);
+            for (let d = 1; !near && d <= 4; d++) near = T.cache.get(key - d) || T.cache.get(key + d);
+            if (near) this.drawFileThumb(box, near); else box.hidden = true;
+            this.pumpFileThumbs();
+        }
+
+        pumpFileThumbs() {
+            const T = this.thumbGen;
+            if (!T || T.busy || T.failed || this.closed || T.want == null || T.cache.has(T.want)) return;
+            if (!T.el) {
+                const el = document.createElement('video');
+                el.muted = true;
+                el.playsInline = true;
+                el.preload = 'auto';
+                el.addEventListener('error', () => { T.failed = true; });
+                el.src = this.stream.url;
+                T.el = el;
+            }
+            const el = T.el;
+            const key = T.want;
+            T.busy = true;
+            const done = () => {
+                el.removeEventListener('seeked', done);
+                clearTimeout(T.timer);
+                if (this.thumbGen !== T) return;
+                try {
+                    if (el.videoWidth) {
+                        const c = document.createElement('canvas');
+                        c.width = 160;
+                        c.height = Math.max(1, Math.round(160 * el.videoHeight / el.videoWidth));
+                        c.getContext('2d').drawImage(el, 0, 0, c.width, c.height);
+                        T.cache.set(key, c);
+                        if (T.cache.size > 240) T.cache.delete(T.cache.keys().next().value);
+                        if (T.want === key && T.box) this.drawFileThumb(T.box, c);
+                    }
+                } catch (_) { /* frame not decodable: leave this one out */ }
+                T.busy = false;
+                this.pumpFileThumbs();
+            };
+            el.addEventListener('seeked', done);
+            T.timer = setTimeout(done, 4000);
+            el.currentTime = Math.max(0, key * T.step);
+        }
+
+        drawFileThumb(box, src) {
+            let c = box.querySelector('canvas');
+            if (!c) {
+                c = document.createElement('canvas');
+                c.setAttribute('aria-hidden', 'true');
+                c.style.display = 'block';
+                c.style.borderRadius = '8px';
+                box.appendChild(c);
+            }
+            if (c.width !== src.width || c.height !== src.height) { c.width = src.width; c.height = src.height; }
+            c.getContext('2d').drawImage(src, 0, 0);
+            box.style.backgroundImage = 'none';
+            box.style.width = `${src.width}px`;
+            box.style.height = `${src.height}px`;
+            box.hidden = false;
+        }
+
+        resetFileThumbs() {
+            const T = this.thumbGen;
+            this.thumbGen = null;
+            if (!T) return;
+            clearTimeout(T.timer);
+            if (T.el) { T.el.removeAttribute('src'); try { T.el.load(); } catch (_) { /* ignore */ } }
+            T.cache.clear();
         }
 
         /** Thumbnail sprites are fetched through the engine (site Referer) and cached as blob URLs. */
@@ -5657,6 +5950,7 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             this.chapters = [];
             this.imageTrackId = undefined;
             this.thumbKey = null;
+            this.resetFileThumbs();
             this.exportState = null;
             this.freshTried = false;
             this.netRecoveries = [];
@@ -5826,13 +6120,16 @@ ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead
             } else if (live) {
                 html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
                 html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
-            } else if (this.stream.type !== 'dash') {
+            } else {
+                const dash = this.stream.type === 'dash';
+                let dashWebm = false;
+                if (dash) { try { const a = this.player.getVariantTracks().find(t => t.active); dashWebm = !!a && /webm/i.test(a.mimeType || ''); } catch (_) { /* not loaded */ } }
                 const clip = this.clipRange();
-                if (clip) html += this.row({ id: 'tl-export-clip', label: (this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save A–B clip (.mp4)' : 'Save A–B clip segments', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
-                html += this.row({ id: 'tl-export', label: this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
+                if (clip) html += this.row({ id: 'tl-export-clip', label: dashWebm ? 'Save A–B clip (WebM originals)' : dash || (this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save A–B clip (.mp4)' : 'Save A–B clip segments', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
+                html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? 'Save as .mp4' : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
             }
             html += '</div>';
-            if (this.stream.type === 'dash') html += '<p class="hint">DASH export is not supported.</p>';
+            if (this.stream.type === 'dash' && !live) html += '<p class="hint">DASH saves the best quality within your quality cap, with the audio language you are listening to: MP4 streams as one .mp4, WebM (VP9) streams as the original video and audio files. DRM-protected streams cannot be saved.</p>';
             if (this.stream.type === 'hls' || live) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             const sleepMode = this.sleep ? this.sleep.mode : 0;
             html += `<div class="section-label" id="lbl-sleep">Sleep timer</div><div role="menu" aria-labelledby="lbl-sleep">${SLEEP_OPTIONS.map(([m, l]) => this.row({ id: `sl-${m}`, label: l, meta: m && sleepMode === m && this.sleep.endsAt ? `${Math.max(0, Math.ceil((this.sleep.endsAt - Date.now()) / 60000))}m left` : '', checked: sleepMode === m, data: `data-sleep="${m}"` })).join('')}</div>`;
@@ -5879,6 +6176,8 @@ ${this.selectField('pf-seek', 'Seek step', SEEK_STEPS.map(v => [v, `${v} s`]), s
 ${this.selectField('pf-defspeed', 'Default speed', SPEED_PRESETS.map(p => [p, fmtRate(p)]), s.defaultSpeed)}
 ${this.selectField('pf-defcap', 'Default resolution cap', QUALITY_CAPS, s.qualityCap)}
 ${this.switchField('pf-autofs', 'Full screen on first tap', s.autoFullscreen)}
+${this.switchField('pf-filethumbs', 'Seek previews for video files', s.fileThumbnails)}
+${this.switchField('pf-pipsubs', 'Subtitles in Picture-in-Picture', s.pipSubtitles)}
 ${this.switchField('pf-badge', 'On-page Play in Velostream button', s.quickLaunchBadge)}
 <div class="section-label">Gestures</div>
 ${this.switchField('pf-g-enabled', 'Touch gestures', g.enabled)}
@@ -6227,6 +6526,8 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 select('pf-defspeed', v => this.saveSettings({ defaultSpeed: +v }));
                 select('pf-defcap', v => this.saveSettings({ qualityCap: +v }));
                 sw('pf-autofs', v => this.saveSettings({ autoFullscreen: v }));
+                sw('pf-filethumbs', v => { this.saveSettings({ fileThumbnails: v }); if (!v) this.resetFileThumbs(); });
+                sw('pf-pipsubs', v => this.saveSettings({ pipSubtitles: v }));
                 sw('pf-badge', v => this.saveSettings({ quickLaunchBadge: v }));
                 select('pf-lprate', v => this.saveSettings({ longPressRate: +v }));
                 for (const k of ['enabled', 'doubleTapSeek', 'longPressSpeed', 'brightnessSwipe', 'volumeSwipe', 'scrubSwipe', 'pinchZoom', 'allowMouseDrag']) {

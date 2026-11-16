@@ -204,6 +204,35 @@ responses so the proxy path can read `Content-Range` and `Content-Length`.
 Recording live streams uses the same path from the current media sequence. The DVR save
 exports what the cache already holds.
 
+**DASH** has no playlist in the engine (the service worker has no XML parser). The player builds
+the plan from the manifest Shaka already parsed (`player.getManifest()`, each stream's
+`segmentIndex`), so every MPD addressing mode works: it picks the best unencrypted variant within
+the quality cap in the audio language being played, and sends `EXPORT_START {dash: {parts}}` with
+one part per stream (`role`, `ext`, `mime`, segments as `{uri, range, start, duration, map}`). The
+engine validates it (`sanitizeDashPlan`: http(s) only, at most 2 parts and 50 000 segments) and
+runs it through the same fetch-and-stream code as HLS fMP4, so cached segments are reused and
+the site's headers apply. MP4 parts are merged by `ExportMuxer`; Shaka keeps a single codec family
+per manifest, so a stream played as VP9 has only WebM left, and its parts are saved as the
+original files. The init segment's URI has no exported getter in the compiled Shaka build and is
+found by shape (the function property that returns http(s) URLs).
+
+## Seek previews for direct files
+
+`fileThumb()` keeps a hidden, muted second `<video>` on the same URL (no CORS: its frames are only
+displayed). Each hover asks for one of about 200 time slots; only the newest request is
+generated (one seek at a time, 4 s timeout), each frame is copied into a 160 px canvas (at most
+240 kept), and the nearest finished one is shown meanwhile.
+
+## Picture-in-Picture with subtitles
+
+Browsers do not render a page's subtitle layer in PiP. When subtitles are on and the frame is
+readable (MSE, or a direct file with CORS), `startSubsPip()` draws the video plus
+`drawSubtitlesOnto(..., {pip: true})` into a canvas, plays `canvas.captureStream(30)` in a hidden
+proxy `<video>` and puts that in PiP. A dedicated worker (`player/pip-ticker.js`) clocks the
+drawing, because `requestAnimationFrame` stops and page timers are throttled in background tabs.
+Sound stays on the real video; the PiP buttons reach it through the Media Session handlers and the
+proxy's own play/pause events.
+
 ## GPU pipeline
 
 `VideoShaderPipeline` draws the `<video>` through WebGL2 into a `<canvas>` placed over the

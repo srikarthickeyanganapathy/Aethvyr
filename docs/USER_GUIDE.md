@@ -60,9 +60,10 @@ speed, subtitles, **Studio**, download and full screen.
 
 | Feature | Notes |
 |---------|-------|
-| **Timeline** | Hover or drag for a time tooltip with **thumbnail previews** (when the stream provides image tracks) and the **chapter** title. Chapter marks, bookmarks and A-B loop points are drawn on the bar. |
+| **Timeline** | Hover or drag for a time tooltip with **thumbnail previews** and the **chapter** title. HLS and DASH show the stream's own thumbnail track when it has one; for direct video files (MP4, WebM…) Velostream makes the previews itself from the file, up to about 200 per video (*Prefs → Playback → Seek previews for video files*). Chapter marks, bookmarks and A-B loop points are drawn on the bar. |
 | **Dynamic island** | The pill at the top briefly shows what changed: volume, speed, seek target, quality switch, buffering, errors. |
 | **Speed** | 0.25×–4×. The chosen speed becomes the default for the next video. Pitch is kept natural unless you turn *Keep voice pitch when speeding up* off. |
+| **Picture-in-Picture** | With subtitles on, the PiP window shows them too, drawn into the picture in your subtitle style (browsers do not show a page's subtitles in PiP by themselves). It keeps updating while the tab is in the background; play/pause in the PiP window controls the player. Needs a picture the page may read: a direct file from a server without CORS falls back to plain PiP. Off in *Prefs → Playback → Subtitles in Picture-in-Picture*. |
 | **Mini player** | Docks the video in a corner of the page so you can keep browsing. Drag to move, drag the corner to resize. |
 | **Lock** | Blocks touches (for pockets and kids). Tap the unlock pill to release. |
 | **Audio-only** | Drops to the lowest-bitrate stream and stops video rendering to save battery and data. A frequency visualizer in your accent colour plays while audio-only is on (static redraws only with reduced motion). |
@@ -296,9 +297,11 @@ Press the **download** button or *Studio → Tools*.
 |--------|--------|
 | HLS on-demand (TS segments) | One **`.mp4`**: segments are remuxed to fragmented MP4 in the browser, and a separate audio rendition is merged in. No re-encoding, so there is no quality loss. |
 | HLS on-demand (fMP4 segments) | One `.mp4` with init segments merged. |
+| DASH on-demand (MP4) | One **`.mp4`** with video and audio merged: the best quality within your quality cap, in the audio language you are listening to. Works with every DASH segment layout (templates, timelines, lists, byte ranges). |
+| DASH on-demand (WebM / VP9) | The original **`.webm`** video and the audio file, side by side (WebM cannot be merged into MP4 without re-encoding). |
 | Direct file | Saved as is. |
-| Live stream | **Record** from now until you stop, or **save the DVR buffer**. |
-| A–B clip (HLS on-demand) | Set loop points A and B (<kbd>[</kbd> / <kbd>]</kbd>), then *Tools → Save A–B clip*: an `.mp4` of just that range, starting at 0:00. Cuts land on segment boundaries (keyframes, no re-encoding), so the clip can start and end a few seconds outside A and B. |
+| Live stream | **Record** from now until you stop, or **save the DVR buffer**. HLS only; live DASH cannot be saved. |
+| A–B clip (HLS or DASH on-demand) | Set loop points A and B (<kbd>[</kbd> / <kbd>]</kbd>), then *Tools → Save A–B clip*: an `.mp4` of just that range, starting at 0:00. Cuts land on segment boundaries (keyframes, no re-encoding), so the clip can start and end a few seconds outside A and B. |
 
 Choose **Save format → Original** to keep `.ts`/`.aac` files instead of MP4. If the first segment
 cannot be remuxed (an unusual codec), Velostream falls back to the original format automatically.

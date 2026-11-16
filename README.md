@@ -45,10 +45,10 @@ no remote code. See [PRIVACY.md](PRIVACY.md).
 | **Playback** | Shaka Player 5 (bundled, never loaded from a CDN). Starts after 0.5 s of media, muted-autoplay fallback with one-tap unmute, auto-resume per video, remembered volume/speed/quality/audio and subtitle language, per-site profiles, auto-replace on chosen sites. |
 | **Pre-buffer engine** | Background service worker downloads ahead with 2–8 adaptive workers, a byte-range accelerator, retries with backoff, an IndexedDB cache read zero-copy by the player, its own ABR, and a live DVR (default 30 min). |
 | **GPU enhancement** | WebGL2 presets: **Fast Sharpen** (CAS), **FSR-style upscale** (Lanczos-2 + RCAS), real **Anime4K** neural upscaling (fast and HQ), **De-block**, **Denoise**, **Deband**, plus **Color Studio** grading (looks, gamma, vibrance, temperature, tint, shadows, highlights). Strength and render-resolution cap, and a thermal guard that steps down when the GPU cannot keep up. |
-| **Controls** | Configurable double-tap zones (left/centre/right), swipe for volume, brightness and scrubbing, long-press 2×, pinch zoom, mouse wheel and middle click, remappable keyboard shortcuts, frame stepping, A-B loop, zoom/pan/rotate/mirror, aspect presets. |
+| **Controls** | Configurable double-tap zones (left/centre/right), swipe for volume, brightness and scrubbing, long-press 2×, pinch zoom, mouse wheel and middle click, remappable keyboard shortcuts, frame stepping, A-B loop, zoom/pan/rotate/mirror, aspect presets, seek previews generated for plain video files, Picture-in-Picture with subtitles. |
 | **Subtitles** | Site subtitles captured automatically (network, `<track>`, in-memory text tracks), SRT/VTT/ASS files, dual subtitles, sync to the next spoken line, timing speed, pause on hover, click to copy, full styling including dyslexia-friendly fonts. |
 | **Audio** | Boost up to 300 %, presets (voice, bass, night) and 5-band EQ, A/V delay, pitch-preserving speed, mono/left/right channel routing, audio-only battery saver. |
-| **Downloads** | VOD to a single **MP4** (TS→fMP4 remux, audio merged) or the original format, live recording, DVR save, PNG snapshots and frame-burst contact sheets. External handoff to PotPlayer, VLC, mpv, IINA or an Android app, or copy a ready `yt-dlp`/`ffmpeg` command with the right headers. |
+| **Downloads** | HLS and DASH VOD to a single **MP4** (TS→fMP4 remux, audio merged) or the original format, A–B clips, live recording, DVR save, PNG snapshots and frame-burst contact sheets. External handoff to PotPlayer, VLC, mpv, IINA or an Android app, or copy a ready `yt-dlp`/`ffmpeg` command with the right headers. |
 | **Player look** | Five skins (Glass, Cinema, Theater, draggable Floating pill, Compact), Minimal / Standard / Pro controls (frame step, A–B loop, snapshot, one-click EQ and GPU), chapter-segment or loudness-heatmap seek bar, bar thickness, background darkness, and per-button show / hide and order. |
 | **Accessibility** | Full keyboard operation, screen-reader announcements, focus management, high-contrast mode, reduced motion, interface scaling (85–150 %), simple mode. |
 
@@ -137,7 +137,8 @@ Velostream/   (repository root)
   so instead of failing silently. YouTube and most paid services fall in this group.
 - **Signed links expire.** Many sites sign stream URLs for minutes. Velostream switches to a newer
   link when the page requests one; otherwise reload the page and open the player again.
-- **DASH download** is not supported (HLS and direct files are).
+- **DASH download** covers on-demand streams: MP4 DASH becomes one `.mp4`; WebM (VP9) DASH is saved
+  as the original video and audio files. Live DASH cannot be saved.
 - A site's **Content Security Policy** or a sandboxed embed can forbid full screen; Velostream then
   fills the browser window instead.
 - **GPU enhancement** needs WebGL2 and cannot read cross-origin direct files served without CORS.

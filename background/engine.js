@@ -1356,6 +1356,45 @@ function recordingSegments(rec, playlist, segs) {
     return segs.slice(i);
 }
 
+/**
+ * Validate a DASH export plan from the player: at most 2 parts (video, audio), http(s) URLs only,
+ * finite times, well-formed byte ranges. Returns segments in the HLS export shape or null.
+ */
+function sanitizeDashPlan(plan) {
+    const httpUrl = (u) => {
+        if (typeof u !== 'string' || u.length > 4096) return null;
+        try { const x = new URL(u); return x.protocol === 'https:' || x.protocol === 'http:' ? x.href : null; } catch (_) { return null; }
+    };
+    const parts = Array.isArray(plan && plan.parts) ? plan.parts.slice(0, 2) : [];
+    const out = [];
+    for (const part of parts) {
+        const role = part && part.role === 'audio' ? 'audio' : 'main';
+        const list = Array.isArray(part && part.segs) ? part.segs : [];
+        if (!list.length || list.length > 50000) return null;
+        const segs = [];
+        for (const s of list) {
+            const uri = httpUrl(s && s.uri);
+            if (!uri) return null;
+            const range = typeof s.range === 'string' && /^bytes=\d+-\d*$/.test(s.range) ? s.range : null;
+            let map = null;
+            if (s.map) {
+                const mu = httpUrl(s.map.uri);
+                if (!mu) return null;
+                const br = s.map.byteRange;
+                const okRange = br && Number.isInteger(br.offset) && Number.isInteger(br.length) && br.offset >= 0 && br.length > 0;
+                map = { uri: mu, byteRange: okRange ? { offset: br.offset, length: br.length } : null };
+            }
+            const start = Number.isFinite(+s.start) ? +s.start : 0;
+            const duration = Number.isFinite(+s.duration) && +s.duration >= 0 ? +s.duration : 0;
+            segs.push({ uri, range, start, duration, map });
+        }
+        const ext = ['mp4', 'm4a', 'webm', 'weba'].includes(part.ext) ? part.ext : (role === 'audio' ? 'm4a' : 'mp4');
+        const mime = /^(video|audio)\/(mp4|webm)$/.test(part.mime) ? part.mime : (ext === 'webm' ? 'video/webm' : ext === 'weba' ? 'audio/webm' : role === 'audio' ? 'audio/mp4' : 'video/mp4');
+        out.push({ role, segs, ext, mime });
+    }
+    return out.length ? out : null;
+}
+
 async function runExport(session, opts = {}) {
     if (session.exportJob) {
         session.post({ type: 'EXPORT_ERROR', error: 'An export is already running. Wait for it to finish or cancel it.' });
@@ -1393,8 +1432,15 @@ async function runExport(session, opts = {}) {
                 const suffix = `${opts.recording ? '-recording' : ''}${opts.clip ? '-clip' : ''}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`;
                 await exportHlsPlaylist(session, parts[i], segs, post, signal, `${base}${suffix}`, i, parts.length);
             }
+        } else if (session.stream.type === 'dash' && opts.dash) {
+            // The player built the plan from Shaka's parsed MPD; segments are fMP4 like HLS fMP4.
+            for (let i = 0; i < opts.dash.length; i++) {
+                const part = opts.dash[i];
+                const suffix = opts.dash.length > 1 ? (part.role === 'audio' ? '-audio' : '-video') : '';
+                await exportHlsPlaylist(session, { role: part.role, ext: part.ext, mime: part.mime }, part.segs, post, signal, `${base}${suffix}`, i, opts.dash.length);
+            }
         } else {
-            throw new Error('Export supports HLS and direct media files. DASH export is not available.');
+            throw new Error('Export supports HLS, DASH and direct media files.');
         }
         post({ type: 'EXPORT_COMPLETE' });
     } catch (err) {
@@ -1415,6 +1461,8 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
     let ext = isFmp4 ? (playlist.role === 'audio' ? 'm4a' : 'mp4') : 'ts';
     let mime = isFmp4 ? (playlist.role === 'audio' ? 'audio/mp4' : 'video/mp4') : 'video/mp2t';
     if (!isFmp4 && /\.aac$/i.test(firstPath)) { ext = 'aac'; mime = 'audio/aac'; }
+    if (playlist.ext) { ext = playlist.ext; mime = playlist.mime || mime; } // DASH: the player knows the container
+    const webm = /^web/.test(ext);
 
     const transport = session.downloader.transport;
     const keyCache = new Map();
@@ -1428,7 +1476,7 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
         return keyCache.get(uri);
     };
 
-    post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime, container: isFmp4 ? 'fmp4' : (ext === 'aac' ? 'aac' : 'ts'), role: playlist.role || 'main' });
+    post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime, container: /^web/.test(ext) ? 'webm' : isFmp4 ? 'fmp4' : (ext === 'aac' ? 'aac' : 'ts'), role: playlist.role || 'main' });
     let lastMap = null;
     const LOOKAHEAD = 4;
     const pending = new Map();
@@ -1442,6 +1490,7 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
             if (seg.key && seg.key.method === 'AES-128') {
                 data = await decryptAes128(data, await getKey(seg.key.uri), ivForSegment(seg));
             }
+            if (webm) return data; // the disguise sniffer knows TS/MP4 only
             const sniff = sniffMedia(data);
             return sniff && sniff.offset ? data.slice(sniff.offset) : data;
         })();
@@ -1457,7 +1506,7 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
             const headers = seg.map.byteRange ? { Range: `bytes=${seg.map.byteRange.offset}-${seg.map.byteRange.offset + seg.map.byteRange.length - 1}` } : {};
             const init = await transport(seg.map.uri, { method: 'GET', headers, signal });
             if (init.status >= 400) throw new Error(`Init segment HTTP ${init.status}`);
-            const initSniff = sniffMedia(init.data);
+            const initSniff = webm ? null : sniffMedia(init.data);
             const initData = initSniff && initSniff.offset ? init.data.slice(initSniff.offset) : init.data;
             post({ type: 'EXPORT_CHUNK', fileIndex, kind: 'init', data: S.packBinary(initData) });
             bytes += initData.byteLength;
@@ -1696,6 +1745,15 @@ api.runtime.onConnect.addListener((port) => {
                 break;
             }
             case 'EXPORT_START': {
+                if (msg.dash) {
+                    const parts = session.stream.type === 'dash' ? sanitizeDashPlan(msg.dash) : null;
+                    if (!parts) {
+                        session.post({ type: 'EXPORT_ERROR', error: 'This DASH stream cannot be saved.' });
+                        break;
+                    }
+                    runExport(session, { dash: parts });
+                    break;
+                }
                 const clip = msg.clip && Number.isFinite(+msg.clip.start) && Number.isFinite(+msg.clip.end) && +msg.clip.end > +msg.clip.start
                     ? { start: +msg.clip.start, end: +msg.clip.end } : null;
                 if (clip && session.stream.type !== 'hls') {

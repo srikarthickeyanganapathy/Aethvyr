@@ -30,6 +30,8 @@ Other storage keys:
 | `autoHideMs` | `3000` | Controls auto-hide delay; `0` never hides |
 | `showStats` | `false` | *Stats for nerds* overlay |
 | `ambientMode` | `false` | Ambient glow from the video behind the letterbox bars |
+| `fileThumbnails` | `true` | Seek-bar previews generated from direct video files |
+| `pipSubtitles` | `true` | Picture-in-Picture shows the subtitles (drawn into the PiP picture) |
 | `look.skin` | `glass` | `glass`, `cinema`, `theater`, `pill`, `compact` |
 | `look.density` | `standard` | `minimal`, `standard`, `pro` (adds frame step, A–B loop, snapshot, EQ and GPU buttons) |
 | `look.scrubber` | `classic` | `classic`, `chapters`, `heatmap` |
