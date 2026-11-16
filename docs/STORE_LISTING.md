@@ -65,6 +65,7 @@ CONTROLS
 • Customizable keyboard shortcuts, mouse wheel and middle-click actions
 • Mini player, Picture-in-Picture, sleep timer, A-B loop, bookmarks, resume where you left off
 • Per-site profiles and "always play in Velostream" for chosen sites
+• Make it yours: five skins (glass, cinema, theater, floating pill, compact), minimal / standard / pro controls, seek bar styles, and show, hide or reorder buttons
 
 SAVE
 • Download on-demand video as one MP4 (segments remuxed, audio merged, no re-encoding)

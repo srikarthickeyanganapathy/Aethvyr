@@ -50,6 +50,18 @@
         autoHideMs: 3000,            // 0 = never hide
         showStats: false,
         ambientMode: false,          // soft colour glow from the video behind letterbox bars
+        // Player look (skins and control layout). 'glass' + 'standard' is the original design.
+        look: {
+            skin: 'glass',           // glass | cinema | theater | pill | compact
+            density: 'standard',     // minimal | standard | pro (pro adds frame step, A-B loop, snapshot, EQ, GPU)
+            scrubber: 'classic',     // classic | chapters (gaps at chapter starts) | heatmap (loudness + buffer strip)
+            scrubHeight: 6,          // seek bar thickness, px (4-10)
+            scrim: -1,               // control background darkness %, 0-95; -1 = the skin's own
+            hidden: [],              // ids from LOOK_BUTTONS the user hid
+            order: [],               // ids of the right-hand buttons in the user's order (missing ids keep default order)
+            pillX: 0.5,              // floating-pill position, fraction of the player (centre point)
+            pillY: 0.85
+        },
         syncEnabled: false,          // opt-in: sync settings, positions, bookmarks, library via the browser account (storage.sync)
         // Playback defaults
         defaultSpeed: 1,
@@ -153,6 +165,11 @@
     const PREBUFFER_SECONDS = Object.freeze([30, 60, 300, 900, 1800, 86400]);
     const CACHE_SIZES_MB = Object.freeze([256, 512, 1024, 2048, 4096, 5120]);
     const LEGACY_CACHE_MB = Object.freeze({ 300: 256, 1000: 1024 });
+    /** Player look: skins, buttons the user may hide, and the right-hand buttons they may reorder. */
+    const LOOK_SKINS = Object.freeze(['glass', 'cinema', 'theater', 'pill', 'compact']);
+    const LOOK_BUTTONS = Object.freeze(['back', 'fwd', 'volume', 'speed', 'cc', 'pip', 'fs', 'lock', 'info', 'dl', 'audioOnly', 'mini',
+        'frameBack', 'frameFwd', 'loop', 'snapshot', 'eq', 'gpu']);
+    const LOOK_ORDERABLE = Object.freeze(['speed', 'cc', 'studio', 'pip', 'fs']);
 
     function isPlainObject(v) {
         return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -215,6 +232,16 @@
         c.gamma = Math.min(200, Math.max(50, c.gamma));
         for (const k of ['vibrance', 'temperature', 'tint', 'shadows', 'highlights']) c[k] = Math.min(100, Math.max(-100, c[k]));
         if (!['', 'low', 'standard', 'high'].includes(out.hwTier)) out.hwTier = '';
+        const lk = out.look;
+        if (!LOOK_SKINS.includes(lk.skin)) lk.skin = 'glass';
+        if (!['minimal', 'standard', 'pro'].includes(lk.density)) lk.density = 'standard';
+        if (!['classic', 'chapters', 'heatmap'].includes(lk.scrubber)) lk.scrubber = 'classic';
+        lk.scrubHeight = Math.round(Math.min(10, Math.max(4, lk.scrubHeight)));
+        lk.scrim = lk.scrim < 0 ? -1 : Math.round(Math.min(95, lk.scrim));
+        lk.hidden = [...new Set(lk.hidden.filter(id => LOOK_BUTTONS.includes(id)))];
+        lk.order = [...new Set(lk.order.filter(id => LOOK_ORDERABLE.includes(id)))];
+        lk.pillX = Math.min(1, Math.max(0, lk.pillX));
+        lk.pillY = Math.min(1, Math.max(0, lk.pillY));
         out.dvrMinutes = Math.min(180, Math.max(0, out.dvrMinutes));
         // Settings saved by older builds used theme names; map them onto accents.
         const legacy = { emerald: 'green', amethyst: 'indigo', crimson: 'rose', 'hc-yellow': 'amber', amoled: 'blue', glass: 'blue' };
@@ -536,6 +563,9 @@
         mergeSettings,
         PREBUFFER_SECONDS,
         CACHE_SIZES_MB,
+        LOOK_SKINS,
+        LOOK_BUTTONS,
+        LOOK_ORDERABLE,
         toBase64,
         fromBase64,
         packBinary,

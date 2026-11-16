@@ -71,6 +71,25 @@ speed, subtitles, **Studio**, download and full screen.
 | **Ambient glow** | Studio → Display (or the popup): a soft glow in the video's colours fills the letterbox bars. Updates about 4 times a second, only while playing. |
 | **Live streams** | A **Live** button jumps to the edge. The DVR keeps the last 30 minutes (configurable) so you can pause and rewind even when the site does not offer it. |
 
+### Player look
+
+Everyone likes a player to look a little different. **Studio → Prefs → Player look** changes
+the controls without changing what they do. Glass with Standard controls is the default.
+
+| Option | Choices |
+|--------|---------|
+| **Skin** | **Glass**: frosted floating islands (default). **Cinema**: an edge-to-edge bar on a soft gradient with play first. **Theater**: docked like Cinema, darker, with big icons and a heavy seek bar. **Floating pill**: a compact 440 px bar you drag anywhere by its handle or any empty part; on the handle the arrow keys move it (<kbd>Shift</kbd> for bigger steps, <kbd>Home</kbd> to reset), and the spot is remembered. **Compact**: an opaque one-line toolbar docked at the bottom, square corners, no blur. |
+| **Controls** | **Minimal** (hides speed, Picture-in-Picture, download, statistics and audio-only, like simple mode), **Standard**, or **Pro**, which adds previous / next frame, an A–B loop button (set A, set B, clear), snapshot (<kbd>Shift</kbd>-click includes subtitles), and one-click **Audio & EQ** and **Picture & GPU** buttons that open those Studio tabs. Choosing Compact turns Pro on (unless you picked Minimal). |
+| **Seek bar** | **Classic**; **Chapter segments** (gaps at chapter starts); **Loudness & buffer heatmap**, a strip above the bar whose height is how loud each part was while you watched (measured once the audio engine is running) and whose colour shows played, buffered and not-yet-loaded parts. |
+| **Seek bar thickness** | 4–10 px. |
+| **Control background darkness** | *Skin default*, or 0–95 % black behind the controls. |
+| **Show or hide buttons** | Hide any button except Play and Studio. Hidden buttons keep their keyboard shortcuts. |
+| **Order of the right-hand buttons** | Move speed, subtitles, Studio, Picture-in-Picture and full screen left or right. |
+
+On players narrower than 600 px every skin uses the stacked phone layout. Keyboard focus always
+follows the order on screen. *Reset player look* restores the defaults. The look is part of
+backups and syncs between devices when sync is on.
+
 ---
 
 ## Gestures and mouse
@@ -186,6 +205,8 @@ Studio is the settings panel inside the player (sliders button). It has five tab
   dropped frames, video and audio codec, whether decoding is smooth and hardware-backed, GPU
   enhancement cost, active effects, network and buffer).
 - **Accent** colour and **Interface size** (85–150 %).
+- **Player look** (see [Player look](#player-look) below): skin, controls density, seek bar style
+  and thickness, control background darkness, which buttons are shown and their order.
 - **Playback** defaults: speed, seek step, resume, auto full screen, controls auto-hide.
 - **Gestures**, **Mouse**, **Keyboard** (see above).
 - **Device**: on first run Velostream classifies the device as low-end, standard or high-end

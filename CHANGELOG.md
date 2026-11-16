@@ -5,6 +5,25 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.3.0] - 2026-11-16
+
+### Added
+
+- **Player look** (Studio → Prefs → Player look). Glass stays the default; everything else is
+  opt-in:
+  - **Skins**: Glass, Cinema (edge-to-edge bar on a gradient), Theater (darker, big icons, heavy
+    bar), Floating pill (a 440 px bar you can drag anywhere, or move with the arrow keys; the
+    position is remembered) and Compact (opaque one-line docked toolbar, square corners, no blur).
+  - **Controls density**: Minimal, Standard or Pro. Pro adds previous / next frame, an A–B loop
+    button, snapshot, and one-click Audio & EQ and Picture & GPU buttons.
+  - **Seek bar** styles: Classic, Chapter segments, and a Loudness & buffer heatmap; thickness
+    4–10 px.
+  - **Control background darkness** 0–95 % (or the skin's own).
+  - **Show or hide** individual buttons and **reorder** the right-hand buttons.
+  - *Reset player look*.
+- New `look` settings group (see [SETTINGS.md](docs/SETTINGS.md)); it is included in backups and
+  synced when sync is on.
+
 ## [2.2.1] - 2026-11-16
 
 ### Changed

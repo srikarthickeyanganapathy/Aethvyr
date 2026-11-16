@@ -30,6 +30,14 @@ Other storage keys:
 | `autoHideMs` | `3000` | Controls auto-hide delay; `0` never hides |
 | `showStats` | `false` | *Stats for nerds* overlay |
 | `ambientMode` | `false` | Ambient glow from the video behind the letterbox bars |
+| `look.skin` | `glass` | `glass`, `cinema`, `theater`, `pill`, `compact` |
+| `look.density` | `standard` | `minimal`, `standard`, `pro` (adds frame step, A–B loop, snapshot, EQ and GPU buttons) |
+| `look.scrubber` | `classic` | `classic`, `chapters`, `heatmap` |
+| `look.scrubHeight` | `6` | Seek bar thickness, 4–10 px |
+| `look.scrim` | `-1` | Control background darkness 0–95 %; `-1` uses the skin's own |
+| `look.hidden` | `[]` | Hidden buttons: `back`, `fwd`, `volume`, `speed`, `cc`, `pip`, `fs`, `lock`, `info`, `dl`, `audioOnly`, `mini`, `frameBack`, `frameFwd`, `loop`, `snapshot`, `eq`, `gpu` (unknown ids are dropped) |
+| `look.order` | `[]` | Order of the right-hand buttons (`speed`, `cc`, `studio`, `pip`, `fs`); missing ids follow in the default order |
+| `look.pillX`, `look.pillY` | `0.5`, `0.85` | Floating-pill centre as a fraction of the player (0–1); clamped on screen |
 | `syncEnabled` | `false` | Opt-in sync through the browser account. Not synced: `syncEnabled`, `settingsVersion`, `uiScale`, `maxWorkers`, `cacheSizeMB`, `maxBufferSec`, `mseBufferAhead`, `mseBufferBehind`, `rebufferingGoal`, `rangeAccel`, `dvrMinutes`, `maxRenderRes`, `shader`, `shaderStrength`, `qualityCap`, `memory.volume`, `memory.muted`, `memory.qualityHeight` (device-specific) |
 | `quickLaunchBadge` | `true` | On-page *Play in Velostream* pill |
 

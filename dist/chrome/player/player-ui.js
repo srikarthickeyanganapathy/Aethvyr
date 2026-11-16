@@ -72,6 +72,22 @@
         loopA: 'Loop point A', loopB: 'Loop point B', screenshot: 'Screenshot',
         frameBack: 'Previous frame', frameFwd: 'Next frame', help: 'Shortcut help', transcript: 'Transcript'
     };
+    const LOOK_ORDERABLE = window.VelostreamShared.LOOK_ORDERABLE;
+    const LOOK_BUTTONS = window.VelostreamShared.LOOK_BUTTONS;
+    const LOOK_LABELS = {
+        back: 'Seek back', fwd: 'Seek forward', volume: 'Volume', speed: 'Speed', cc: 'Subtitles & audio', studio: 'Studio',
+        pip: 'Picture in Picture', fs: 'Full screen', lock: 'Lock touch controls', info: 'Stream statistics', dl: 'Download',
+        audioOnly: 'Audio-only', mini: 'Mini player', frameBack: 'Previous frame', frameFwd: 'Next frame', loop: 'A–B loop',
+        snapshot: 'Snapshot', eq: 'Audio & EQ', gpu: 'Picture & GPU'
+    };
+    const LOOK_PRO = ['frameBack', 'frameFwd', 'loop', 'snapshot', 'eq', 'gpu'];
+    const SKINS = [
+        ['glass', 'Glass', 'Frosted floating islands (the original look).'],
+        ['cinema', 'Cinema', 'Edge-to-edge bar on a soft gradient, play button first.'],
+        ['theater', 'Theater', 'Docked like Cinema, darker, with big icons and a heavy seek bar.'],
+        ['pill', 'Floating pill', 'A small bar you can drag anywhere; drag its handle or use the arrow keys on it.'],
+        ['compact', 'Compact', 'Opaque one-line toolbar docked at the bottom, square corners, no blur.']
+    ];
     const STUDIO_TABS = [['quality', 'Quality'], ['audio', 'Audio'], ['display', 'Display'], ['tools', 'Tools'], ['prefs', 'Prefs']];
 
     // 24px grid, 1.8px rounded strokes. Play/pause use filled glyphs for optical weight.
@@ -1151,6 +1167,127 @@ button:disabled { opacity: 0.4; cursor: default; }
   .chip.abr { display: none; }
 }
 
+/* ---------- Player look: density, buttons, scrubber, skins ----------
+   Glass + Standard is the original design and needs none of these rules. Every skin keeps the
+   same DOM and focus order (zones are moved in the DOM, never with CSS order) and 32px+ targets. */
+.pro-group { display: none; align-items: center; gap: 2px; }
+.root[data-density="pro"]:not([data-simple="true"]) .pro-group { display: flex; }
+.pro-group .ib { width: max(40px, calc(var(--u) * 40)); height: max(40px, calc(var(--u) * 40)); }
+.root[data-density="minimal"] .adv { display: none !important; }
+.look-off { display: none !important; }
+.track { height: var(--scrub-h, 6px); }
+.timeline:hover .track, .timeline.dragging .track, .timeline:focus-visible .track { height: calc(var(--scrub-h, 6px) + 4px); }
+.root[data-scrub="chapters"] .mark.chapter { display: none; }
+.scrub-heat { position: absolute; left: 0; right: 0; bottom: calc(50% + var(--scrub-h, 6px) / 2 + 3px); width: 100%; height: 18px; pointer-events: none; opacity: 0.9; }
+.scrub-heat[hidden] { display: none; }
+.root[data-scrim] .deck, .root[data-scrim] .topgrid .glass { background: rgba(0, 0, 0, var(--scrim-a)); }
+.deck-grip { display: none; }
+
+/* Cinema: edge-to-edge bar on a bottom gradient, play button at the start of the row. */
+.root[data-skin="cinema"] .deck, .root[data-skin="theater"] .deck {
+  left: 0; right: 0; bottom: 0; transform: none; width: auto; border-radius: 0; border: 0; box-shadow: none;
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+  background: linear-gradient(to top, rgba(0, 0, 0, var(--scrim-a, 0.72)) 0%, rgba(0, 0, 0, calc(var(--scrim-a, 0.72) * 0.6)) 55%, transparent 100%);
+  padding: calc(var(--u) * 36) max(calc(var(--u) * 16), env(safe-area-inset-right)) max(calc(var(--u) * 6), env(safe-area-inset-bottom)) max(calc(var(--u) * 16), env(safe-area-inset-left));
+}
+.root[data-skin="cinema"] .topgrid .glass, .root[data-skin="theater"] .topgrid .glass { background: transparent; border-color: transparent; box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
+.root[data-skin="cinema"] .chrome::before, .root[data-skin="theater"] .chrome::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: calc(var(--u) * 110); pointer-events: none;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, calc(var(--scrim-a, 0.72) * 0.8)), transparent);
+}
+.root[data-skin="cinema"] .row2, .root[data-skin="theater"] .row2 { grid-template-columns: auto auto 1fr; }
+.root[data-skin="cinema"] .zone-center, .root[data-skin="theater"] .zone-center { justify-self: start; gap: 4px; }
+.root[data-skin="cinema"] .ib.btn-play { width: 44px; height: 44px; background: none; box-shadow: none; }
+.root[data-skin="cinema"] .played, .root[data-skin="cinema"] .thumb { background: var(--fs-red); }
+.root[data-skin="cinema"] .zone-right { gap: 0; }
+
+/* Theater: the same docking, bigger and darker, with large icons and a heavy bar. */
+.root[data-skin="theater"] .deck { padding-top: calc(var(--u) * 56); }
+.root[data-skin="theater"]:not([data-scrim]) { --scrim-a: 0.85; }
+.root[data-skin="theater"] .ib svg { width: calc(var(--u) * 26); height: calc(var(--u) * 26); }
+.root[data-skin="theater"] .ib.btn-play { width: 56px; height: 56px; background: none; box-shadow: none; }
+.root[data-skin="theater"] .ib.btn-play svg { width: 34px; height: 34px; }
+.root[data-skin="theater"] .zone-center { gap: calc(var(--u) * 12); }
+.root[data-skin="theater"] .played, .root[data-skin="theater"] .thumb { background: var(--fs-red); }
+.root[data-skin="theater"] .thumb { width: 18px; height: 18px; margin: -9px 0 0 -9px; transform: scale(1); }
+.root[data-skin="theater"] .title { font-size: calc(var(--u) * 17); }
+
+/* Floating pill: a compact island you can drag anywhere (position is remembered). */
+.root[data-skin="pill"] .deck {
+  /* Clamped so the pill stays fully inside the player whatever its size (--deck-h = height + 24px). */
+  left: clamp(min(220px, 50% - 12px), calc(var(--pill-x, 0.5) * 100%), max(calc(100% - 220px), 50% + 12px));
+  top: clamp(calc((var(--deck-h, 130px) - 24px) / 2 + 4px), calc(var(--pill-y, 0.85) * 100%), calc(100% - (var(--deck-h, 130px) - 24px) / 2 - 4px));
+  bottom: auto; transform: translate(-50%, -50%);
+  width: min(440px, calc(100% - 24px)); border-radius: 14px; padding: 24px 10px 6px;
+}
+.root[data-skin="pill"] .deck-grip {
+  display: block; position: absolute; left: 50%; top: 0; width: 64px; height: 24px; margin-left: -32px; padding: 0; border: 0; border-radius: 8px;
+  background: none; cursor: grab; touch-action: none;
+}
+.root[data-skin="pill"] .deck-grip span { display: block; width: 36px; height: 4px; margin: 10px auto 0; border-radius: 2px; background: rgba(255, 255, 255, 0.4); }
+.root[data-skin="pill"] .deck-grip:hover span, .root[data-skin="pill"] .deck-grip:focus-visible span { background: rgba(255, 255, 255, 0.75); }
+.root[data-skin="pill"] .deck.dragging, .root[data-skin="pill"] .deck.dragging .deck-grip { cursor: grabbing; }
+.root[data-skin="pill"] .row1 { grid-template-columns: 40px 1fr 48px; gap: 6px; }
+.root[data-skin="pill"] .row2 { margin-top: 2px; gap: 2px; }
+.root[data-skin="pill"] .zone-left, .root[data-skin="pill"] .zone-right, .root[data-skin="pill"] .pro-group { gap: 0; }
+.root[data-skin="pill"] .zone-center { gap: 2px; }
+.root[data-skin="pill"] .ib, .root[data-skin="pill"] .pro-group .ib { width: 34px; height: 34px; }
+.root[data-skin="pill"] .ib svg { width: 18px; height: 18px; }
+.root[data-skin="pill"] .ib.btn-play { width: 40px; height: 40px; }
+.root[data-skin="pill"] .speed-pill { min-width: 44px; height: 34px; padding: 0 6px; }
+.root[data-skin="pill"] .vol:hover input, .root[data-skin="pill"] .vol:focus-within input { width: 64px; }
+
+/* Compact: opaque docked toolbar on one line, square corners, no blur. */
+.root[data-skin="compact"] .deck {
+  left: 0; right: 0; bottom: 0; transform: none; width: auto; border-radius: 2px; border: 0; border-top: 1px solid rgba(255, 255, 255, 0.08);
+  -webkit-backdrop-filter: none; backdrop-filter: none; box-shadow: none; background: rgba(16, 16, 18, var(--scrim-a, 0.92));
+  display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; padding: 2px max(8px, env(safe-area-inset-right)) max(2px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+}
+.root[data-skin="compact"] .topgrid .glass { background: rgba(16, 16, 18, var(--scrim-a, 0.92)); border-radius: 2px; -webkit-backdrop-filter: none; backdrop-filter: none; box-shadow: none; border-color: rgba(255, 255, 255, 0.08); }
+/* One line when it fits; on a smaller player the buttons wrap under the seek bar instead of overflowing. */
+.root[data-skin="compact"] .row1 { flex: 1 1 220px; min-width: 0; grid-template-columns: auto 1fr auto; gap: 6px; }
+.root[data-skin="compact"] .row2 { flex: 0 1 auto; display: flex; flex-wrap: wrap; justify-content: flex-end; margin: 0 0 0 auto; gap: 0; }
+.root[data-skin="compact"] .zone-left, .root[data-skin="compact"] .zone-center, .root[data-skin="compact"] .zone-right, .root[data-skin="compact"] .pro-group { gap: 0; }
+.root[data-skin="compact"] .ib, .root[data-skin="compact"] .pro-group .ib { width: 32px; height: 32px; border-radius: 2px; }
+.root[data-skin="compact"] .ib svg { width: 17px; height: 17px; }
+.root[data-skin="compact"] .ib.btn-play { width: 34px; height: 34px; background: none; box-shadow: none; }
+.root[data-skin="compact"] .speed-pill { height: 28px; min-width: 44px; padding: 0 6px; border-radius: 2px; }
+.root[data-skin="compact"] .track { border-radius: 1px; }
+.root[data-skin="compact"] .played, .root[data-skin="compact"] .layer { border-radius: 1px; }
+.root[data-skin="compact"] .vol:hover input, .root[data-skin="compact"] .vol:focus-within input { width: 64px; }
+.root[data-skin="compact"] .t-left, .root[data-skin="compact"] .t-right { font-size: 11px; }
+
+/* Pro density: the extra tools get their own centred row under the transport, and the skip pill
+   floats above the deck, so nothing overlaps. Docked skins wide enough (960px+) keep one row. */
+@media (min-width: 601px) {
+  .root[data-density="pro"]:not([data-skin="compact"]) .deck { container: deck / inline-size; }
+  .root[data-density="pro"]:not([data-skin="compact"]) .zone-left { display: contents; }
+  .root[data-density="pro"]:not([data-skin="compact"]) .vol { grid-area: 1 / 1; justify-self: start; }
+  .root[data-density="pro"]:not([data-skin="compact"]) .zone-center { grid-area: 1 / 2; }
+  .root[data-density="pro"]:not([data-skin="compact"]) .zone-right { grid-area: 1 / -2; }
+  .root[data-density="pro"]:not([data-skin="compact"]) .pro-group { grid-area: 2 / 1 / 3 / -1; justify-self: center; }
+  .root[data-density="pro"] .skip-intro { position: absolute; right: 0; bottom: calc(100% + 12px); box-shadow: var(--fs-shadow-floating); }
+  .root[data-density="pro"][data-skin="cinema"] .zone-center, .root[data-density="pro"][data-skin="theater"] .zone-center { grid-area: 1 / 1; }
+  .root[data-density="pro"][data-skin="cinema"] .vol, .root[data-density="pro"][data-skin="theater"] .vol { grid-area: 1 / 2; }
+  .root[data-density="pro"][data-skin="cinema"] .skip-intro, .root[data-density="pro"][data-skin="theater"] .skip-intro { right: max(calc(var(--u) * 16), env(safe-area-inset-right)); }
+  @container deck (min-width: 960px) {
+    .root[data-skin="cinema"] .row2, .root[data-skin="theater"] .row2 { grid-template-columns: auto auto auto 1fr; }
+    .root[data-skin="cinema"] .pro-group, .root[data-skin="theater"] .pro-group { grid-area: 1 / 3; justify-self: start; margin-left: 8px; }
+  }
+}
+.root[data-skin="compact"] .skip-intro { height: 28px; border-radius: 2px; }
+
+/* Narrow players: every skin falls back to the stacked phone layout. */
+@media (max-width: 600px) {
+  .root[data-skin="pill"] .deck { left: 50%; top: auto; bottom: max(12px, env(safe-area-inset-bottom)); transform: translateX(-50%); width: calc(100% - 16px); }
+  .root[data-skin="pill"] .deck-grip { display: none; }
+  .root[data-skin="compact"] .deck { display: block; }
+  .root[data-skin="cinema"] .deck, .root[data-skin="theater"] .deck { padding-top: 20px; }
+  .root[data-skin="cinema"] .row2, .root[data-skin="theater"] .row2, .root[data-skin="compact"] .row2 { display: grid; grid-template-columns: 1fr; }
+  .root[data-skin] .zone-center { justify-self: center; }
+  .pro-group { justify-self: center; }
+}
+
 /* ---------- spinner, ripples, cards ---------- */
 .spinner { position: absolute; left: 50%; top: 50%; width: 44px; height: 44px; margin: -22px; z-index: 4; pointer-events: none; display: none; }
 .spinner svg { width: 44px; height: 44px; animation: spin 0.9s linear infinite; }
@@ -1242,6 +1379,11 @@ input[type="text"] { width: 100%; min-width: 0; }
 .sub-preview { margin: 8px 10px; padding: 16px; border-radius: 12px; background: linear-gradient(135deg, #5b6b7d, #2c3e50); text-align: center; }
 .list-row { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 4px; padding: 0 0 0 10px; min-height: 44px; border-radius: 10px; }
 .list-row:hover { background: var(--fs-fill); }
+.look-more { margin: 4px 0; border-radius: 12px; }
+.look-more summary { min-height: 44px; display: flex; align-items: center; padding: 0 10px; border-radius: 10px; cursor: pointer; font-weight: 600; list-style-position: inside; }
+.look-more summary:hover { background: var(--fs-fill); }
+.look-more summary:focus-visible { outline: 2px solid var(--fs-accent); outline-offset: 2px; }
+.look-more .pillbtn[disabled] { opacity: 0.35; cursor: default; }
 .list-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 /* Nerd telemetry popover */
@@ -1298,6 +1440,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.locked = false;
             this.audioOnly = false;
             this.mini = false;
+            this.lookOpen = { buttons: false, order: false };
             this.qualityCap = 0;
             this.exportState = null;
             this.recordingSince = 0;
@@ -2056,11 +2199,11 @@ input[type="text"] { width: 100%; min-width: 0; }
       </div>
       <span aria-hidden="true"></span>
       <div class="capsule-right glass" role="toolbar" aria-label="Player tools">
-        <button type="button" class="ib btn-lock" aria-label="Lock touch controls">${icon('lock')}</button>
-        <button type="button" class="ib btn-info adv narrow-hide" aria-pressed="false" aria-label="Stream statistics">${icon('info')}</button>
-        <button type="button" class="ib ring-host btn-dl adv" aria-label="Download stream">${icon('download')}<svg class="ring" viewBox="0 0 44 44" aria-hidden="true" hidden><circle class="track" cx="22" cy="22" r="19"/><circle class="prog" cx="22" cy="22" r="19" stroke-dasharray="119.38" stroke-dashoffset="119.38"/></svg></button>
-        <button type="button" class="ib btn-audio-only adv narrow-hide" aria-pressed="false" aria-label="Audio-only battery saver">${icon('headphones')}</button>
-        <button type="button" class="ib btn-mini" aria-label="Collapse to mini player">${icon('mini')}</button>
+        <button type="button" class="ib btn-lock" data-look="lock" aria-label="Lock touch controls">${icon('lock')}</button>
+        <button type="button" class="ib btn-info adv narrow-hide" data-look="info" aria-pressed="false" aria-label="Stream statistics">${icon('info')}</button>
+        <button type="button" class="ib ring-host btn-dl adv" data-look="dl" aria-label="Download stream">${icon('download')}<svg class="ring" viewBox="0 0 44 44" aria-hidden="true" hidden><circle class="track" cx="22" cy="22" r="19"/><circle class="prog" cx="22" cy="22" r="19" stroke-dasharray="119.38" stroke-dashoffset="119.38"/></svg></button>
+        <button type="button" class="ib btn-audio-only adv narrow-hide" data-look="audioOnly" aria-pressed="false" aria-label="Audio-only battery saver">${icon('headphones')}</button>
+        <button type="button" class="ib btn-mini" data-look="mini" aria-label="Collapse to mini player">${icon('mini')}</button>
       </div>
     </header>
 
@@ -2071,6 +2214,7 @@ input[type="text"] { width: 100%; min-width: 0; }
     </div>
 
     <section class="deck glass" aria-label="Playback controls">
+      <button type="button" class="deck-grip" aria-label="Move controls (arrow keys or drag)" hidden><span aria-hidden="true"></span></button>
       <div class="row1">
         <span class="t-left num" aria-hidden="true">00:00</span>
         <div class="timeline" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="0 seconds of 0 seconds">
@@ -2082,29 +2226,38 @@ input[type="text"] { width: 100%; min-width: 0; }
             <div class="marks"></div>
             <div class="thumb"></div>
           </div>
+          <canvas class="scrub-heat" aria-hidden="true" hidden></canvas>
           <div class="tip glass elevated" aria-hidden="true"><div class="tip-thumb" hidden></div><span class="tip-chapter" hidden></span><span class="tip-text">00:00</span></div>
         </div>
         <button type="button" class="t-right num" aria-label="Show remaining time">00:00</button>
       </div>
       <div class="row2">
         <div class="zone-left">
-          <div class="vol">
+          <div class="vol" data-look="volume">
             <button type="button" class="ib btn-mute" aria-label="Mute">${icon('volume')}</button>
             <input type="range" class="vol-slider" min="0" max="100" step="1" value="100" aria-label="Volume" aria-valuetext="100%">
+          </div>
+          <div class="pro-group" role="group" aria-label="Pro tools">
+            <button type="button" class="ib pro btn-frame-back" data-look="frameBack" aria-label="Previous frame">${icon('frameBack')}</button>
+            <button type="button" class="ib pro btn-frame-fwd" data-look="frameFwd" aria-label="Next frame">${icon('frameFwd')}</button>
+            <button type="button" class="ib pro btn-ab" data-look="loop" aria-pressed="false" aria-label="A–B loop: set point A">${icon('loop')}</button>
+            <button type="button" class="ib pro btn-snap" data-look="snapshot" aria-label="Save snapshot">${icon('camera')}</button>
+            <button type="button" class="ib pro btn-eq narrow-hide" data-look="eq" aria-haspopup="dialog" aria-expanded="false" aria-label="Audio and equalizer">${icon('wave')}</button>
+            <button type="button" class="ib pro btn-gpu narrow-hide" data-look="gpu" aria-haspopup="dialog" aria-expanded="false" aria-label="Picture, GPU enhancement and colour">${icon('bolt')}</button>
           </div>
           <button type="button" class="pillbtn skip-intro" hidden>${icon('skip')}<span class="num">+85s</span></button>
         </div>
         <div class="zone-center">
-          <button type="button" class="ib btn-back" aria-label="Seek back 10 seconds">${skipIcon(-1, 10)}</button>
+          <button type="button" class="ib btn-back" data-look="back" aria-label="Seek back 10 seconds">${skipIcon(-1, 10)}</button>
           <button type="button" class="ib btn-play" aria-label="Play">${icon('play')}</button>
-          <button type="button" class="ib btn-fwd" aria-label="Seek forward 10 seconds">${skipIcon(1, 10)}</button>
+          <button type="button" class="ib btn-fwd" data-look="fwd" aria-label="Seek forward 10 seconds">${skipIcon(1, 10)}</button>
         </div>
         <div class="zone-right">
-          <button type="button" class="pillbtn speed-pill adv narrow-hide" aria-haspopup="menu" aria-expanded="false" aria-label="Playback speed 1.0×"><span class="num">1.0×</span></button>
-          <button type="button" class="ib btn-cc" aria-haspopup="dialog" aria-expanded="false" aria-label="Subtitles and audio tracks">${icon('captions')}</button>
-          <button type="button" class="ib btn-studio" aria-haspopup="dialog" aria-expanded="false" aria-label="Studio settings">${icon('studio')}</button>
-          <button type="button" class="ib btn-pip adv narrow-hide" aria-label="Picture in Picture">${icon('pip')}</button>
-          <button type="button" class="ib btn-fs" aria-label="Enter full screen">${icon('fullscreen')}</button>
+          <button type="button" class="pillbtn speed-pill adv narrow-hide" data-look="speed" aria-haspopup="menu" aria-expanded="false" aria-label="Playback speed 1.0×"><span class="num">1.0×</span></button>
+          <button type="button" class="ib btn-cc" data-look="cc" aria-haspopup="dialog" aria-expanded="false" aria-label="Subtitles and audio tracks">${icon('captions')}</button>
+          <button type="button" class="ib btn-studio" data-look="studio" aria-haspopup="dialog" aria-expanded="false" aria-label="Studio settings">${icon('studio')}</button>
+          <button type="button" class="ib btn-pip adv narrow-hide" data-look="pip" aria-label="Picture in Picture">${icon('pip')}</button>
+          <button type="button" class="ib btn-fs" data-look="fs" aria-label="Enter full screen">${icon('fullscreen')}</button>
         </div>
       </div>
     </section>
@@ -2177,6 +2330,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             r.dataset.rm = s.reducedMotion;
             r.dataset.simple = String(!!s.simpleMode);
             r.style.setProperty('--fs-scale', String(s.uiScale || 1));
+            this.applyLook();
             this.$('.stats').classList.toggle('show', !!s.showStats);
             this.$('.btn-info').setAttribute('aria-pressed', String(!!s.showStats));
             setHTML(this.$('.btn-back'), skipIcon(-1, s.seekStep));
@@ -2194,6 +2348,182 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (this.audio.active) this.audio.apply(s.audio);
             if (s.autoHideMs === 0) this.showControls(true);
             this.later(0, () => this.layoutVideo());
+        }
+
+        /**
+         * Player look: skin, density, scrubber, background darkness, hidden buttons and the order
+         * of the right-hand buttons. Zones and buttons are moved in the DOM (not with CSS `order`)
+         * so keyboard focus always follows what is on screen; nodes are only moved when the order
+         * really changed, so a focused button keeps focus on unrelated setting changes.
+         */
+        applyLook() {
+            const r = this.root;
+            const lk = this.settings.look;
+            r.dataset.skin = lk.skin;
+            r.dataset.density = lk.density;
+            r.dataset.scrub = lk.scrubber;
+            r.style.setProperty('--scrub-h', `${lk.scrubHeight}px`);
+            if (lk.scrim >= 0) {
+                r.dataset.scrim = '';
+                r.style.setProperty('--scrim-a', String(lk.scrim / 100));
+            } else {
+                delete r.dataset.scrim;
+                r.style.removeProperty('--scrim-a');
+            }
+            r.style.setProperty('--pill-x', String(lk.pillX));
+            r.style.setProperty('--pill-y', String(lk.pillY));
+            const hidden = new Set(lk.hidden);
+            for (const el of this.$$('[data-look]')) el.classList.toggle('look-off', hidden.has(el.dataset.look));
+            this.$('.deck-grip').hidden = lk.skin !== 'pill';
+
+            const zr = this.$('.zone-right');
+            const order = [...new Set(lk.order.concat(LOOK_ORDERABLE))];
+            const now = Array.from(zr.children).map(el => el.dataset.look).filter(Boolean);
+            if (now.join() !== order.filter(id => now.includes(id)).join()) {
+                for (const id of order) { const el = zr.querySelector(`[data-look="${id}"]`); if (el) zr.appendChild(el); }
+            }
+            // Docked skins put play / seek at the start of the row, like most video sites.
+            const row2 = this.$('.row2');
+            const zc = this.$('.zone-center');
+            const zl = this.$('.zone-left');
+            const centreFirst = ['cinema', 'theater', 'compact'].includes(lk.skin);
+            if (centreFirst && row2.firstElementChild !== zc) row2.insertBefore(zc, zl);
+            else if (!centreFirst && row2.firstElementChild === zc) row2.insertBefore(zl, zc);
+
+            this.updateAbButton();
+            if (this.video) { this.renderMarks(); this.tickHeat(true); }
+        }
+
+        /** The Pro A–B button cycles: set A, set B, clear. */
+        cycleAbLoop() {
+            if (this.loop.a == null) this.setLoopPoint('a');
+            else if (this.loop.b == null) this.setLoopPoint('b');
+            else this.clearLoop();
+        }
+
+        updateAbButton() {
+            const b = this.$('.btn-ab');
+            if (!b) return;
+            const { a, b: pb } = this.loop;
+            b.setAttribute('aria-pressed', String(a != null));
+            b.setAttribute('aria-label', a == null ? 'A–B loop: set point A' : pb == null ? 'A–B loop: set point B' : 'A–B loop: clear loop');
+        }
+
+        /** Pro EQ / GPU buttons open Studio straight on their tab (a second click closes it). */
+        openStudioTab(tab, btn) {
+            if (this.popKind === 'studio' && this.popButton === btn && this.studioTab === tab) { this.closePopover(true); return; }
+            this.studioTab = tab;
+            this.openPopover('studio', btn);
+        }
+
+        /**
+         * Floating-pill skin: drag the deck by its grip or any empty part of it, or move it with the
+         * arrow keys on the grip (Shift = bigger steps, Home = back to the default spot). The centre
+         * point is stored as a fraction of the player, so it survives resizes and full screen.
+         */
+        bindDeckDrag() {
+            const deck = this.deck;
+            const grip = this.$('.deck-grip');
+            let drag = null;
+            const usable = () => this.settings.look.skin === 'pill' && getComputedStyle(grip).display !== 'none';
+            const place = (x, y, save) => {
+                const rect = this.root.getBoundingClientRect();
+                const hw = deck.offsetWidth / 2 / Math.max(1, rect.width);
+                const hh = deck.offsetHeight / 2 / Math.max(1, rect.height);
+                x = clamp(x, Math.min(0.5, hw), Math.max(0.5, 1 - hw));
+                y = clamp(y, Math.min(0.5, hh), Math.max(0.5, 1 - hh));
+                this.root.style.setProperty('--pill-x', String(x));
+                this.root.style.setProperty('--pill-y', String(y));
+                if (save) this.saveSettings({ look: { ...this.settings.look, pillX: Math.round(x * 1000) / 1000, pillY: Math.round(y * 1000) / 1000 } });
+                return [x, y];
+            };
+            this.listen(deck, 'pointerdown', (e) => {
+                if (!usable() || e.button > 0) return;
+                if (!grip.contains(e.target) && e.target.closest('button, input, select, .timeline')) return;
+                const d = deck.getBoundingClientRect();
+                drag = { id: e.pointerId, dx: e.clientX - (d.left + d.width / 2), dy: e.clientY - (d.top + d.height / 2), x: 0, y: 0 };
+                try { deck.setPointerCapture(e.pointerId); } catch (_) { /* pointer already gone */ }
+                deck.classList.add('dragging');
+                e.preventDefault();
+                e.stopPropagation();
+            });
+            this.listen(deck, 'pointermove', (e) => {
+                if (!drag || e.pointerId !== drag.id) return;
+                const rect = this.root.getBoundingClientRect();
+                [drag.x, drag.y] = place((e.clientX - drag.dx - rect.left) / rect.width, (e.clientY - drag.dy - rect.top) / rect.height, false);
+                this.showControls();
+            });
+            const end = (e) => {
+                if (!drag || e.pointerId !== drag.id) return;
+                deck.classList.remove('dragging');
+                if (drag.x || drag.y) place(drag.x, drag.y, true);
+                drag = null;
+            };
+            this.listen(deck, 'pointerup', end);
+            this.listen(deck, 'pointercancel', end);
+            this.listen(grip, 'keydown', (e) => {
+                if (!usable()) return;
+                const lk = this.settings.look;
+                const step = e.shiftKey ? 0.1 : 0.02;
+                const moves = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+                let xy = null;
+                if (moves[e.key]) xy = [lk.pillX + moves[e.key][0], lk.pillY + moves[e.key][1]];
+                else if (e.key === 'Home') xy = [0.5, 0.85];
+                if (!xy) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const [x, y] = place(xy[0], xy[1], true);
+                this.announceOnly(`Controls moved to ${Math.round(x * 100)}% across, ${Math.round(y * 100)}% down`);
+            });
+        }
+
+        /**
+         * Heatmap scrubber: a strip above the seek bar. Bar height is the loudness heard in that
+         * slice of the video (measured while it plays, once the audio graph is running); colour
+         * shows what is played (accent), buffered (dim accent) or not loaded yet (grey).
+         */
+        tickHeat(force) {
+            const c = this.$('.scrub-heat');
+            const on = this.settings.look.scrubber === 'heatmap' && !this.isLive() && !this.mini;
+            c.hidden = !on;
+            if (!on) return;
+            const v = this.video;
+            const r = this.seekRange();
+            const span = r.end - r.start;
+            if (!(span > 1)) return;
+            const N = 120;
+            if (!this.heat || this.heat.span !== Math.round(span)) this.heat = { span: Math.round(span), lv: new Float32Array(N) };
+            const lv = this.heat.lv;
+            if (!v.paused && this.audio.active) {
+                const i = clamp(Math.floor((v.currentTime - r.start) / span * N), 0, N - 1);
+                const level = Math.min(1, Math.sqrt(this.audio.rms()) * 1.6);
+                lv[i] = lv[i] ? lv[i] * 0.6 + level * 0.4 : Math.max(level, 0.05);
+            }
+            if (!force && (this.tickCount || 0) % 2) return; // draw at 2 Hz
+            const dpr = Math.min(2, window.devicePixelRatio || 1);
+            const W = Math.round(c.clientWidth * dpr);
+            const H = Math.round(18 * dpr);
+            if (!W) return;
+            if (c.width !== W) c.width = W;
+            if (c.height !== H) c.height = H;
+            const g = c.getContext('2d');
+            g.clearRect(0, 0, W, H);
+            const ranges = [];
+            for (let i = 0; i < v.buffered.length; i++) ranges.push([v.buffered.start(i), v.buffered.end(i)]);
+            if (this.engineStats && this.stream && this.stream.type === 'hls') for (const cr of this.engineStats.cachedRanges || []) ranges.push([cr.start, cr.end]);
+            const accent = getComputedStyle(this.root).getPropertyValue('--fs-accent').trim() || '#0a84ff';
+            const bw = W / N;
+            const gap = Math.max(1, Math.round(dpr));
+            for (let i = 0; i < N; i++) {
+                const t = r.start + (i + 0.5) / N * span;
+                const h = Math.max(0.14, lv[i]) * H;
+                const played = t <= v.currentTime;
+                const buffered = played || ranges.some(([s, e]) => t >= s && t <= e);
+                g.fillStyle = buffered ? accent : 'rgba(255,255,255,0.28)';
+                g.globalAlpha = played ? 0.95 : buffered ? 0.5 : 1;
+                g.fillRect(Math.round(i * bw), H - h, Math.max(1, Math.round(bw) - gap), h);
+            }
+            g.globalAlpha = 1;
         }
 
         /** Apply a user edit now and persist it (debounced). */
@@ -2318,6 +2648,13 @@ input[type="text"] { width: 100%; min-width: 0; }
             on('.speed-pill', 'click', (e) => this.togglePopover('speed', e.currentTarget));
             on('.btn-cc', 'click', (e) => this.togglePopover('captions', e.currentTarget));
             on('.btn-studio', 'click', (e) => this.togglePopover('studio', e.currentTarget));
+            on('.btn-frame-back', 'click', () => this.stepFrame(-1));
+            on('.btn-frame-fwd', 'click', () => this.stepFrame(1));
+            on('.btn-ab', 'click', () => this.cycleAbLoop());
+            on('.btn-snap', 'click', (e) => this.screenshot(e.shiftKey));
+            on('.btn-eq', 'click', (e) => this.openStudioTab('audio', e.currentTarget));
+            on('.btn-gpu', 'click', (e) => this.openStudioTab('display', e.currentTarget));
+            this.bindDeckDrag();
             on('.skip-intro', 'click', () => {
                 const target = this.smartSkip;
                 if (target && this.smartSkipChapter(this.video.currentTime)) {
@@ -4045,6 +4382,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (!this.dragging) this.renderTimeline();
             this.updateAmbient(false);
             if (this.audio.active) this.audio.tickLoudness();
+            if (this.settings) this.tickHeat(false);
             this.updateViz();
             if (this.transcriptOpen) { this.renderTranscript(false); this.updateTranscriptActive(false); }
             this.tickCount = (this.tickCount || 0) + 1;
@@ -4525,6 +4863,19 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (this.loop.a != null) html += `<div class="mark" style="left:${pos(this.loop.a)}%"></div>`;
             if (this.loop.b != null) html += `<div class="mark" style="left:${pos(this.loop.b)}%"></div>`;
             setHTML(this.$('.marks'), html);
+            // Chapters scrubber: cut a 3 px gap into the bar at every chapter start.
+            const track = this.$('.track');
+            const cuts = this.settings && this.settings.look.scrubber === 'chapters'
+                ? (this.chapters || []).filter(c => c.start > r.start + 0.5 && c.start < r.end - 0.5).map(c => pos(c.start).toFixed(3)) : [];
+            const mask = cuts.length
+                ? `linear-gradient(to right, #000 0, ${cuts.map(p => `#000 calc(${p}% - 1.5px), transparent calc(${p}% - 1.5px), transparent calc(${p}% + 1.5px), #000 calc(${p}% + 1.5px)`).join(', ')}, #000 100%)`
+                : '';
+            if (track.dataset.mask !== mask) {
+                track.dataset.mask = mask;
+                track.style.setProperty('-webkit-mask-image', mask || 'none');
+                track.style.setProperty('mask-image', mask || 'none');
+            }
+            this.updateAbButton();
             const lr = this.$('.loop-range');
             if (this.loop.a != null && this.loop.b != null) {
                 lr.hidden = false;
@@ -5521,6 +5872,7 @@ ${this.selectField('pf-rm', 'Reduce motion', [['system', 'System'], ['on', 'Alwa
 ${this.switchField('pf-simple', 'Simple mode (fewer buttons)', s.simpleMode)}
 ${this.selectField('pf-autohide', 'Auto-hide controls', AUTOHIDE, s.autoHideMs)}
 ${this.switchField('pf-stats', 'Stats for nerds', s.showStats)}
+${this.lookSection()}
 <div class="section-label">Playback</div>
 ${this.selectField('pf-resume', 'Resume where I left off', [['ask', 'Ask'], ['always', 'Always'], ['off', 'Off']], s.autoResume)}
 ${this.selectField('pf-seek', 'Seek step', SEEK_STEPS.map(v => [v, `${v} s`]), s.seekStep)}
@@ -5558,6 +5910,71 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
 <p class="hint">Settings, site profiles, presets, shortcuts, bookmarks and watch history in one .json file.</p>
 <div role="menu" aria-label="Backup and restore">${this.row({ id: 'pf-backup-export', label: 'Export settings (.json)', role: 'menuitem', lead: 'download' })}${this.row({ id: 'pf-backup-import', label: 'Import settings (.json)', role: 'menuitem', lead: 'rotate' })}</div>
 <input type="file" id="pf-backup-file" accept=".json,application/json" hidden>`;
+        }
+
+        /** Prefs → Player look: skin, density, scrubber, darkness, button visibility and order. */
+        lookSection() {
+            const lk = this.settings.look;
+            const skin = SKINS.find(k => k[0] === lk.skin) || SKINS[0];
+            const scrimText = lk.scrim < 0 ? 'Skin default' : `${lk.scrim}%`;
+            const shows = LOOK_BUTTONS.map(id => this.switchField(`pf-lb-${id}`, `${LOOK_LABELS[id]}${LOOK_PRO.includes(id) ? ' (Pro)' : ''}`, !lk.hidden.includes(id))).join('');
+            const order = [...new Set(lk.order.concat(LOOK_ORDERABLE))];
+            const rows = order.map((id, i) => `<div class="list-row"><span>${esc(LOOK_LABELS[id])}</span><button type="button" class="pillbtn" id="pf-lo-up-${id}" data-move="${id}" data-dir="-1"${i === 0 ? ' disabled' : ''} aria-label="Move ${esc(LOOK_LABELS[id])} left">Left</button><button type="button" class="pillbtn" id="pf-lo-dn-${id}" data-move="${id}" data-dir="1"${i === order.length - 1 ? ' disabled' : ''} aria-label="Move ${esc(LOOK_LABELS[id])} right">Right</button></div>`).join('');
+            return `<div class="section-label">Player look</div>
+${this.selectField('pf-skin', 'Skin', SKINS.map(k => [k[0], k[1]]), lk.skin)}
+<p class="hint" id="pf-skin-hint">${esc(skin[2])}</p>
+${this.selectField('pf-density', 'Controls', [['minimal', 'Minimal'], ['standard', 'Standard'], ['pro', 'Pro (frame step, A–B, snapshot, EQ, GPU)']], lk.density)}
+${this.selectField('pf-scrubber', 'Seek bar', [['classic', 'Classic'], ['chapters', 'Chapter segments'], ['heatmap', 'Loudness & buffer heatmap']], lk.scrubber)}
+${this.rangeField('pf-scrubh', 'Seek bar thickness', 4, 10, 1, lk.scrubHeight, `${lk.scrubHeight} px`)}
+${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim < 0 ? -5 : lk.scrim, scrimText)}
+<details class="look-more" data-sec="buttons"${this.lookOpen.buttons ? ' open' : ''}><summary>Show or hide buttons</summary>${shows}<p class="hint">Studio and Play are always shown. Hidden buttons keep their keyboard shortcuts.</p></details>
+<details class="look-more" data-sec="order"${this.lookOpen.order ? ' open' : ''}><summary>Order of the right-hand buttons</summary>${rows}</details>
+<div role="menu" aria-label="Player look">${this.row({ id: 'pf-look-reset', label: 'Reset player look', role: 'menuitem', lead: 'rotate' })}</div>`;
+        }
+
+        bindLook(byId, select, range) {
+            const set = (patch, say) => { this.saveSettings({ look: { ...this.settings.look, ...patch } }); if (say) this.announceOnly(say); };
+            select('pf-skin', v => {
+                const name = (SKINS.find(k => k[0] === v) || SKINS[0])[1];
+                // Compact is built around one-click tools: turn Pro on unless the user chose Minimal.
+                const patch = { skin: v };
+                if (v === 'compact' && this.settings.look.density === 'standard') patch.density = 'pro';
+                set(patch, `Skin: ${name}${patch.density ? ', Pro controls on' : ''}`);
+                this.refreshPopover();
+            });
+            // Remember which collapsible sections are open, so re-renders of the panel keep them open.
+            this.pop.querySelectorAll('details.look-more').forEach(d => d.addEventListener('toggle', () => { this.lookOpen[d.dataset.sec] = d.open; }));
+            select('pf-density', v => set({ density: v }, `Controls: ${v}`));
+            select('pf-scrubber', v => set({ scrubber: v }));
+            range('pf-scrubh', v => set({ scrubHeight: v }), v => `${v} px`);
+            range('pf-scrim', v => set({ scrim: v < 0 ? -1 : v }), v => (v < 0 ? 'Skin default' : `${v}%`));
+            for (const id of LOOK_BUTTONS) {
+                const el = byId(`pf-lb-${id}`);
+                if (el) el.addEventListener('change', () => {
+                    const hidden = new Set(this.settings.look.hidden);
+                    if (el.checked) hidden.delete(id); else hidden.add(id);
+                    set({ hidden: [...hidden] });
+                });
+            }
+            this.pop.querySelectorAll('[data-move]').forEach(btn => btn.addEventListener('click', () => {
+                const order = [...new Set(this.settings.look.order.concat(LOOK_ORDERABLE))];
+                const i = order.indexOf(btn.dataset.move);
+                const j = i + +btn.dataset.dir;
+                if (i < 0 || j < 0 || j >= order.length) return;
+                [order[i], order[j]] = [order[j], order[i]];
+                set({ order }, `${LOOK_LABELS[order[j]]} moved to position ${j + 1} of ${order.length}`);
+                const keep = btn.id;
+                this.refreshPopover();
+                const again = byId(keep);
+                const target = again && !again.disabled ? again : byId(keep.replace(/-(up|dn)-/, (m, d) => (d === 'up' ? '-dn-' : '-up-')));
+                if (target) target.focus();
+            }));
+            const reset = byId('pf-look-reset');
+            if (reset) reset.addEventListener('click', () => {
+                this.saveSettings({ look: { ...window.VelostreamShared.DEFAULT_SETTINGS.look, hidden: [], order: [] } });
+                this.announceOnly('Player look reset');
+                this.refreshPopover();
+            });
         }
 
         popHelp() {
@@ -5804,6 +6221,7 @@ ${this.selectField('pf-middle', 'Middle click', TAP_ACTIONS.concat([['mute', 'Mu
                 sw('pf-simple', v => this.saveSettings({ simpleMode: v }));
                 select('pf-autohide', v => { this.saveSettings({ autoHideMs: +v }); this.scheduleHide(); });
                 sw('pf-stats', v => this.saveSettings({ showStats: v }));
+                this.bindLook(byId, select, range);
                 select('pf-resume', v => this.saveSettings({ autoResume: v }));
                 select('pf-seek', v => this.saveSettings({ seekStep: +v }));
                 select('pf-defspeed', v => this.saveSettings({ defaultSpeed: +v }));

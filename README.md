@@ -49,6 +49,7 @@ no remote code. See [PRIVACY.md](PRIVACY.md).
 | **Subtitles** | Site subtitles captured automatically (network, `<track>`, in-memory text tracks), SRT/VTT/ASS files, dual subtitles, sync to the next spoken line, timing speed, pause on hover, click to copy, full styling including dyslexia-friendly fonts. |
 | **Audio** | Boost up to 300 %, presets (voice, bass, night) and 5-band EQ, A/V delay, pitch-preserving speed, mono/left/right channel routing, audio-only battery saver. |
 | **Downloads** | VOD to a single **MP4** (TS→fMP4 remux, audio merged) or the original format, live recording, DVR save, PNG snapshots and frame-burst contact sheets. External handoff to PotPlayer, VLC, mpv, IINA or an Android app, or copy a ready `yt-dlp`/`ffmpeg` command with the right headers. |
+| **Player look** | Five skins (Glass, Cinema, Theater, draggable Floating pill, Compact), Minimal / Standard / Pro controls (frame step, A–B loop, snapshot, one-click EQ and GPU), chapter-segment or loudness-heatmap seek bar, bar thickness, background darkness, and per-button show / hide and order. |
 | **Accessibility** | Full keyboard operation, screen-reader announcements, focus management, high-contrast mode, reduced motion, interface scaling (85–150 %), simple mode. |
 
 The full tour is in **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)**.
