@@ -33,8 +33,12 @@
                 <ul id="library-tabs" class="lib-tabs">
                     <li><a href="#continue" data-view="continue"><span>Continue watching</span><span class="count num" data-count="continue">0</span></a></li>
                     <li><a href="#recent" data-view="recent"><span>Recently watched</span><span class="count num" data-count="recent">0</span></a></li>
+                    <li><a href="#anime" data-view="anime"><span>Anime</span><span class="count num" data-count="anime">0</span></a></li>
+                    <li><a href="#donghua" data-view="donghua"><span>Donghua</span><span class="count num" data-count="donghua">0</span></a></li>
+                    <li><a href="#cartoon" data-view="cartoon"><span>Cartoons</span><span class="count num" data-count="cartoon">0</span></a></li>
                     <li><a href="#series" data-view="series"><span>Series</span><span class="count num" data-count="series">0</span></a></li>
                     <li><a href="#movies" data-view="movies"><span>Movies</span><span class="count num" data-count="movies">0</span></a></li>
+                    <li><a href="#video" data-view="video"><span>Other videos</span><span class="count num" data-count="video">0</span></a></li>
                     <li><a href="#favorites" data-view="favorites"><span>Favorites</span><span class="count num" data-count="favorites">0</span></a></li>
                     <li><a href="#collections" data-view="collections"><span>Collections</span><span class="count num" data-count="collections">0</span></a></li>
                     <li><a href="#bookmarked" data-view="bookmarked"><span>Bookmarked</span><span class="count num" data-count="bookmarked">0</span></a></li>
@@ -43,6 +47,7 @@
 
             <main id="main" class="lib-main" tabindex="-1" aria-labelledby="view-title">
                 <div class="lib-toolbar" role="search" aria-label="Filter videos">
+                    <label class="lib-sort"><span class="sr-only">Source website</span><select id="source-site"><option value="">All websites</option></select></label>
                     <div class="lib-search">
                         <label for="search" class="sr-only">Search by title or site</label>
                         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>

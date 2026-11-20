@@ -504,9 +504,10 @@
     // -------------------------------------------------------------------
     document.addEventListener('DOMContentLoaded', async () => {
         $('version').textContent = `Velostream v${api.runtime.getManifest().version}`;
-        const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+        const [tab] = await api.tabs.query({ active: true, currentWindow: true }).catch(() => []);
         tabId = tab ? tab.id : null;
 
+        for (const [value, label] of S.GRAPHICS_PRESETS) $('s-shader').add(new Option(label, value));
         await loadSettings();
         setupSiteToggle(tab); // needs the loaded settings
         checkPermissions();
@@ -690,8 +691,10 @@
             if (changes[S.HISTORY_KEY]) renderHistory();
         });
 
-        if (tabId === null) {
-            showMessage('No active tab.');
+        if (!tab || !/^https?:\/\//i.test(tab.url || '')) {
+            $('status-text').textContent = 'Site needed';
+            $('empty-copy').textContent = 'Open a website with a video to find streams.';
+            for (const id of ['rescan-btn', 'empty-rescan', 'clear-btn']) $(id).disabled = true;
             return;
         }
         await Promise.all([refreshStreams(), refreshStats()]);

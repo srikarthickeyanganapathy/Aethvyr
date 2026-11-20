@@ -227,20 +227,34 @@
         const titles = [meta('title'), document.querySelector('h1')?.textContent, document.title].map(v => (v || '').trim()).filter(Boolean);
         let path = location.pathname;
         try { path = decodeURIComponent(path); } catch (_) { /* malformed escape */ }
-        const source = [...titles, path].join(' ');
-        const episode = source.match(/(?:\b(?:episodes?|ep)[\s._/-]*|\bs\d+e)(\d+(?:\.\d+)?)/i);
-        const season = source.match(/\b(?:season[\s._/-]*|s)(\d+)(?:e\d|\b)/i);
-        const titleFromPath = path.match(/\/(?:series|shows?|anime|movies?)\/([^/]+)/i)?.[1]?.replace(/[-_]/g, ' ') || '';
-        const showTitle = [...titles, titleFromPath].map(title => title.replace(/\s*(?:[-–—:|]\s*)?(?:\b(?:season|episodes?|ep)[\s._-]*\d|\bs\d+e\d).*$/i, '').trim()).find(Boolean) || '';
+        const siteName = meta('site_name') || location.hostname;
+        let structured;
+        for (const script of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0, 6)) {
+            if (!script.textContent || script.textContent.length > 65536) continue;
+            try {
+                const data = JSON.parse(script.textContent);
+                const nodes = Array.isArray(data) ? data : Array.isArray(data?.['@graph']) ? data['@graph'] : [data];
+                structured = nodes.find(node => ['Movie', 'TVSeries', 'TVEpisode'].includes(node?.['@type']));
+                if (structured) break;
+            } catch (_) { /* invalid structured metadata */ }
+        }
+        const tags = [...document.querySelectorAll('meta[property="video:tag"], meta[property="article:tag"], meta[name="genre"]')].slice(0, 12).map(m => m.content);
+        const classification = S.classifyLibraryMedia({
+            pageUrl: location.href, siteName, title: titles.join(' '),
+            type: structured?.['@type'] || meta('type'), hints: [...tags, structured?.genre].join(' ')
+        });
+        const season = structured?.partOfSeason?.seasonNumber;
+        const episode = structured?.episodeNumber;
+        if (typeof season === 'number' && Number.isFinite(season)) classification.season = season;
+        if (typeof episode === 'number' && Number.isFinite(episode)) classification.episode = episode;
+        const titleFromPath = path.match(/\/(?:series|shows?|anime|donghua|cartoons?|movies?)\/([^/]+)/i)?.[1]?.replace(/[-_]/g, ' ') || '';
+        const showTitle = [structured?.partOfSeries?.name, structured?.name, ...titles, titleFromPath].filter(title => typeof title === 'string').map(title => title.replace(/\s*(?:[-–—:|]\s*)?(?:\b(?:season|episodes?|ep)[\s._-]*\d|\bs\d+e\d).*$/i, '').trim()).find(Boolean) || '';
         const poster = meta('image') ? S.normalizeUrl(meta('image'), location.href) : '';
         const pageMeta = {
             pageUrl: location.href,
-            siteName: (meta('site_name') || location.hostname).slice(0, 200),
+            siteName: siteName.slice(0, 200),
             showTitle: showTitle.slice(0, 200),
-            kind: episode || season || /^(?:video\.episode|video\.tv_show)$/.test(meta('type')) ? 'series' :
-                meta('type') === 'video.movie' || /(?:^|\/)movies?(?:\/|$)/i.test(path) ? 'movie' : 'video',
-            season: season ? Number(season[1]) : null,
-            episode: episode ? Number(episode[1]) : null,
+            ...classification,
             poster: /^https?:/i.test(poster || '') ? poster : ''
         };
         const snapshot = JSON.stringify(pageMeta);

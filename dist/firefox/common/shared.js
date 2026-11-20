@@ -40,6 +40,24 @@
         help: '?'
     });
 
+    const GRAPHICS_PRESETS = Object.freeze([
+        ['off', 'Off'], ['auto', 'Auto'], ['cas', 'Detail sharpening'],
+        ['deblock', 'Compression cleanup'], ['anime4k', 'Anime4K'], ['anime4k-hq', 'Anime4K High']
+    ].map(Object.freeze));
+
+    function normalizeGraphicsPreset(value) {
+        if (value === 'fsr') return 'cas';
+        if (value === 'denoise' || value === 'deband') return 'off';
+        return GRAPHICS_PRESETS.some(([id]) => id === value) ? value : 'off';
+    }
+
+    function graphicsBudget(tier, mobile, sourceHeight) {
+        if (mobile) return { preset: 'cas', maxHeight: tier === 'low' ? 720 : 1080 };
+        if (tier === 'low') return { preset: 'cas', maxHeight: 720 };
+        if (tier === 'high') return { preset: 'cas', maxHeight: 1440 };
+        return { preset: sourceHeight > 0 && sourceHeight <= 480 ? 'deblock' : 'cas', maxHeight: 1080 };
+    }
+
     const DEFAULT_SETTINGS = Object.freeze({
         // Appearance & accessibility
         theme: 'blue',               // accent: blue | green | indigo | amber | rose
@@ -213,8 +231,8 @@
         out.mseBufferAhead = Math.min(300, Math.max(15, out.mseBufferAhead));
         out.mseBufferBehind = Math.min(300, Math.max(10, out.mseBufferBehind));
         out.rebufferingGoal = Math.min(5, Math.max(0.5, out.rebufferingGoal));
-        out.shaderStrength = Math.min(100, Math.max(0, out.shaderStrength));
-        if (!['off', 'cas', 'fsr', 'anime4k', 'anime4k-hq', 'deblock', 'denoise', 'deband'].includes(out.shader)) out.shader = 'off';
+        out.shaderStrength = Number.isFinite(out.shaderStrength) ? Math.min(100, Math.max(0, out.shaderStrength)) : DEFAULT_SETTINGS.shaderStrength;
+        out.shader = normalizeGraphicsPreset(out.shader);
         if (!['mp4', 'original'].includes(out.exportFormat)) out.exportFormat = 'mp4';
         out.gestures.doubleTapZoneWidth = Math.min(0.45, Math.max(0.2, out.gestures.doubleTapZoneWidth));
         out.siteProfiles = out.siteProfiles.filter(p => isPlainObject(p) && typeof p.host === 'string').slice(0, 200);
@@ -475,6 +493,44 @@
     const withoutResumeTime = value => typeof value === 'string' ? value.replace(/[#&?]velostream-t=\d+(?:\.\d+)?$/, '') : '';
     const finiteNum = (n) => (typeof n === 'number' && Number.isFinite(n) ? n : null);
 
+    const LIBRARY_TYPES = Object.freeze({
+        series: 'Series', movie: 'Movie', anime: 'Anime', donghua: 'Donghua', cartoon: 'Cartoon', video: 'Other video'
+    });
+    const DONGHUA_SITES = new Set(['animexin', 'luciferdonghua', 'lmanime', 'donghuastream', 'cksub', 'animekhor', 'crimsonsubs']);
+    const ANIME_SITES = new Set(['9anime', 'hianime', 'animepahe', 'crunchyroll', 'animeonsen', 'animesnatch', 'anisnatch', 'animeparadise', 'anikura', 'anikage', 'animekisa', 'animedex', 'watchanimex', 'anilover', 'animelover', 'anihq', 'anify', 'animekai', 'animegogo', 'gogoanime', 'anichan', 'anistream', 'animestream', 'kawaiianime', 'meguanimes', 'yumezone', 'yenime', 'aniclover', 'kotoplay', 'anisuge', 'reanime', 'anidream', 'miruro', 'anivault', 'gotaku', 'animex', 'anilight', 'nekowatch', 'anidap', 'anixo', 'justanime', 'weebtube', 'kickassanime', 'animenexus', 'zanix', 'kuroko', 'animey', 'aniwave', '123anime', 'anizone', 'animo', 'animotvslash', 'animetvplus', 'anihost', '2dhive', 'tsukuyomi', 'kyren', 'shonen', 'tatakai', 'enma', 'pahenime', 'banime', 'sakusaku', 'kototv', 'zenbu']);
+    const CARTOON_SITES = new Set(['funniermoments', 'megacartoons', 'toontales', 'supercartoons', 'eddvault']);
+
+    function classifyLibraryMedia({ pageUrl, siteName, title, hints, type, kind, medium } = {}) {
+        let route = '';
+        let hostLabels = [];
+        try {
+            const url = new URL(pageUrl);
+            hostLabels = url.hostname.split('.').slice(0, -1);
+            route = decodeURIComponent(url.pathname + ' ' + url.hash.split('?')[0]);
+        } catch (_) { /* partial metadata or a malformed URL */ }
+        const names = [siteName, ...hostLabels].map(s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
+        const site = table => names.some(n => table.has(n));
+        const language = String(hints || '').slice(0, 600);
+        const path = route.replace(/[-_]/g, ' ');
+        const evidence = [title, path, language].join(' ');
+        const episodic = route + ' ' + (title || '');
+        const numbered = episodic.match(/\bs(\d{1,3})[\s._/-]*e(\d+(?:\.\d+)?)/i);
+        const season = numbered?.[1] || episodic.match(/\bseason[\s._/-]*(\d+)/i)?.[1];
+        const episode = numbered?.[2] || episodic.match(/\b(?:episodes?|ep)[\s._/-]*(\d+(?:\.\d+)?)/i)?.[1];
+        let format = kind === 'series' || kind === 'movie' ? kind : 'video';
+        if (/^(?:video\.movie|movie)$/i.test(type || '')) format = 'movie';
+        else if (/^(?:video\.(?:episode|tv_show)|TVEpisode|TVSeries)$/i.test(type || '')) format = 'series';
+        else if (format === 'video') {
+            if (/(?:^|\/)(?:movies?|films?)(?:\/|$)/i.test(route)) format = 'movie';
+            else if (episode || season || /(?:^|\/)(?:tv|series|shows?|episodes?)(?:\/|$)/i.test(route)) format = 'series';
+        }
+        const animation = ['anime', 'donghua', 'cartoon'].includes(medium) ? medium :
+            /\bdonghua\b|中国动画|国产动画|chinese animation/i.test(evidence) || site(DONGHUA_SITES) ? 'donghua' :
+            /\banime\b|japanese animation/i.test(evidence) || site(ANIME_SITES) ? 'anime' :
+            /\bcartoons?\b/i.test(evidence) || site(CARTOON_SITES) ? 'cartoon' : '';
+        return { kind: format, medium: animation, season: season ? Number(season) : null, episode: episode ? Number(episode) : null };
+    }
+
     function sanitizePageMeta(raw) {
         if (!isPlainObject(raw)) return null;
         return {
@@ -482,6 +538,7 @@
             siteName: String(raw.siteName || '').slice(0, 200),
             showTitle: String(raw.showTitle || '').slice(0, 200),
             kind: ['series', 'movie'].includes(raw.kind) ? raw.kind : 'video',
+            medium: ['anime', 'donghua', 'cartoon'].includes(raw.medium) ? raw.medium : '',
             season: finiteNum(raw.season), episode: finiteNum(raw.episode), poster: httpUrl(raw.poster)
         };
     }
@@ -559,12 +616,17 @@
         buildBackup,
         restoreBackup,
         sanitizePageMeta,
+        classifyLibraryMedia,
+        LIBRARY_TYPES,
         withoutResumeTime,
         sanitizeBackup,
         sanitizeLibrary,
         backupFilename,
         api,
         IS_FIREFOX,
+        GRAPHICS_PRESETS,
+        normalizeGraphicsPreset,
+        graphicsBudget,
         DEFAULT_SETTINGS,
         DEFAULT_KEYMAP,
         SETTINGS_KEY: 'fs_settings',

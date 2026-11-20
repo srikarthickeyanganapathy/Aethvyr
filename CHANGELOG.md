@@ -5,6 +5,16 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.5.0] - 2026-11-20
+
+- Added separate Anime, Donghua, Cartoons and Other Videos shelves with website filtering and local category corrections.
+- Added artwork-led library cards and reorganized Studio Display settings into collapsible sections.
+
+## [2.4.2] - 2026-11-20
+
+- Fixed toolbar popup sizing and guarded updates for tabs that close during playback detection.
+- Simplified graphics presets, added device-aware Auto and an original-video comparison, and made failed renders fall back to native video.
+
 ## [2.4.1] - 2026-11-20
 
 - Fixed horizontal overflow and aligned the player controls, popup, and library with shared design tokens.

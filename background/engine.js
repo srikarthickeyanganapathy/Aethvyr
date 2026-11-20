@@ -64,6 +64,7 @@ api.storage.onChanged.addListener((changes, area) => {
 // ============================================================================
 /** @type {Map<number, {tabId:number, streams:Map<string,object>, byUrl:Map<string,string>, children:Set<string>, mseFrames:Map<number,number>, videoFrames:Set<number>, playerSessionId:string|null, probing:number}>} */
 const tabs = new Map();
+const closedTabs = new Set();
 const sessions = new Map(); // sessionId -> Session
 const persistTimers = new Map();
 const tabClears = new Map();
@@ -201,13 +202,24 @@ function visibleStreams(tab) {
     return list.sort((a, b) => score(b) - score(a) || b.detectedAt - a.detectedAt);
 }
 
+// Chromium's callback reads runtime.lastError even if the tab closes during the API call.
+function setTabAction(method, options) {
+    if (S.IS_FIREFOX) return api.action[method](options);
+    const chromium = globalThis.chrome || api;
+    return new Promise(resolve => chromium.action[method](options, () => {
+        resolve(!chromium.runtime.lastError);
+    }));
+}
+
 async function updateIcon(tabId) {
+    if (closedTabs.has(tabId)) return;
     const tab = tabs.get(tabId);
     const count = tab ? visibleStreams(tab).length : 0;
     try {
-        await api.action.setIcon({ tabId, path: count ? ICONS_ACTIVE : ICONS_IDLE });
-        await api.action.setBadgeText({ tabId, text: count ? String(Math.min(count, 99)) : '' });
-        if (count) await api.action.setBadgeBackgroundColor({ tabId, color: '#0B6E4F' });
+        const icon = await setTabAction('setIcon', { tabId, path: count ? ICONS_ACTIVE : ICONS_IDLE });
+        if (icon === false || closedTabs.has(tabId)) return;
+        const badge = await setTabAction('setBadgeText', { tabId, text: count ? String(Math.min(count, 99)) : '' });
+        if (count && badge !== false && !closedTabs.has(tabId)) await setTabAction('setBadgeBackgroundColor', { tabId, color: '#0B6E4F' });
     } catch (_) { /* tab closed */ }
 }
 
@@ -231,9 +243,11 @@ function streamSummaries(tab) {
 }
 
 function notifyFrames(tabId) {
+    if (closedTabs.has(tabId)) return;
     clearTimeout(notifyTimers.get(tabId));
     notifyTimers.set(tabId, setTimeout(() => {
         notifyTimers.delete(tabId);
+        if (closedTabs.has(tabId)) return;
         const tab = tabs.get(tabId);
         // The open player's stream switcher follows newly detected / probed streams.
         const open = tab && tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
@@ -252,8 +266,9 @@ function notifyFrames(tabId) {
 
 /** Remember a subtitle track seen on the page (sidecar file or serialized in-memory cues). */
 async function addSubtitle(tabId, frameId, frameUrl, sub) {
-    if (!sub || (!sub.url && !sub.vtt)) return;
+    if (closedTabs.has(tabId) || !sub || (!sub.url && !sub.vtt)) return;
     const tab = await getTab(tabId);
+    if (closedTabs.has(tabId)) { if (tabs.get(tabId) === tab) tabs.delete(tabId); return; }
     const url = sub.url ? S.normalizeUrl(sub.url, frameUrl) : '';
     if (url && !/^https?:/i.test(url)) return;
     const key = url || `inline:${sub.label || ''}:${sub.language || ''}:${String(sub.vtt).length}`;
@@ -310,8 +325,9 @@ async function addSubtitle(tabId, frameId, frameUrl, sub) {
 }
 
 async function handleDetection(tabId, frameId, frameUrl, payload) {
-    if (tabId === undefined || tabId < 0 || !payload) return null;
+    if (tabId === undefined || tabId < 0 || closedTabs.has(tabId) || !payload) return null;
     const tab = await getTab(tabId);
+    if (closedTabs.has(tabId)) { if (tabs.get(tabId) === tab) tabs.delete(tabId); return null; }
 
     if (payload.type === 'mse') {
         const known = tab.mseFrames.has(frameId);
@@ -2170,11 +2186,11 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'PAGE_META':
             if (fromTab !== undefined && sender.frameId === 0 && message.pageMeta?.pageUrl) {
                 getTab(fromTab).then(tab => {
-                    const { pageUrl, kind, siteName, showTitle, season, episode, poster } = message.pageMeta;
+                    const { pageUrl } = message.pageMeta;
                     if (tab.pageUrl && tab.pageUrl !== pageUrl) return;
                     if (!/^https?:\/\//i.test(pageUrl)) return;
                     tab.pageUrl = pageUrl;
-                    tab.pageMeta = S.sanitizePageMeta({ pageUrl, kind, siteName, showTitle, season, episode, poster });
+                    tab.pageMeta = S.sanitizePageMeta(message.pageMeta);
                     persistTab(fromTab);
                     sessions.get(tab.playerSessionId)?.post({ type: 'PAGE_META', pageUrl, pageMeta: tab.pageMeta });
                 }).catch(() => { });
@@ -2338,8 +2354,10 @@ async function teardownTab(tabId, { keepPlayer = false, removed = false } = {}) 
 }
 
 api.tabs.onRemoved.addListener((tabId) => {
+    closedTabs.add(tabId);
+    if (closedTabs.size > 256) closedTabs.delete(closedTabs.values().next().value);
     clearLibraryResume(tabId);
-    teardownTab(tabId, { removed: true });
+    teardownTab(tabId, { removed: true }).catch(() => { });
 });
 
 function resetRouteState(tab) {

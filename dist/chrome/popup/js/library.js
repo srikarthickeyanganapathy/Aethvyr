@@ -22,7 +22,14 @@
     const SERIES_PREFIX = 'fs_series_';
     const seriesStatuses = new Map();
     const expandedSeries = new Set();
+    const CATEGORY_PREFIX = 'fs_category_';
+    const classifications = new Map();
+    let sourceSite = '';
     const VIEWS = {
+        anime: { title: 'Anime', empty: 'Anime appears here after you play it in Velostream.' },
+        donghua: { title: 'Donghua', empty: 'Chinese animation appears here after you play it in Velostream.' },
+        cartoon: { title: 'Cartoons', empty: 'Cartoons appear here after you play them in Velostream.' },
+        video: { title: 'Other videos', empty: 'Clips and unclassified titles appear here.' },
         series: { title: 'Series', empty: 'Series appear here as you watch episodes.' },
         movies: { title: 'Movies', empty: 'Movies appear here as you watch them.' },
         continue: { title: 'Continue watching', empty: 'Nothing in progress. Videos you stop partway through show up here so you can pick up where you left off.' },
@@ -201,13 +208,18 @@
             const page = webUrl(e.page);
             const direct = webUrl(e.url);
             const target = page || direct;
-            const meta = e.pageMeta || {};
+            const storedMeta = e.pageMeta || {};
+            const inferred = S.classifyLibraryMedia({ ...storedMeta, pageUrl: page, title: storedMeta.showTitle || e.title });
+            const meta = { ...storedMeta, ...inferred, season: storedMeta.season ?? inferred.season, episode: storedMeta.episode ?? inferred.episode };
+            const categoryKey = page || key;
+            const category = classifications.get(categoryKey) || meta.medium || meta.kind;
+            const episodic = !['movie', 'video'].includes(category) && (category === 'series' || meta.kind === 'series');
             const host = hostOf(webUrl(e.page) || e.url) || hostOf(e.url);
             const title = cleanTitle(e.title);
             const done = !!e.done && !(key.length <= 8 && d > 0 && d <= 20 && t / d < 0.8);
             const pct = done ? 100 : d ? Math.min(100, Math.round((t / d) * 100)) : 0;
             items.push({
-                key, t, d, done, pct, target, page, direct, host, meta,
+                key, t, d, done, pct, target, page, direct, host, meta, categoryKey, category, episodic,
                 title: title || host || 'Untitled video',
                 updatedAt: finite(e.updatedAt),
                 bms: bookmarks.get(key) || [],
@@ -253,16 +265,38 @@
         return s;
     }
 
+    function countCategory(items, category) {
+        const subset = items.filter(i => i.category === category);
+        return seriesGroups(subset).size + subset.filter(i => !i.episodic).length;
+    }
+
     function seriesGroups(items) {
         const groups = new Map();
         for (const item of items) {
-            if (item.meta.kind !== 'series') continue;
+            if (!item.episodic) continue;
             const title = item.meta.showTitle || item.title;
             const key = SERIES_PREFIX + JSON.stringify([item.host, title.toLocaleLowerCase()]);
             if (!groups.has(key)) groups.set(key, []);
             groups.get(key).push(item);
         }
         return groups;
+    }
+
+    function coverMarkup(item, poster = webUrl(item.meta.poster)) {
+        const label = S.LIBRARY_TYPES[item.category];
+        const format = item.meta.medium && item.meta.kind !== 'video' && item.category === item.meta.medium ? S.LIBRARY_TYPES[item.meta.kind] : '';
+        return `<div class="library-cover" data-category="${esc(item.category)}">
+            ${poster ? `<img src="${esc(poster)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
+            <span class="library-type">${esc(label)}${format ? ' · ' + esc(format) : ''}</span>
+        </div>`;
+    }
+
+    function categoryControl(item) {
+        const manual = classifications.get(item.categoryKey);
+        return `<label class="category-control"><span>Category</span><select data-category-key="${esc(item.categoryKey)}" aria-label="Category for ${esc(item.title)}">
+            <option value="">Auto (${esc(S.LIBRARY_TYPES[item.meta.medium || item.meta.kind])})</option>
+            ${Object.entries(S.LIBRARY_TYPES).map(([value, label]) => `<option value="${value}"${manual === value ? ' selected' : ''}>${label}</option>`).join('')}
+        </select></label>`;
     }
 
     function websiteLink(item) {
@@ -292,7 +326,7 @@
         const label = episode => episode.meta.episode == null ? episode.title :
             `${episode.meta.season != null ? 'S' + episode.meta.season + ' · ' : ''}Ep ${episode.meta.episode}`;
         return `<li class="card vcard">
-            ${poster ? `<img class="series-poster" src="${esc(poster)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
+            ${coverMarkup(recent, poster)}
             <h3 class="vc-title">${esc(recent.meta.showTitle || recent.title)}</h3>
             <p class="meta vc-meta">${websiteLink(recent)}</p>
             <p class="meta vc-meta">${esc(label(recent))} · ${fmtTime(recent.t)} · ${episodeList.filter(e => e.done).length}/${episodeList.length} watched</p>
@@ -302,7 +336,7 @@
             <details data-series="${esc(key)}"${expandedSeries.has(key) ? ' open' : ''}>
                 <summary>Episodes (${episodeList.length})</summary>
                 <ol class="series-episodes">${episodeList.map(e => `<li><strong>${esc(label(e))}</strong> · ${fmtTime(e.t)}${e.done ? ' · Watched' : ''}
-                    <div class="vc-actions">${websiteLink(e)} ${resumeLink(e)}</div></li>`).join('')}</ol>
+                    <div class="vc-actions">${websiteLink(e)} ${resumeLink(e)}</div>${categoryControl(e)}</li>`).join('')}</ol>
             </details>
         </li>`;
     }
@@ -342,6 +376,7 @@
 
         const colNote = memberOf.length ? ` · <span class="vc-cols">${esc(memberOf.map(c => c.name).join(', '))}</span>` : '';
         return `<li class="card vcard${item.fav ? ' is-fav' : ''}">
+            ${coverMarkup(item)}
             <h${level} class="vc-title name" title="${t}">${t}</h${level}>
             <p class="meta vc-meta">${websiteLink(item)}${colNote}</p>
             <p class="meta num vc-meta">${timeText} · Watched ${esc(fmtAgo(item.updatedAt))}${item.bms.length ? ` · ${plural(item.bms.length, 'bookmark')}` : ''}</p>
@@ -361,6 +396,7 @@
                     ? `<button type="button" class="icon-btn vc-remove" ${ctl('uncollect', scope, item.key, { col: collection.id })} aria-label="Remove ${t} from the collection ${esc(collection.name)}" title="Remove from collection">${ICON.minus}</button>`
                     : `<button type="button" class="icon-btn vc-remove" ${ctl('remove', scope, item.key)} aria-label="Remove ${t} from history" title="Remove from history">${ICON.trash}</button>`}
             </div>
+            <details class="card-corrections"><summary>Edit category</summary>${categoryControl(item)}</details>
             ${colsPanel}${bmsPanel}
         </li>`;
     }
@@ -384,13 +420,27 @@
     function render() {
         clearTimeout(renderTimer);
         uid = 0;
-        const items = buildItems();
+        const allItems = buildItems();
+        const sources = [...new Set(allItems.map(i => i.host).filter(Boolean))].sort(collator.compare);
+        if (sourceSite && !sources.includes(sourceSite)) sourceSite = '';
+        const siteControl = $('source-site');
+        const siteSignature = sources.join(' ');
+        if (siteControl.dataset.sources !== siteSignature) {
+            siteControl.replaceChildren(new Option('All websites', ''), ...sources.map(host => new Option(host, host)));
+            siteControl.dataset.sources = siteSignature;
+        }
+        siteControl.value = sourceSite;
+        const items = allItems.filter(i => !sourceSite || i.host === sourceSite);
         const byKey = new Map(items.map(i => [i.key, i]));
         const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
         const groups = seriesGroups(items);
         const counts = {
-            series: groups.size,
-            movies: items.filter(i => i.meta.kind === 'movie').length,
+            series: [...groups.values()].filter(g => g.some(i => i.category === 'series')).length,
+            anime: countCategory(items, 'anime'),
+            donghua: countCategory(items, 'donghua'),
+            cartoon: countCategory(items, 'cartoon'),
+            video: items.filter(i => i.category === 'video').length,
+            movies: items.filter(i => i.category === 'movie').length,
             continue: items.filter(i => i.inProgress).length,
             recent: items.length,
             favorites: items.filter(i => i.fav).length,
@@ -409,11 +459,14 @@
         let markup;
         let countText;
         $('new-collection').hidden = view !== 'collections';
-        if (view === 'series') {
-            const groupsByRecent = [...groups].sort((a, b) => Math.max(...b[1].map(i => i.updatedAt)) - Math.max(...a[1].map(i => i.updatedAt)));
-            const shown = groupsByRecent.filter(([, episodes]) => episodes.some(i => matches(i, tokens)));
-            markup = shown.length ? `<ul class="lib-grid">${shown.map(([key, episodes]) => seriesCard(key, episodes)).join('')}</ul>` : emptyMarkup(groups.size ? 'No series match your search.' : VIEWS.series.empty, !!groups.size);
-            countText = plural(shown.length, 'series', 'series');
+        if (['series', 'anime', 'donghua', 'cartoon'].includes(view)) {
+            const shelves = [...groups].map(([key, list]) => [key, list.filter(i => i.category === view)]).filter(([, list]) => list.length)
+                .map(([key, list]) => ({ ...list.reduce((a, b) => a.updatedAt > b.updatedAt ? a : b), groupKey: key, list }));
+            const singles = items.filter(i => i.category === view && !i.episodic);
+            const shown = sortItems([...shelves, ...singles].filter(i => i.list ? i.list.some(ep => matches(ep, tokens)) : matches(i, tokens)));
+            markup = shown.length ? `<ul class="lib-grid">${shown.map(i => i.list ? seriesCard(i.groupKey, i.list) : cardMarkup(i, 'main', 3, null)).join('')}</ul>` :
+                emptyMarkup(tokens.length ? 'No titles match your search.' : VIEWS[view].empty, !!tokens.length);
+            countText = plural(shown.length, 'title');
         } else if (view === 'collections') {
             if (!library.collections.length) {
                 markup = emptyMarkup(VIEWS.collections.empty);
@@ -441,7 +494,7 @@
                 countText = `${plural(library.collections.length, 'collection')}${tokens.length ? ` · ${plural(shown, 'match', 'matches')}` : ''}`;
             }
         } else {
-            const base = items.filter(i => view === 'continue' ? i.inProgress : view === 'favorites' ? i.fav : view === 'bookmarked' ? i.bms.length > 0 : view === 'movies' ? i.meta.kind === 'movie' : true);
+            const base = items.filter(i => view === 'continue' ? i.inProgress : view === 'favorites' ? i.fav : view === 'bookmarked' ? i.bms.length > 0 : view === 'movies' ? i.category === 'movie' : view === 'video' ? i.category === 'video' : true);
             const list = sortItems(base.filter(i => matches(i, tokens)));
             if (!base.length) markup = emptyMarkup(VIEWS[view].empty);
             else if (!list.length) markup = emptyMarkup(`No videos here match “${query.trim()}”.`, true);
@@ -733,6 +786,12 @@
 
     function onViewChange(e) {
         const el = e.target;
+        if (el.dataset.categoryKey && (!el.value || Object.hasOwn(S.LIBRARY_TYPES, el.value))) {
+            const key = CATEGORY_PREFIX + el.dataset.categoryKey;
+            const save = el.value ? api.storage.local.set({ [key]: el.value }) : api.storage.local.remove(key);
+            save.then(() => announce('Category updated'), () => showMessage('Could not save this category.'));
+            return;
+        }
         if (el.dataset.seriesStatus && SERIES_STATUS.includes(el.value)) {
             api.storage.local.set({ [el.dataset.seriesStatus]: el.value }).catch(() => showMessage('Could not save watch status.'));
             return;
@@ -745,7 +804,7 @@
     // Views, settings, export
     // -------------------------------------------------------------------
     function setView(next, fromUser) {
-        view = VIEWS[next] ? next : 'recent';
+        view = Object.hasOwn(VIEWS, next) ? next : 'recent';
         document.querySelectorAll('.lib-tabs a').forEach(a => {
             if (a.dataset.view === view) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
         });
@@ -805,6 +864,7 @@
 
         const res = await api.storage.local.get(null);
         for (const [k, v] of Object.entries(res)) if (k.startsWith(SERIES_PREFIX) && SERIES_STATUS.includes(v)) seriesStatuses.set(k, v);
+        for (const [key, value] of Object.entries(res)) if (key.startsWith(CATEGORY_PREFIX) && Object.hasOwn(S.LIBRARY_TYPES, value)) classifications.set(key.slice(CATEGORY_PREFIX.length), value);
         settings = S.mergeSettings(res[S.SETTINGS_KEY]);
         applyTheme();
         setHistory(res[S.HISTORY_KEY]);
@@ -812,7 +872,7 @@
         try { await loadBookmarks(Object.keys(history)); } catch (_) { /* render without bookmarks */ }
 
         const hash = location.hash.slice(1);
-        const initial = VIEWS[hash] ? hash : (buildItems().some(i => i.inProgress) ? 'continue' : 'recent');
+        const initial = Object.hasOwn(VIEWS, hash) ? hash : (buildItems().some(i => i.inProgress) ? 'continue' : 'recent');
         setView(initial, false);
 
         $('library-filters').addEventListener('click', () => {
@@ -846,6 +906,7 @@
                 announce('Search cleared');
             }
         });
+        $('source-site').addEventListener('change', () => { sourceSite = $('source-site').value; render(); });
         $('sort').addEventListener('change', () => {
             sort = $('sort').value;
             render();
@@ -877,6 +938,11 @@
             if (changes[LIBRARY_KEY]) { library = S.sanitizeLibrary(changes[LIBRARY_KEY].newValue); dirty = true; }
             for (const [k, ch] of Object.entries(changes)) {
                 if (k.startsWith(BM_PREFIX) && has(history, k.slice(BM_PREFIX.length))) { setBookmarks(k.slice(BM_PREFIX.length), ch.newValue); dirty = true; }
+                if (k.startsWith(CATEGORY_PREFIX)) {
+                    const key = k.slice(CATEGORY_PREFIX.length);
+                    if (Object.hasOwn(S.LIBRARY_TYPES, ch.newValue)) classifications.set(key, ch.newValue); else classifications.delete(key);
+                    dirty = true;
+                }
                 if (k.startsWith(SERIES_PREFIX)) {
                     if (SERIES_STATUS.includes(ch.newValue)) seriesStatuses.set(k, ch.newValue); else seriesStatuses.delete(k);
                     dirty = true;

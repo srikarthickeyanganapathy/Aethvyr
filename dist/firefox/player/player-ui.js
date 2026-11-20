@@ -36,7 +36,7 @@
     const UI_SCALES = [[0.85, '85%'], [1, '100%'], [1.25, '125%'], [1.5, '150%']];
     const AUTOHIDE = [[2000, '2 seconds'], [3000, '3 seconds'], [5000, '5 seconds'], [0, 'Never']];
     const EXTERNAL_APPS = [['potplayer', 'PotPlayer', 'Windows'], ['vlc', 'VLC', 'needs vlc:// handler on desktop'], ['mpv', 'mpv', 'needs mpv:// handler'], ['iina', 'IINA', 'macOS'], ['android', 'Android video app', 'MX Player, VLC…']];
-    const GPU_PRESETS = [['off', 'Off'], ['cas', 'Fast Sharpen (CAS)'], ['fsr', 'Upscale + sharpen (FSR-style)'], ['anime4k', 'Anime4K (fast)'], ['anime4k-hq', 'Anime4K HQ (strong GPU)'], ['deblock', 'De-block + sharpen (low-res fix)'], ['denoise', 'Denoise (keeps detail)'], ['deband', 'Deband (smooth gradients)']];
+    const GPU_PRESETS = window.VelostreamShared.GRAPHICS_PRESETS;
     const PREBUFFER_WINDOWS = [[30, '30 seconds'], [60, '1 minute'], [300, '5 minutes'], [900, '15 minutes'], [1800, '30 minutes'], [86400, 'Whole video']];
     const CACHE_CAPS = [[256, '256 MB'], [512, '512 MB'], [1024, '1 GB'], [2048, '2 GB'], [4096, '4 GB'], [5120, '5 GB']];
     /** Settings sub-objects that are merged field by field (never replaced wholesale). */
@@ -478,7 +478,7 @@
         if (!p) return out;
         if (Number.isFinite(p.defaultSpeed)) out.defaultSpeed = p.defaultSpeed;
         if (Number.isFinite(p.qualityCap)) out.qualityCap = p.qualityCap;
-        if (typeof p.shader === 'string') out.shader = p.shader;
+        if (typeof p.shader === 'string') out.shader = window.VelostreamShared.normalizeGraphicsPreset(p.shader);
         if (Number.isFinite(p.shaderStrength)) out.shaderStrength = p.shaderStrength;
         if (typeof p.audioPreset === 'string') out.audio = { preset: p.audioPreset };
         if (Number.isFinite(p.subSize)) out.subtitles = { size: p.subSize };
@@ -1104,10 +1104,12 @@
             const small = Math.min(screen.width || 0, screen.height || 0) < 600;
             let gpu = 1;
             let renderer = '';
+            let webgl = false;
             try {
                 const gl = document.createElement('canvas').getContext('webgl2');
                 if (!gl) gpu = 0;
                 else {
+                    webgl = true;
                     const ext = gl.getExtension('WEBGL_debug_renderer_info');
                     renderer = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || '');
                     if (/SwiftShader|llvmpipe|Microsoft Basic Render|Mali-[T4]|Adreno \(TM\) [3-5]\d\d|PowerVR/i.test(renderer)) gpu = 0;
@@ -1119,7 +1121,7 @@
             let tier = 'standard';
             if ((mem && mem <= 2) || cores <= 2 || gpu === 0 || (coarse && small && (cores <= 4 || (mem && mem <= 4)))) tier = 'low';
             else if (!coarse && cores >= 8 && (!mem || mem >= 8) && gpu === 2) tier = 'high';
-            return { tier, cores, mem, coarse, renderer };
+            return { tier, cores, mem, coarse, renderer, webgl };
         }
 
         /**
@@ -1129,6 +1131,7 @@
          */
         applyHardwareTier(force) {
             const info = this.detectHardwareTier();
+            this.graphicsHardware = info;
             const D = window.VelostreamShared.DEFAULT_SETTINGS;
             const TUNE = {
                 low: { maxWorkers: 3, cacheSizeMB: 512, mseBufferAhead: 30, mseBufferBehind: 15, maxRenderRes: 1080 },
@@ -1745,6 +1748,11 @@
                     break;
                 case 'SETTINGS_CHANGED':
                     if (!this.rawSettings) { this.bootSettings = msg.settings; break; }
+                    if (this.rawSettings.shader !== msg.settings.shader) {
+                        this.gpuOverride = this.gpuBlocked = null;
+                        this.graphicsOriginal = false;
+                        if (this.gpu?.failed) this.destroyGpu();
+                    }
                     this.rawSettings = cloneSettings(msg.settings);
                     // Edits still waiting in the debounce are not in storage yet: keep them.
                     if (this.pendingPatch) overlaySettings(this.rawSettings, this.pendingPatch);
@@ -2347,6 +2355,7 @@
                     // The Audio tab's "blocked by CORS" hint / disabled controls depend on it.
                     if (this.popKind === 'studio' && this.studioTab === 'audio') this.refreshPopover();
                 }
+                if (this.settings?.shader === 'auto') this.applyFilters();
                 this.layoutVideo(); this.updateQualityBadge(); this.renderMarks();
             });
             media('durationchange', () => this.renderMarks());
@@ -3365,10 +3374,15 @@
         applyFilters() {
             const f = this.filters;
             this.applyGpu();
+            if (this.graphicsOriginal) {
+                this.video.style.filter = '';
+                if (this.glCanvas) this.glCanvas.style.filter = '';
+                return;
+            }
             const gpuOn = !!(this.gpu && this.gpu.active);
             const parts = [`brightness(${f.brightness}%)`, `contrast(${f.contrast}%)`, `saturate(${f.saturate}%)`, `hue-rotate(${f.hue}deg)`, `sepia(${f.warmth}%)`];
             // Sharpness: GPU CAS when WebGL2 works (applyGpu), CPU SVG convolution otherwise.
-            if (f.sharpness > 0 && !gpuOn) {
+            if (f.sharpness > 0 && !gpuOn && this.gpuOverride !== 'off') {
                 const a = (f.sharpness / 100) * 0.9;
                 this.shadow.getElementById('fs-kernel').setAttribute('kernelMatrix', `0 ${-a} 0 ${-a} ${1 + 4 * a} ${-a} 0 ${-a} 0`);
                 parts.push('url(#fs-sharpen)');
@@ -3382,9 +3396,20 @@
 
         /** The GPU preset in effect: the Studio choice, or CAS when only the sharpness slider is used. */
         effectiveShader() {
-            if (!this.settings || this.gpuBlocked) return { preset: 'off', strength: 0 };
+            if (!this.settings || this.gpuBlocked || this.graphicsOriginal) return { preset: 'off', strength: 0 };
+            if (this.gpuOverride === 'off') return { preset: 'off', strength: 0 };
             const chosen = this.gpuOverride || this.settings.shader || 'off';
-            if (chosen !== 'off') return { preset: chosen, strength: this.settings.shaderStrength };
+            const mobile = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 700;
+            if (chosen === 'auto') {
+                const hardware = this.graphicsHardware ||= this.detectHardwareTier();
+                if (!hardware.webgl || /SwiftShader|llvmpipe|Microsoft Basic Render/i.test(hardware.renderer)) return { preset: 'off', strength: 0 };
+                const budget = window.VelostreamShared.graphicsBudget(hardware.tier, mobile, this.video.videoHeight);
+                return { preset: budget.preset, strength: this.settings.shaderStrength, maxHeight: budget.maxHeight, mobile };
+            }
+            if (chosen !== 'off') {
+                const maxHeight = mobile ? (this.settings.hwTier === 'low' ? 720 : 1080) : undefined;
+                return { preset: chosen, strength: this.settings.shaderStrength, maxHeight };
+            }
             if (this.filters.sharpness > 0) return { preset: 'cas', strength: this.filters.sharpness };
             return { preset: 'off', strength: 0 };
         }
@@ -3409,7 +3434,7 @@
 
         applyGpu() {
             const want = this.effectiveShader();
-            const color = this.gpuBlocked ? null : this.gpuColor();
+            const color = this.gpuBlocked || this.graphicsOriginal ? null : this.gpuColor();
             if (want.preset === 'off' && !color && !this.gpu) return;
             if (!this.gpu) {
                 if (!window.VelostreamShaders || !this.glCanvas) { this.gpuBlocked = 'unavailable'; return; }
@@ -3441,7 +3466,7 @@
                     }
                 });
             }
-            const on = this.gpu.configure({ preset: want.preset, strength: want.strength, maxRenderRes: this.settings.maxRenderRes || 2160, color: color || {} });
+            const on = this.gpu.configure({ preset: want.preset, strength: want.strength, maxRenderRes: Math.min(this.settings.maxRenderRes || 2160, want.maxHeight || Infinity), color: color || {} });
             this.vbox.classList.toggle('gl-on', on);
             if (on) {
                 this.layoutVideo();
@@ -4957,7 +4982,8 @@
             const tipChapter = tip.querySelector('.tip-chapter');
             const showTip = (clientX) => {
                 const { t, ratio, r } = timeAt(clientX);
-                tipText.textContent = `${fmtTime(t - r.start)} • ${fmtDelta(t - this.video.currentTime)}`;
+                tipText.textContent = fmtTime(t - r.start);
+                tipText.title = fmtDelta(t - this.video.currentTime);
                 const ch = this.chapterAt(t);
                 tipChapter.hidden = !ch;
                 if (ch) tipChapter.textContent = ch.title;
@@ -5493,7 +5519,7 @@
 
         selectField(id, label, pairs, value) {
             const opts = pairs.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(value) ? ' selected' : ''}>${esc(l)}</option>`).join('');
-            return `<div class="field"><label for="${id}">${esc(label)}</label><select id="${id}">${opts}</select></div>`;
+            return `<div class="field select-field"><label for="${id}">${esc(label)}</label><select id="${id}">${opts}</select></div>`;
         }
 
         renderPopover() {
@@ -5511,6 +5537,13 @@
             setHTML(this.pop, `<div class="pop-head"><h2 id="fs-pop-title">${titles[kind]}</h2><button type="button" class="ib pop-close" aria-label="Close ${titles[kind]}">${icon('close', 18)}</button></div><div class="pop-body">${body}</div>`);
             this.pop.querySelector('.pop-close').addEventListener('click', () => this.closePopover(true));
             this.bindPopover(kind);
+            for (const section of this.pop.querySelectorAll('[data-display-section]')) {
+                section.addEventListener('toggle', () => {
+                    if (!section.isConnected) return;
+                    this.displaySections = new Set([...this.pop.querySelectorAll('[data-display-section][open]')].map(el => el.dataset.displaySection));
+                    this.positionPopover();
+                });
+            }
         }
 
         popSpeed() {
@@ -5739,27 +5772,36 @@ ${this.switchField('au-crossfeed', 'Headphone crossfeed', !!a.crossfeed)}
             return html;
         }
 
+        displaySection(id, title, caption) {
+            const open = this.displaySections?.has(id) || (!this.displaySections && id === 'picture');
+            return `<details class="display-section" data-display-section="${id}"${open ? ' open' : ''}><summary><span>${title}<small>${caption}</small></span></summary><div class="display-controls">`;
+        }
+
         tabDisplay() {
             const f = this.filters;
-            let html = this.rangeField('dp-brightness', 'Brightness', 20, 200, 5, f.brightness, `${f.brightness}%`)
+            let html = this.displaySection('picture', 'Picture', 'Light, contrast and detail') + this.rangeField('dp-brightness', 'Brightness', 20, 200, 5, f.brightness, `${f.brightness}%`)
                 + this.rangeField('dp-contrast', 'Contrast', 50, 200, 5, f.contrast, `${f.contrast}%`)
                 + this.rangeField('dp-saturate', 'Saturation', 0, 300, 5, f.saturate, `${f.saturate}%`)
                 + this.rangeField('dp-sharpness', 'Sharpness', 0, 100, 5, f.sharpness, `${f.sharpness}%`)
                 + this.rangeField('dp-hue', 'Hue', -180, 180, 5, f.hue, `${f.hue}°`)
                 + this.rangeField('dp-warmth', 'Eye-care warmth', 0, 100, 5, f.warmth, `${f.warmth}%`);
             const s = this.settings;
-            const eff = this.effectiveShader();
-            const gpuState = this.gpuBlocked ? `Unavailable: ${this.gpuBlocked}.`
-                : this.gpu && this.gpu.active ? `Active: ${eff.preset === 'off' ? 'colour grading only' : ((GPU_PRESETS.find(p => p[0] === eff.preset) || ['', eff.preset])[1])} at ${this.glCanvas.width}×${this.glCanvas.height}${this.gpuOverride ? ' (stepped down for GPU load)' : ''}.`
-                    : 'Off.';
-            html += `<div class="section-label">GPU enhancement</div>
-${this.selectField('dp-shader', 'Shader', GPU_PRESETS, s.shader)}
-${this.rangeField('dp-shader-str', 'Strength', 0, 100, 5, s.shaderStrength, `${s.shaderStrength}%`)}
+            const activePreset = this.gpu?.preset || 'off';
+            const path = this.gpu?.path;
+            const gpuState = this.graphicsOriginal ? 'Showing the original video.' : this.gpuBlocked ? `Unavailable: ${this.gpuBlocked}.`
+                : this.gpu && this.gpu.active ? `Active: ${activePreset === 'off' ? 'colour grading only' : ((GPU_PRESETS.find(p => p[0] === activePreset) || ['', activePreset])[1])} at ${this.glCanvas.width}×${this.glCanvas.height}${this.gpuOverride ? ' (stepped down for GPU load)' : ''}.${path?.includes('lite') ? ' Using the lighter Anime4K fallback.' : ''}`
+                    : s.shader === 'auto' && this.graphicsHardware && (!this.graphicsHardware.webgl || /SwiftShader|llvmpipe|Microsoft Basic Render/i.test(this.graphicsHardware.renderer))
+                        ? 'Auto is using original playback because hardware WebGL2 is unavailable.' : 'Off.';
+            const showStrength = ['auto', 'cas', 'deblock'].includes(s.shader);
+            html += `</div></details>${this.displaySection('graphics', 'Graphics', 'Enhancement and original preview')}
+${this.selectField('dp-shader', 'Enhancement', GPU_PRESETS, s.shader)}
+${showStrength ? this.rangeField('dp-shader-str', 'Strength', 0, 100, 5, s.shaderStrength, `${s.shaderStrength}%`) : ''}
+<div class="graphics-compare"><button type="button" class="pillbtn" id="dp-original" aria-pressed="${!!this.graphicsOriginal}">${this.graphicsOriginal ? 'Show enhanced' : 'Show original'}</button></div>
 ${this.selectField('dp-maxres', 'Max render resolution', [[1080, '1080p'], [1440, '1440p'], [2160, '2160p (4K)']], s.maxRenderRes)}
-<p class="hint">${esc(gpuState)} WebGL2 shaders run on the graphics chip and pause while the video is paused or hidden. Heavy presets step down automatically if the device cannot keep up.</p>`;
+<p class="hint">${esc(gpuState)} Auto adjusts rendering cost for your device. Try Detail sharpening for soft footage, Compression cleanup for blocky video, or Anime4K for animation. Heavy presets step down if playback struggles.</p>`;
             const cs = s.color || {};
             const CP = window.VelostreamShared.COLOR_PRESETS;
-            html += `<div class="section-label">Color Studio</div>
+            html += `</div></details>${this.displaySection('color', 'Color Studio', 'Looks and fine color adjustments')}
 ${this.selectField('dp-cpreset', 'Look', Object.entries(CP).map(([k, p]) => [k, p.label]).concat([['custom', 'Custom']]), cs.preset || 'neutral')}
 ${this.rangeField('dp-c-gamma', 'Gamma', 50, 200, 5, cs.gamma ?? 100, `${((cs.gamma ?? 100) / 100).toFixed(2)}`)}
 ${this.rangeField('dp-c-vibrance', 'Vibrance', -100, 100, 5, cs.vibrance || 0, `${cs.vibrance || 0}`)}
@@ -5773,12 +5815,12 @@ ${this.rangeField('dp-c-highlights', 'Highlights', -100, 100, 5, cs.highlights |
             (this.settings.filterPresets || []).forEach((p, i) => {
                 html += `<div class="list-row"><span>${esc(p.name)}</span><button type="button" class="pillbtn" id="dp-apply-${i}" data-fp-apply="${i}">Apply</button><button type="button" class="ib" id="dp-del-${i}" data-fp-del="${i}" aria-label="Delete preset ${esc(p.name)}">${icon('trash', 18)}</button></div>`;
             });
-            html += '<div class="section-label" id="lbl-fit">Aspect ratio</div><div role="menu" aria-labelledby="lbl-fit">';
+            html += `</div></details>${this.displaySection('frame', 'Framing', 'Aspect ratio, zoom and rotation')}<div role="menu" aria-label="Aspect ratio">`;
             for (const [k, l, m] of FIT_MODES) html += this.row({ id: `dp-fit-${k.replace(':', '-')}`, label: l, meta: m, checked: this.fit === k, data: `data-fit="${k}"` });
             html += '</div>';
             html += this.rangeField('dp-zoom', 'Zoom', 100, 400, 5, Math.round(this.xf.zoom * 100), `${Math.round(this.xf.zoom * 100)}%`);
             html += `<div role="menu" aria-label="Transform">${this.row({ id: 'dp-rotate', label: 'Rotate 90°', meta: `${this.xf.rotate}°`, role: 'menuitem', lead: 'rotate' })}${this.row({ id: 'dp-flip', label: 'Mirror', meta: this.xf.flip ? 'On' : 'Off', role: 'menuitem', lead: 'flip' })}${this.row({ id: 'dp-xreset', label: 'Reset transform', role: 'menuitem', lead: 'expand' })}</div>`;
-            return html;
+            return html + '</div></details>';
         }
 
         tabTools() {
@@ -6122,7 +6164,13 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             } else if (tab === 'display') {
                 const filt = (key, suffix) => range(`dp-${key}`, v => { this.filters[key] = v; this.applyFilters(); }, v => `${v}${suffix}`);
                 filt('brightness', '%'); filt('contrast', '%'); filt('saturate', '%'); filt('sharpness', '%'); filt('hue', '°'); filt('warmth', '%');
+                click('dp-original', () => {
+                    this.graphicsOriginal = !this.graphicsOriginal;
+                    this.applyFilters();
+                    this.refreshPopover();
+                });
                 select('dp-shader', v => {
+                    this.graphicsOriginal = false;
                     this.gpuOverride = null;
                     this.gpuBlocked = null;
                     if (this.gpu && this.gpu.failed) this.destroyGpu();

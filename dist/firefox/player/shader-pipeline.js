@@ -3,14 +3,10 @@
  *
  * Draws the <video> through WebGL2 into a <canvas> laid exactly over it:
  *   cas        - Contrast Adaptive Sharpening (1 pass, replaces the CPU SVG convolution)
- *   fsr        - Lanczos-2 upscale with anti-ringing + RCAS sharpening (2 passes, FSR 1-style)
  *   anime4k    - Anime4K v4 CNN Restore (S) + Upscale x2 (S), from player/anime4k.js; falls back
  *                to Anime4K-lite (Lanczos-2 + gradient "push") without float render targets
  *   anime4k-hq - Anime4K v4 CNN Restore (M) + Upscale x2 (M), same fallback
  *   deblock    - removes 8x8 block edges on the source pixel grid, then a light CAS (2 passes)
- *   denoise    - edge-preserving bilateral denoise at source size with optional luma-grain
- *                preservation, then Lanczos-2 to the display (2 passes)
- *   deband     - randomized 4-tap gradient smoothing with dither (1 pass)
  * plus optional colour grading (gamma, vibrance, temperature, tint, shadows, highlights) as one
  * final pass; with preset 'off' and non-neutral colour the pipeline runs colour-only.
  *
@@ -31,8 +27,8 @@
 (function () {
     'use strict';
 
-    const PRESETS = ['off', 'cas', 'fsr', 'anime4k', 'anime4k-hq', 'deblock', 'denoise', 'deband'];
-    const STEP_DOWN = Object.freeze({ 'anime4k-hq': 'anime4k', anime4k: 'cas', fsr: 'cas', cas: 'off', deblock: 'off', denoise: 'off', deband: 'off' });
+    const PRESETS = ['off', 'cas', 'deblock', 'anime4k', 'anime4k-hq'];
+    const STEP_DOWN = Object.freeze({ 'anime4k-hq': 'anime4k', anime4k: 'cas', cas: 'off', deblock: 'cas' });
 
     /** Neutral colour grading values (configure({ color }) units). */
     const COLOR_NEUTRAL = Object.freeze({ gamma: 1, vibrance: 0, temperature: 0, tint: 0, shadows: 0, highlights: 0 });
@@ -90,7 +86,7 @@ void main() {
     vec3 mn = min(min(min(d, e), min(f, b)), h);
     vec3 mx = max(max(max(d, e), max(f, b)), h);
     vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
-    float peak = -1.0 / mix(8.0, 4.5, uStrength);
+    float peak = -0.22 * uStrength;
     vec3 w = amp * peak;
     vec3 col = (e + (b + d + f + h) * w) / (1.0 + 4.0 * w);
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
@@ -126,25 +122,6 @@ void main() {
     outColor = vec4(clamp(sum / wsum, mn, mx), 1.0);
 }`;
 
-    // FSR 1 RCAS (robust contrast adaptive sharpening) on the upscaled image.
-    const FS_RCAS = HEADER + `
-void main() {
-    vec3 b = px(vUv, vec2(0.0, -1.0));
-    vec3 d = px(vUv, vec2(-1.0, 0.0));
-    vec3 e = px(vUv, vec2(0.0, 0.0));
-    vec3 f = px(vUv, vec2(1.0, 0.0));
-    vec3 h = px(vUv, vec2(0.0, 1.0));
-    vec3 mn4 = min(min(b, d), min(f, h));
-    vec3 mx4 = max(max(b, d), max(f, h));
-    vec3 hitMin = mn4 / max(4.0 * mx4, vec3(1e-4));
-    vec3 hitMax = (1.0 - mx4) / min(4.0 * mn4 - 4.0, vec3(-1e-4));
-    vec3 lobeRGB = max(-hitMin, hitMax);
-    float sharp = exp2(-mix(2.0, 0.0, uStrength));
-    float lobe = max(-0.1875, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * sharp;
-    vec3 col = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
-    outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
-}`;
-
     // Anime4K-lite (fallback for the CNN presets): push each pixel toward the brighter side of
     // strong luma gradients, which thins and straightens dark line art after upscaling, then
     // lightly re-darkens the lines.
@@ -170,28 +147,6 @@ void main() {
         float avg = (t + l + r + b) * 0.25;
         if (luma(cc) < avg - 0.05) col *= mix(1.0, 0.9, k);
     }
-    outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
-}`;
-
-    // Deband: compare 4 randomized taps at a radius; smooth only where they agree (flat areas).
-    const FS_DEBAND = HEADER + `
-uniform float uFrame;
-float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233)) + uFrame * 0.618) * 43758.5453); }
-void main() {
-    vec3 c = px(vUv, vec2(0.0));
-    float ang = hash(vUv * uOutSize) * 6.2831853;
-    float rad = mix(6.0, 16.0, hash(vUv * uOutSize + 3.1));
-    vec2 o = vec2(cos(ang), sin(ang)) * rad;
-    vec3 a1 = px(vUv, o);
-    vec3 a2 = px(vUv, -o);
-    vec3 a3 = px(vUv, vec2(-o.y, o.x));
-    vec3 a4 = px(vUv, vec2(o.y, -o.x));
-    vec3 avg = (a1 + a2 + a3 + a4) * 0.25;
-    float thr = mix(0.012, 0.035, uStrength);
-    vec3 diff = max(max(abs(a1 - c), abs(a2 - c)), max(abs(a3 - c), abs(a4 - c)));
-    vec3 col = c;
-    if (max(diff.r, max(diff.g, diff.b)) < thr) col = avg;
-    col += (hash(vUv * uOutSize + 7.7) - 0.5) / 255.0;
     outColor = vec4(clamp(col, 0.0, 1.0), 1.0);
 }`;
 
@@ -221,7 +176,7 @@ vec3 fixEdge(ivec2 p, ivec2 dir, int x, int size) {
     float jump = abs(luma(q0) - luma(p0));
     float flatness = max(max(abs(luma(p1) - luma(p0)), abs(luma(p2) - luma(p1))),
                          max(abs(luma(q1) - luma(q0)), abs(luma(q2) - luma(q1))));
-    float alpha = mix(0.04, 0.12, uStrength);   // larger steps are real edges: keep them
+    float alpha = mix(0.04, 0.18, uStrength);   // larger steps are real edges: keep them
     float beta = mix(0.008, 0.024, uStrength);  // in-block variation allowed on each side
     float w = (1.0 - smoothstep(alpha * 0.5, alpha, jump))
             * (1.0 - smoothstep(beta, beta * 2.0, flatness))
@@ -233,34 +188,6 @@ void main() {
     ivec2 size = ivec2(uInSize);
     vec3 c = T(p) + fixEdge(p, ivec2(1, 0), p.x, size.x) + fixEdge(p, ivec2(0, 1), p.y, size.y);
     outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
-}`;
-
-    // Denoise, pass 1 of 2 (source size): 5x5 bilateral filter (spatial sigma ~1.7 px, range sigma
-    // from uStrength), so edges and line art are kept. uGrain re-adds that share of the removed
-    // LUMA detail: film grain survives while the blotchy chroma noise is still removed.
-    const FS_DENOISE = HEADER + `
-uniform float uGrain;
-vec3 T(ivec2 p) { return texelFetch(uTex, clamp(p, ivec2(0), ivec2(uInSize) - 1), 0).rgb; }
-void main() {
-    ivec2 p = ivec2(floor(vUv * uInSize));
-    vec3 c = T(p);
-    float sr = mix(0.02, 0.085, uStrength);
-    float inv = -0.5 / (sr * sr);
-    vec3 sum = c;
-    float wsum = 1.0;
-    for (int j = -2; j <= 2; j++) {
-        for (int i = -2; i <= 2; i++) {
-            if (i == 0 && j == 0) continue;
-            vec3 s = T(p + ivec2(i, j));
-            vec3 d = s - c;
-            float w = exp(dot(d, d) * inv - float(i * i + j * j) * 0.18);
-            sum += s * w;
-            wsum += w;
-        }
-    }
-    vec3 den = sum / wsum;
-    den += vec3(luma(c - den) * uGrain);
-    outColor = vec4(clamp(den, 0.0, 1.0), 1.0);
 }`;
 
     // Colour grading (final pass): white balance, shadows / highlights, gamma, vibrance.
@@ -291,7 +218,7 @@ void main() {
     const FS_COPY = HEADER + `
 void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
 
-    const BUILTIN = { cas: FS_CAS, lanczos: FS_LANCZOS, rcas: FS_RCAS, a4k: FS_A4K, deband: FS_DEBAND, copy: FS_COPY, deblock: FS_DEBLOCK, denoise: FS_DENOISE, color: FS_COLOR };
+    const BUILTIN = { cas: FS_CAS, lanczos: FS_LANCZOS, a4k: FS_A4K, copy: FS_COPY, deblock: FS_DEBLOCK, color: FS_COLOR };
 
     function isSupported() {
         try {
@@ -314,7 +241,6 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             this.hooks = hooks;
             this.preset = 'off';
             this.strength = 0.5;
-            this.grain = 0;
             this.color = Object.assign({}, COLOR_NEUTRAL);
             this.maxRenderRes = 2160;
             this.gl = null;
@@ -368,7 +294,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             // back that same dead context, so a destroyed pipeline never re-initialises.
             if (this.destroyed) return false;
             if (this.gl || this.failed) return !!this.gl;
-            const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance' });
+            const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'default' });
             // (No `desynchronized`: low-latency canvases bypass the compositor and can tear/flicker.)
             if (!gl) { this.fail('WebGL2 is not available'); return false; }
             // A canvas whose context was lost (e.g. by an earlier pipeline's destroy()) keeps returning
@@ -403,6 +329,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.enableVertexAttribArray(0);
             gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
             this.videoTex = this.makeTexture();
+            this.uploadWidth = this.uploadHeight = 0;
             this.timerExt = gl.getExtension('EXT_disjoint_timer_query_webgl2');
             this.parallelExt = gl.getExtension('KHR_parallel_shader_compile');
             this.floatRT = this.probeFloatTargets();
@@ -486,7 +413,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             const u = n => gl.getUniformLocation(p, n);
             return {
                 p, shaders: h.shaders, uTex: u('uTex'), uIn: u('uInSize'), uOut: u('uOutSize'), uStr: u('uStrength'), uFrame: u('uFrame'), uFbo: u('uFbo'),
-                uGrain: u('uGrain'), uColorA: u('uColorA'), uColorB: u('uColorB'),
+                uColorA: u('uColorA'), uColorB: u('uColorB'),
                 binds: binds.map(n => ({ raw: u(`${n}_raw`), size: u(`${n}_size`), pt: u(`${n}_pt`), flip: u(`${n}_flip`) }))
             };
         }
@@ -516,17 +443,16 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
 
         /**
          * Applies settings; returns true if the GPU path is now active.
-         * @param {{preset?:string, strength?:number, maxRenderRes?:number, grain?:number,
+         * @param {{preset?:string, strength?:number, maxRenderRes?:number,
          *   color?:{gamma?:number, vibrance?:number, temperature?:number, tint?:number, shadows?:number, highlights?:number}|null}} opts
          *   color: replaces the grading (missing keys neutral); leave it out to keep the current one.
-         *   grain: 0..100, share of luma grain the denoise preset keeps (default 0).
          */
-        configure({ preset, strength, maxRenderRes, color, grain } = {}) {
-            if (typeof strength === 'number') this.strength = Math.min(1, Math.max(0, strength / 100));
+        configure({ preset, strength, maxRenderRes, color } = {}) {
+            if (Number.isFinite(strength)) this.strength = Math.min(1, Math.max(0, strength / 100));
             if (typeof maxRenderRes === 'number' && maxRenderRes > 0) this.maxRenderRes = maxRenderRes;
-            if (typeof grain === 'number' && Number.isFinite(grain)) this.grain = Math.min(1, Math.max(0, grain / 100));
             if (color !== undefined) this.color = normalizeColor(color);
-            const next = PRESETS.includes(preset) ? preset : 'off';
+            let next = PRESETS.includes(preset) ? preset : this.preset;
+            if (this.strength === 0 && (next === 'cas' || next === 'deblock')) next = 'off';
             if ((next !== 'off' || this.colorOn) && !this.init()) { this.preset = 'off'; return false; }
             const wasActive = this.active;
             this.preset = next;
@@ -630,7 +556,6 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.uniform1f(prog.uStr, strength);
             gl.uniform1f(prog.uFbo, tex === this.videoTex ? 0 : 1);
             if (prog.uFrame) gl.uniform1f(prog.uFrame, this.frame % 1000);
-            if (prog.uGrain) gl.uniform1f(prog.uGrain, this.grain);
             if (prog.uColorA) {
                 const c = this.color;
                 gl.uniform4f(prog.uColorA, c.gamma, c.vibrance / 100, c.temperature / 100, c.tint / 100);
@@ -642,6 +567,11 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
         /** Uploads the current video frame and runs the preset's passes (+ the colour pass). */
         draw() {
             if (!this.active) return;
+            try { this.drawFrame(); }
+            catch (err) { this.fail(`Could not render the graphics effect: ${err.message}`); }
+        }
+
+        drawFrame() {
             const v = this.video;
             const vw = v.videoWidth;
             const vh = v.videoHeight;
@@ -653,7 +583,14 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
             try {
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
+                if (this.uploadWidth === vw && this.uploadHeight === vh) {
+                    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, v);
+                } else {
+                    if (vw > this.textureLimit || vh > this.textureLimit) throw new Error('Video exceeds the GPU texture size limit');
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, v);
+                    this.uploadWidth = vw;
+                    this.uploadHeight = vh;
+                }
             } catch (err) {
                 // A cross-origin file without CORS taints the frame: WebGL may not read it.
                 this.fail(err && err.name === 'SecurityError' ? 'This video comes from another site without CORS, so the GPU may not read its pixels' : `Frame upload failed: ${err && err.message}`);
@@ -682,32 +619,11 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
                 case 'cas':
                     this.pass(P.cas, video, vw, vh, out, W, H);
                     return 'cas';
-                case 'deband':
-                    this.pass(P.deband, video, vw, vh, out, W, H);
-                    return 'deband';
-                case 'fsr': {
-                    // Displayed at or below the source size there is nothing to upscale: one
-                    // sharpening pass straight from the video (half the GPU work, no resampling).
-                    if (W <= vw * 1.05 && H <= vh * 1.05) {
-                        this.pass(P.cas, video, vw, vh, out, W, H);
-                        return 'fsr (cas only, no upscale)';
-                    }
-                    const up = this.target('up', W, H, false);
-                    this.pass(P.lanczos, video, vw, vh, up, W, H);
-                    this.pass(P.rcas, up.tex, W, H, out, W, H);
-                    return 'fsr';
-                }
                 case 'deblock': {
                     const src = this.target('src', vw, vh, false);
                     this.pass(P.deblock, video, vw, vh, src, vw, vh);
-                    this.pass(P.cas, src.tex, vw, vh, out, W, H, 0.1 + 0.3 * this.strength);
+                    this.pass(P.cas, src.tex, vw, vh, out, W, H, 0.45 * this.strength);
                     return 'deblock';
-                }
-                case 'denoise': {
-                    const src = this.target('src', vw, vh, this.floatRT);
-                    this.pass(P.denoise, video, vw, vh, src, vw, vh);
-                    this.pass(P.lanczos, src.tex, vw, vh, out, W, H);
-                    return 'denoise';
                 }
                 case 'anime4k':
                 case 'anime4k-hq':
@@ -869,6 +785,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             const q = this.beginQuery();
             this.draw();
             this.endQuery(q);
+            if (!this.active) return;
             this.watch(performance.now() - t0);
             this.schedule();
         }

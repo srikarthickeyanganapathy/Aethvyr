@@ -521,3 +521,32 @@ input[type="text"] { width: 100%; min-width: 0; }
 }
 
 .segmented [aria-selected="true"] { background: var(--control-hover); }
+.graphics-compare { display: flex; padding: var(--space-2) var(--space-3); }
+.graphics-compare .pillbtn { min-height: 44px; }
+
+/* Studio controls are grouped by task and remain legible in embedded players. */
+.studio .pop-head { padding-block: 0 8px; }
+.studio .pop-body > .segmented { position: sticky; top: 0; z-index: 2; background: var(--bg-elevated); }
+.studio .segmented [aria-selected="true"] { background: var(--fs-accent-strong); color: white; }
+.display-section { margin: 0 0 8px; border: 1px solid var(--glass-border); border-radius: var(--radius-panel); background: #ffffff06; }
+.display-section > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 52px; padding: 8px 12px; cursor: pointer; font-weight: 650; }
+.display-section > summary::after { content: ''; inline-size: 8px; block-size: 8px; flex: none; margin-right: 3px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg); }
+.display-section[open] > summary::after { transform: rotate(225deg); }
+.display-section small { display: block; color: var(--text-secondary); font-weight: 400; margin-top: 2px; }
+.display-controls { border-top: 1px solid var(--glass-border); padding-block: 4px 8px; }
+.studio .field.stack output { background: var(--control-fill); padding: 2px 6px; border-radius: 6px; white-space: nowrap; }
+.studio .field input[type="range"] { height: 32px; }
+.studio .field input[type="range"]::-webkit-slider-runnable-track { background: linear-gradient(to right, var(--fs-accent) var(--p), var(--control-hover) var(--p)); }
+.studio .field input[type="range"]::-moz-range-progress { background: var(--fs-accent); }
+.studio .field.select-field { grid-template-columns: minmax(0, 1fr) minmax(0, 50%); padding-block: 4px; }
+.studio .select-field select { width: 100%; max-width: none; text-overflow: ellipsis; }
+.display-controls .inline { display: flex; flex-wrap: wrap; }
+.display-controls .inline input { flex: 1 1 120px; min-inline-size: 0; }
+@container (max-width: 360px) {
+    .studio .field.select-field { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+    .studio .field.select-field select { min-height: 44px; }
+}
+.root:is([data-skin="cinema"], [data-skin="theater"]) .row1 { width: min(100%, 1280px); margin-inline: auto; }
+.root:is([data-skin="cinema"], [data-skin="theater"]) .t-left,
+.root:is([data-skin="cinema"], [data-skin="theater"]) .t-right { padding-inline: 6px; border-radius: 6px; background: #121214bf; }
+.tip { border-radius: 8px; background: #151518f0; box-shadow: none; }
