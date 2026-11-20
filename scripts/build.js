@@ -59,7 +59,13 @@ function verifyManifestFiles(manifest, targetDir) {
     (manifest.content_scripts || []).forEach(cs => cs.js.forEach(f => files.add(f)));
     ((manifest.declarative_net_request || {}).rule_resources || []).forEach(r => files.add(r.path));
     ((manifest.web_accessible_resources || [])).forEach(w => w.resources.forEach(f => files.add(f)));
-    files.add('background/hls-parser.js');
+    for (const file of files) {
+        const absolute = path.join(targetDir, file);
+        if (!file.endsWith('.js') || !fs.existsSync(absolute)) continue;
+        const source = fs.readFileSync(absolute, 'utf8');
+        const imports = source.matchAll(/(?:^\s*import\s+(?:[^'";\n]+\s+from\s+)?|\bimport\(\s*)['"](\.{1,2}\/[^'"]+)['"]/gm);
+        for (const [, dependency] of imports) files.add(path.posix.normalize(path.posix.join(path.posix.dirname(file), dependency)));
+    }
     const missing = [...files].filter(f => !fs.existsSync(path.join(targetDir, f)));
     if (missing.length) throw new Error(`Missing files in ${targetDir}: ${missing.join(', ')}`);
 
@@ -95,6 +101,7 @@ function buildTarget(browser, shaka) {
     manifest.version = pkg.version;
 
     if (browser === 'firefox') {
+        manifest.permissions = manifest.permissions.filter(p => p !== 'declarativeNetRequestWithHostAccess');
         manifest.browser_specific_settings = {
             gecko: {
                 id: GECKO_ID,
@@ -143,13 +150,32 @@ if (WATCH) {
     runBuild();
     let timer = null;
     const watched = [...SHARED_FILES.map(f => path.join(ROOT, f)), path.join(ROOT, 'manifest.json')];
-    for (const p of watched) {
-        if (!fs.existsSync(p)) continue;
-        fs.watch(p, { recursive: fs.statSync(p).isDirectory() }, () => {
-            clearTimeout(timer);
-            timer = setTimeout(runBuild, 200);
-        });
-    }
+    const watchers = new Map();
+    const refreshWatchers = () => {
+        const active = new Set();
+        function watch(p) {
+            if (!fs.existsSync(p)) return;
+            active.add(p);
+            if (!watchers.has(p)) {
+                const watcher = fs.watch(p, () => {
+                    clearTimeout(timer);
+                    timer = setTimeout(() => { refreshWatchers(); runBuild(); }, 200);
+                });
+                watcher.on('error', () => { watcher.close(); watchers.delete(p); });
+                watchers.set(p, watcher);
+            }
+            if (fs.statSync(p).isDirectory()) {
+                for (const child of fs.readdirSync(p, { withFileTypes: true })) {
+                    if (child.isDirectory()) watch(path.join(p, child.name));
+                }
+            }
+        }
+        for (const p of watched) watch(p);
+        for (const [p, watcher] of watchers) {
+            if (!active.has(p)) { watcher.close(); watchers.delete(p); }
+        }
+    };
+    refreshWatchers();
     console.log('[Build] Watching for changes...');
 } else if (!runBuild()) {
     process.exit(1);

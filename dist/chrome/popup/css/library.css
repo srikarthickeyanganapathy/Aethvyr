@@ -148,3 +148,17 @@ a.bm-link:hover { background: var(--fill); }
 body.hc .lib-dialog { border: 2px solid #fff; }
 
 .lib .foot { margin-top: 8px; }
+
+.lib-page, .lib-page * { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.28) transparent; }
+.lib-page select, .lib-page option { color-scheme: dark; background: #1c1c1e; color: #fff; }
+.website-link { color: var(--text); text-decoration: underline; overflow-wrap: anywhere; }
+.series-poster { width: min(100%, 120px); aspect-ratio: 2 / 3; object-fit: cover; border-radius: 8px; }
+.series-episodes { display: grid; gap: 8px; padding-inline-start: 24px; }
+.vcard details > summary { display: list-item; min-height: 44px; padding-block: 12px; cursor: pointer; }
+.vcard select { min-height: 44px; max-width: 100%; }
+@media (max-width: 420px) {
+    .lib-layout { grid-template-columns: minmax(0, 1fr); }
+    .lib-page .lib-grid { grid-template-columns: minmax(0, 1fr); }
+    .lib-page .vc-actions { flex-wrap: wrap; }
+    .lib-page .vc-actions > * { min-height: 44px; }
+}

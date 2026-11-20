@@ -269,7 +269,7 @@
     }
 
     function fromBase64(b64) {
-        if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(b64).buffer;
+        if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(b64).slice().buffer;
         const binary = atob(b64);
         const len = binary.length;
         const bytes = new Uint8Array(len);
@@ -363,16 +363,15 @@
     // innerHTML: it is parsed in an inert document (scripts never run, images never load there),
     // stripped of anything executable, then moved into place.
     // ---------------------------------------------------------------------
-    const BLOCKED_TAGS = new Set(['script', 'iframe', 'frame', 'frameset', 'object', 'embed', 'link', 'meta', 'base', 'foreignobject', 'noscript']);
+    const BLOCKED_TAGS = new Set(['script', 'style', 'iframe', 'frame', 'frameset', 'object', 'embed', 'link', 'meta', 'base', 'foreignobject', 'noscript']);
     const URL_ATTRS = new Set(['href', 'src', 'xlink:href', 'action', 'formaction', 'srcdoc', 'poster', 'data']);
     const SAFE_URL = /^(?:\s*(?:https?:|blob:|data:image\/(?:png|jpe?g|gif|webp);|#|\/|\.{0,2}\/|[\w-]+\.))/i;
 
     // SVG animation elements can rewrite an attribute after sanitizing (<animate attributeName="href"
     // values="javascript:…">), so the ones that target a URL attribute are dropped.
     const ANIMATION_TAGS = new Set(['animate', 'set', 'animatemotion', 'animatetransform']);
-    // Inline styles cannot run script in current engines, but legacy expression()/-moz-binding and
-    // javascript: inside url() are stripped anyway (cheap test; normal UI styles never contain them).
-    const UNSAFE_STYLE = /expression\s*\(|-moz-binding|behavior\s*:|url\s*\(\s*['"]?\s*(?:javascript|vbscript|data:(?!image\/(?:png|jpe?g|gif|webp)))/i;
+    // Disallow CSS escapes, comments, at-rules and functions in untrusted inline styles.
+    const UNSAFE_STYLE = /[\\@()]|\/\*|-moz-binding|behavior\s*:/i;
 
     function sanitizeTree(node) {
         const walker = (node.ownerDocument || node).createTreeWalker(node, 1 /* NodeFilter.SHOW_ELEMENT */);
@@ -400,7 +399,7 @@
     function parseHTML(markup) {
         const doc = new DOMParser().parseFromString(String(markup == null ? '' : markup), 'text/html');
         const frag = doc.createDocumentFragment();
-        // A leading <style> is parsed into <head>; keep it, in order, ahead of the body content.
+        // Sanitize both head and body nodes, including elements the parser moved into <head>.
         for (const n of [...doc.head.childNodes, ...doc.body.childNodes]) frag.appendChild(n);
         sanitizeTree(frag);
         return frag;
@@ -473,7 +472,19 @@
     }
 
     const httpUrl = (u) => typeof u === 'string' && u.length < 4096 && /^https?:\/\//i.test(u) ? u : '';
+    const withoutResumeTime = value => typeof value === 'string' ? value.replace(/[#&?]velostream-t=\d+(?:\.\d+)?$/, '') : '';
     const finiteNum = (n) => (typeof n === 'number' && Number.isFinite(n) ? n : null);
+
+    function sanitizePageMeta(raw) {
+        if (!isPlainObject(raw)) return null;
+        return {
+            pageUrl: httpUrl(withoutResumeTime(raw.pageUrl)),
+            siteName: String(raw.siteName || '').slice(0, 200),
+            showTitle: String(raw.showTitle || '').slice(0, 200),
+            kind: ['series', 'movie'].includes(raw.kind) ? raw.kind : 'video',
+            season: finiteNum(raw.season), episode: finiteNum(raw.episode), poster: httpUrl(raw.poster)
+        };
+    }
 
     /** Validate + clean a parsed backup. Throws with a readable message when it is not one. */
     function sanitizeBackup(data) {
@@ -490,13 +501,14 @@
         }
         const history = {};
         const entries = Object.entries(isPlainObject(data.history) ? data.history : {})
-            .filter(([k, e]) => typeof k === 'string' && k.length <= 512 && isPlainObject(e) && httpUrl(e.url))
+            .filter(([k, e]) => /^[\w-]{1,64}$/.test(k) && !['__proto__', 'constructor', 'prototype'].includes(k) && isPlainObject(e) && httpUrl(e.url))
             .sort((a, b) => (finiteNum(b[1].updatedAt) || 0) - (finiteNum(a[1].updatedAt) || 0))
             .slice(0, 200);
         for (const [k, e] of entries) {
             history[k] = {
                 url: httpUrl(e.url),
-                page: httpUrl(e.page),
+                page: httpUrl(withoutResumeTime(e.page)),
+                pageMeta: sanitizePageMeta(e.pageMeta),
                 title: String(e.title == null ? '' : e.title).slice(0, 200),
                 t: Math.max(0, finiteNum(e.t) || 0),
                 d: Math.max(0, finiteNum(e.d) || 0),
@@ -546,6 +558,8 @@
         replaceWithHTML,
         buildBackup,
         restoreBackup,
+        sanitizePageMeta,
+        withoutResumeTime,
         sanitizeBackup,
         sanitizeLibrary,
         backupFilename,

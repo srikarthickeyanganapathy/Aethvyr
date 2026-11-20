@@ -22,11 +22,17 @@ import { initSync } from './sync.js';
 
 const S = globalThis.VelostreamShared;
 const api = S.api;
+let storageWrites = Promise.resolve();
+function writeStorage(operation) {
+    const run = storageWrites.then(operation);
+    storageWrites = run.catch(() => { });
+    return run;
+}
 
 // Opt-in cross-device sync (browser account storage.sync). Started synchronously so its
 // storage/message listeners exist on every service-worker wake; it is inert unless
 // settings.syncEnabled is true and never throws into the engine.
-try { initSync({ api, S }); } catch (e) { console.warn('[Engine] sync unavailable:', e && e.message); }
+try { initSync({ api, S, writeStorage }); } catch (e) { console.warn('[Engine] sync unavailable:', e && e.message); }
 
 const MAX_STREAMS_PER_TAB = 40;
 const PROXY_TIMEOUT_MS = 60000;
@@ -60,6 +66,8 @@ api.storage.onChanged.addListener((changes, area) => {
 const tabs = new Map();
 const sessions = new Map(); // sessionId -> Session
 const persistTimers = new Map();
+const tabClears = new Map();
+const resumeRequests = new Map();
 
 function newTabState(tabId) {
     return {
@@ -69,6 +77,9 @@ function newTabState(tabId) {
         children: new Set(),       // variant/rendition playlists of a known master (hidden in popup)
         mseFrames: new Map(),      // frameId -> last MSE_INIT timestamp
         videoFrames: new Set(),    // frames with a <video> element
+        pageUrl: '',
+        pageMeta: null,
+        routeVersion: 0,
         subtitles: [],             // captured sidecar / in-memory subtitle tracks (bounded)
         drm: null,                 // { keySystem, frameId } once a frame requested EME keys
         autoLaunched: false,       // auto-replace already ran for this page load
@@ -87,12 +98,17 @@ const tabKey = (tabId) => `tab_${tabId}`;
 const tabSubsKey = (tabId) => `tabsubs_${tabId}`;
 
 async function getTab(tabId, { create = true } = {}) {
+    if (tabClears.has(tabId)) await tabClears.get(tabId);
     let tab = tabs.get(tabId);
     if (tab) return tab;
     // Restore after a service-worker / event-page restart.
     const key = tabKey(tabId);
     const subsKey = tabSubsKey(tabId);
     const res = await api.storage.session.get([key, subsKey]).catch(() => ({}));
+    if (tabClears.has(tabId)) {
+        await tabClears.get(tabId);
+        return getTab(tabId, { create });
+    }
     const stored = res && res[key];
     const storedSubs = res && res[subsKey];
     tab = tabs.get(tabId); // re-check after await
@@ -110,6 +126,10 @@ async function getTab(tabId, { create = true } = {}) {
             if (Array.isArray(e) && typeof e[0] === 'number') tab.mseFrames.set(e[0], +e[1] || 0);
         }
         (stored.videoFrames || []).forEach(f => { if (typeof f === 'number') tab.videoFrames.add(f); });
+        tab.pageUrl = stored.pageUrl || '';
+        tab.pageMeta = stored.pageMeta || null;
+        tab.staleStreamId = stored.staleStreamId || null;
+        tab.activeStreamId = stored.activeStreamId || null;
         tab.drm = stored.drm || null;
         tab.autoLaunched = !!stored.autoLaunched;
         tab.mountFrameId = typeof stored.mountFrameId === 'number' ? stored.mountFrameId : null;
@@ -148,8 +168,12 @@ function persistTab(tabId, { subtitles = false } = {}) {
                 streams: [...tab.streams.values()],
                 children: [...tab.children].slice(-200),
                 playerSessionId: tab.playerSessionId,
+                activeStreamId: tab.activeStreamId || null,
                 mseFrames: [...tab.mseFrames.entries()].slice(-32),
                 videoFrames: [...tab.videoFrames].slice(-32),
+                pageUrl: tab.pageUrl,
+                pageMeta: tab.pageMeta,
+                staleStreamId: tab.staleStreamId || null,
                 drm: tab.drm || null,
                 autoLaunched: !!tab.autoLaunched,
                 mountFrameId: tab.mountFrameId ?? null
@@ -164,7 +188,7 @@ function persistTab(tabId, { subtitles = false } = {}) {
 }
 
 function visibleStreams(tab) {
-    const list = [...tab.streams.values()].filter(s => !tab.children.has(s.url));
+    const list = [...tab.streams.values()].filter(s => !tab.children.has(s.url) && s.id !== tab.staleStreamId);
     const score = s => {
         let v = 0;
         if (s.probe && s.probe.isMaster) v += 4;
@@ -319,7 +343,12 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
             persistTab(tabId);
         }
         if (existing && payload.method === 'manual') tab.children.delete(url);
-        return existing || null;
+        if (existingId !== tab.staleStreamId || payload.method === 'dom_scan') {
+            if (resumeRequests.has(tabId)) scheduleLibraryResume(tabId);
+            return existing || null;
+        }
+        // A fresh network request can reuse the exact same manifest URL on a new episode.
+        tab.byUrl.delete(url);
     }
 
     if (tab.streams.size >= MAX_STREAMS_PER_TAB) {
@@ -349,7 +378,11 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
     updateIcon(tabId);
     notifyFrames(tabId);
     if (type !== 'progressive') probeStream(tab, stream);
-    if (!stream.isAd && payload.method !== 'manual') maybeAutoLaunch(tab, stream);
+    if (!stream.isAd && payload.method !== 'manual') {
+        if (tab.staleStreamId) scheduleEpisodeSwitch(tab);
+        else if (resumeRequests.has(tabId)) scheduleLibraryResume(tabId);
+        else maybeAutoLaunch(tab, stream);
+    }
     return stream;
 }
 
@@ -358,10 +391,51 @@ async function handleDetection(tabId, frameId, frameUrl, payload) {
  * site opens in Velostream automatically, once per page load. Waits briefly so the master
  * playlist probe can win over its variant playlists.
  */
+function scheduleEpisodeSwitch(tab) {
+    if (tab.episodeTimer) return;
+    const version = tab.routeVersion;
+    tab.episodeTimer = setTimeout(() => {
+        tab.episodeTimer = null;
+        const session = sessions.get(tab.playerSessionId);
+        if (tabs.get(tab.tabId) !== tab || tab.routeVersion !== version || !tab.staleStreamId || !session?.port) return;
+        const next = visibleStreams(tab).find(s => !s.isAd && (s.frameId === session.stream.frameId || session.stream.frameId < 0));
+        if (next) switchEpisode(session, tab, next).catch(() => { });
+    }, 600);
+}
+
+async function switchEpisode(session, tab, next) {
+    if (session.switching || session.closing) return;
+    session.switching = true;
+    const version = tab.routeVersion;
+    const previous = session.stream;
+    try {
+        await session.switchStream(next);
+        if (session.closing || tab.routeVersion !== version) return;
+        if (tab.staleStreamId === previous.id) {
+            tab.streams.delete(previous.id);
+            if (tab.byUrl.get(previous.url) === previous.id) tab.byUrl.delete(previous.url);
+            tab.staleStreamId = null;
+            api.tabs.sendMessage(tab.tabId, { action: 'SUSPEND_MEDIA' }).catch(() => { });
+        }
+        tab.activeStreamId = next.id;
+        session.post({
+            type: 'STREAM_SWITCHED', stream: next, streams: streamSummaries(tab), pageUrl: tab.pageUrl,
+            pageMeta: tab.pageMeta, subtitles: tab.subtitles, drm: tab.drm
+        });
+        persistTab(tab.tabId);
+        notifyFrames(tab.tabId);
+    } finally {
+        session.switching = false;
+        if (tab.routeVersion !== version && !session.closing) scheduleEpisodeSwitch(tab);
+    }
+}
+
 async function maybeAutoLaunch(tab, stream) {
     // autoLaunchPending: several streams are usually detected in the same burst; only the first
     // may run the (async) host check, or two launches would race and end each other's session.
     if (tab.autoLaunched || tab.autoLaunchPending || tab.playerSessionId || !settings.autoSites.length) return;
+    const routeVersion = tab.routeVersion;
+    const current = () => tabs.get(tab.tabId) === tab && tab.routeVersion === routeVersion;
     tab.autoLaunchPending = true;
     try {
         // Match the top page's host *and* the embedding frame's host: the stream is often found
@@ -371,13 +445,14 @@ async function maybeAutoLaunch(tab, stream) {
         try { if (stream && stream.frameUrl) hosts.add(new URL(stream.frameUrl).hostname); } catch (_) { /* opaque */ }
         const sites = settings.autoSites.map(h => String(h).toLowerCase());
         const match = [...hosts].some(h => sites.some(s => h === s || h.endsWith(`.${s}`)));
-        if (!match || tab.autoLaunched || tab.playerSessionId) return;
+        if (!current() || !match || tab.autoLaunched || tab.playerSessionId) return;
         tab.autoLaunched = true;
         persistTab(tab.tabId);
     } finally {
-        tab.autoLaunchPending = false;
+        if (current()) tab.autoLaunchPending = false;
     }
     setTimeout(() => {
+        if (!current()) return;
         const list = visibleStreams(tab).filter(s => !s.isAd);
         // Prefer a probed master playlist over its variants when both exist already.
         const best = list.find(s => s.probe && s.probe.isMaster) || list[0];
@@ -409,8 +484,16 @@ async function detectTypeByContent(tabId, url, frameUrl) {
 // Headers the site's own player sent, keyed by `${requestHost}|${initiatorSite}` so two sites
 // sharing a CDN host never see each other's Referer/Origin/auth headers.
 const capturedByHostSite = new Map(); // key -> {referer, origin, headers, site}
-const latestCaptureByHost = new Map(); // host -> key of the most recent capture (frame URL unknown)
+
 const MAX_CAPTURES = 300;
+const CAPTURE_KEY = 'fs_request_captures';
+const CAPTURE_TTL = 15 * 60 * 1000;
+const captureReady = api.storage.session.get(CAPTURE_KEY).then(res => {
+    for (const [key, info] of res[CAPTURE_KEY] || []) {
+        if (!capturedByHostSite.has(key) && Date.now() - info.at < CAPTURE_TTL) capturedByHostSite.set(key, info);
+    }
+}).catch(() => { });
+let captureTimer;
 
 function pickFrameId(tab, stream) {
     if (stream && stream.frameId >= 0) return stream.frameId;
@@ -512,15 +595,11 @@ function httpOrigin(frameUrl) {
     }
 }
 
-/**
- * What the site's player sent to `host`, as seen from the frame that owns the stream. With a known
- * frame only a capture initiated from the same site is used; with an unknown frame, the latest.
- */
+/** Return a fresh capture from the site that owns the stream. */
 function lookupCapture(host, frameUrl) {
     const site = httpOrigin(frameUrl) ? siteOf(frameUrl) : '';
-    if (site) return capturedByHostSite.get(`${host}|${site}`) || null;
-    const k = latestCaptureByHost.get(host);
-    return (k && capturedByHostSite.get(k)) || null;
+    const capture = site && capturedByHostSite.get(`${host}|${site}`);
+    return capture && Date.now() - capture.at < CAPTURE_TTL ? capture : null;
 }
 
 /** Custom request headers the site's own player sent to this host (auth tokens etc.). */
@@ -765,7 +844,7 @@ async function directFetch(url, { method = 'GET', headers = {}, signal }, frameU
 }
 
 /** Hosts that only answer requests made from inside the page (cookie/session-bound CDNs). */
-const pageOnlyHosts = new Set();
+const pageOnlyHosts = new Map();
 
 /**
  * Transport, fastest path first:
@@ -781,15 +860,17 @@ function makeTransport(tabId, getStream) {
         const stream = getStream();
         const frameId = pickFrameId(tab, stream);
         const frameUrl = (stream && stream.frameUrl) || '';
+        await captureReady;
         // Replay auth/token headers the site's player used for this host (Range stays ours).
         // Only headers captured from the same site as the stream's frame (never another site's).
-        opts = { ...opts, headers: { ...capturedHeaders(url, frameUrl), ...(opts.headers || {}) } };
+        const directOptions = { ...opts, headers: { ...capturedHeaders(url, frameUrl), ...(opts.headers || {}) } };
+        const pageHeaders = Object.fromEntries(Object.entries(opts.headers || {}).filter(([name]) => /^(range|accept|content-type)$/i.test(name)));
         let host = '';
         try { host = new URL(url).host; } catch (_) { /* opaque */ }
 
         const viaPage = async () => {
             try {
-                return await proxyViaFrame(tabId, frameId, url, opts);
+                return await proxyViaFrame(tabId, frameId, url, { ...opts, headers: pageHeaders });
             } catch (err) {
                 if (err.name === 'AbortError') throw err;
                 if (err.status) return { status: err.status, headers: {}, url, data: new ArrayBuffer(0) };
@@ -797,11 +878,11 @@ function makeTransport(tabId, getStream) {
             }
         };
 
-        if (!pageOnlyHosts.has(host)) {
+        if ((pageOnlyHosts.get(host) || 0) <= Date.now()) {
             let direct = null;
             let directErr = null;
             try {
-                direct = await directFetch(url, opts, frameUrl);
+                direct = await directFetch(url, directOptions, frameUrl);
             } catch (err) {
                 if (err.name === 'AbortError') throw err;
                 directErr = err;
@@ -810,7 +891,11 @@ function makeTransport(tabId, getStream) {
             // Refused or blocked outside the page: retry inside it.
             try {
                 const res = await viaPage();
-                if (res.status < 400) pageOnlyHosts.add(host);
+                if (res.status < 400) {
+                    pageOnlyHosts.delete(host);
+                    pageOnlyHosts.set(host, Date.now() + 5 * 60 * 1000);
+                    if (pageOnlyHosts.size > 100) pageOnlyHosts.delete(pageOnlyHosts.keys().next().value);
+                }
                 return res;
             } catch (err) {
                 if (err.name === 'AbortError') throw err;
@@ -834,11 +919,13 @@ function makeTransport(tabId, getStream) {
 // ============================================================================
 async function probeStream(tab, stream) {
     if (stream.probe || tab.probing >= 3) return;
+    const routeVersion = tab.routeVersion;
     stream.probe = { status: 'pending' };
     tab.probing++;
     try {
         const transport = makeTransport(tab.tabId, () => stream);
         const res = await transport(stream.url, { method: 'GET', headers: {} });
+        if (tab.routeVersion !== routeVersion || tabs.get(tab.tabId) !== tab) return;
         if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
         const text = new TextDecoder().decode(res.data.byteLength > 2_000_000 ? res.data.slice(0, 2_000_000) : res.data);
         if (stream.type === 'hls') {
@@ -899,7 +986,7 @@ function rememberReferer(details) {
     if (!S.classifyStream(details.url) && !['xmlhttprequest', 'media', 'other'].includes(details.type)) return;
     let host;
     try { host = new URL(details.url).hostname; } catch (_) { return; }
-    const info = { headers: {} };
+    const info = { headers: {}, at: Date.now() };
     // Standard / browser-controlled headers are left alone; anything else (Authorization,
     // X-Playback-Session-Id, custom token headers...) is replayed on our requests to this host.
     const STANDARD = /^(host|cookie|origin|referer|user-agent|accept(-.*)?|connection|content-(length|type)|sec-.*|range|pragma|cache-control|if-.*|dnt|upgrade-insecure-requests|priority|te|keep-alive|proxy-.*)$/i;
@@ -907,20 +994,24 @@ function rememberReferer(details) {
         const n = h.name.toLowerCase();
         if (n === 'referer') info.referer = h.value;
         else if (n === 'origin') info.origin = h.value;
-        else if (!STANDARD.test(n) && h.value && h.value.length < 4096) info.headers[h.name] = h.value;
+        else if (!STANDARD.test(n) && h.value && h.value.length < 4096 && Object.keys(info.headers).length < 12) info.headers[h.name] = h.value;
     }
     if (info.referer || info.origin || Object.keys(info.headers).length) {
         // Site that issued the request: Chromium reports `initiator` (origin), Firefox
         // `originUrl`/`documentUrl`; the Referer is the last resort.
         info.site = siteOf(details.initiator && details.initiator !== 'null' ? details.initiator
             : (details.originUrl || details.documentUrl || info.referer || ''));
+        if (!info.site) return;
         const key = `${host}|${info.site}`;
         capturedByHostSite.delete(key); // refresh LRU position
         capturedByHostSite.set(key, info);
-        latestCaptureByHost.delete(host);
-        latestCaptureByHost.set(host, key);
         while (capturedByHostSite.size > MAX_CAPTURES) capturedByHostSite.delete(capturedByHostSite.keys().next().value);
-        while (latestCaptureByHost.size > MAX_CAPTURES) latestCaptureByHost.delete(latestCaptureByHost.keys().next().value);
+        if (!captureTimer) captureTimer = setTimeout(async () => {
+            await captureReady;
+            captureTimer = null;
+            const entries = [...capturedByHostSite].filter(([, value]) => Date.now() - value.at < CAPTURE_TTL).slice(-MAX_CAPTURES);
+            api.storage.session.set({ [CAPTURE_KEY]: entries }).catch(() => { });
+        }, 250);
     }
 }
 
@@ -1220,13 +1311,19 @@ async function endSession(session, { clearCache = true, restoreMedia = true } = 
     const tab = tabs.get(session.tabId);
     if (tab && tab.playerSessionId === session.id) {
         tab.playerSessionId = null;
+        tab.activeStreamId = null;
+        if (tab.staleStreamId === session.stream.id) {
+            tab.streams.delete(session.stream.id);
+            if (tab.byUrl.get(session.stream.url) === session.stream.id) tab.byUrl.delete(session.stream.url);
+            tab.staleStreamId = null;
+        }
         persistTab(session.tabId);
     }
     // Remove the player iframe if it is still mounted (closed from the popup, tab navigation...).
     api.tabs.sendMessage(session.tabId, { action: 'UNMOUNT_PLAYER', sessionId: session.id }).catch(() => { });
     if (restoreMedia) api.tabs.sendMessage(session.tabId, { action: 'RESTORE_MEDIA' }).catch(() => { });
     try { session.port && session.port.disconnect(); } catch (_) { /* already closed */ }
-    notifyFrames(session.tabId);
+    if (tabs.has(session.tabId)) notifyFrames(session.tabId);
 }
 
 async function handleRequest(session, msg) {
@@ -1453,7 +1550,7 @@ async function runExport(session, opts = {}) {
 
 async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fileIndex, fileCount) {
     if (!segs.length) throw new Error('Nothing to save yet');
-    if (segs.some(s => s.key && s.key.method !== 'AES-128')) {
+    if (segs.some(s => s.key && !['NONE', 'AES-128'].includes(s.key.method))) {
         throw new Error('This stream uses SAMPLE-AES/DRM encryption and cannot be exported.');
     }
     const isFmp4 = segs.some(s => s.map);
@@ -1583,7 +1680,7 @@ async function exportProgressive(session, post, signal, name) {
 // Player port
 // ----------------------------------------------------------------------------
 api.runtime.onConnect.addListener((port) => {
-    if (port.name !== 'velostream-player') return;
+    if (port.name !== 'velostream-player' || !port.sender?.url?.startsWith(api.runtime.getURL('player/player.html?'))) return;
     const tabId = port.sender && port.sender.tab ? port.sender.tab.id : -1;
     let session = null;
     // Messages that arrive while HELLO is still attaching the session (the player resends its
@@ -1593,7 +1690,10 @@ api.runtime.onConnect.addListener((port) => {
     port.onMessage.addListener(async (msg) => {
         if (!msg || typeof msg.type !== 'string') return;
         if (msg.type === 'HELLO') {
-            hello = attach(msg).catch(e => console.warn('[Engine] attach failed:', e && e.message));
+            hello = attach(msg).catch(async e => {
+                console.warn('[Engine] attach failed:', e && e.message);
+                if (session && (!session.port || session.port === port)) await endSession(session);
+            });
             return;
         }
         if (hello) await hello;
@@ -1636,7 +1736,7 @@ api.runtime.onConnect.addListener((port) => {
                 // grace timer here (the session would otherwise leak with its timers running).
                 if (!session.port) {
                     clearTimeout(session.disconnectTimer);
-                    session.disconnectTimer = setTimeout(() => { if (!session.port) endSession(session, { clearCache: true, restoreMedia: false }); }, RECONNECT_GRACE_MS);
+                    session.disconnectTimer = setTimeout(() => { if (!session.port) endSession(session); }, RECONNECT_GRACE_MS);
                 }
                 return;
             }
@@ -1646,7 +1746,10 @@ api.runtime.onConnect.addListener((port) => {
             // the site's Referer/Origin so hot-link protection accepts them.
             if (session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
             const pageUrl = await api.tabs.get(tabId).then(t => (t && t.url) || '', () => '');
-            session.post({ type: 'INIT', sessionId: session.id, tabId: session.tabId, stream: session.stream, resumed: !!msg.resumed, subtitles: tab.subtitles || [], drm: tab.drm || null, pageUrl, streams: streamSummaries(tab) });
+            if (disconnected || session.closing || session.port !== port) return;
+            tab.pageUrl ||= pageUrl;
+            if (tab.staleStreamId) scheduleEpisodeSwitch(tab);
+            session.post({ type: 'INIT', sessionId: session.id, tabId: session.tabId, stream: session.stream, resumed: !!msg.resumed, subtitles: tab.subtitles || [], drm: tab.drm || null, pageUrl: tab.pageUrl, pageMeta: tab.pageMeta, streams: streamSummaries(tab) });
         }
     }
 
@@ -1721,9 +1824,7 @@ api.runtime.onConnect.addListener((port) => {
                 const tab = await getTab(session.tabId);
                 const next = tab.streams.get(msg.streamId);
                 if (!next) { session.post({ type: 'SWITCH_FAILED', error: 'That stream is no longer available. Rescan the page.' }); break; }
-                if (next.id !== session.stream.id) await session.switchStream(next);
-                if (session.closing) break;
-                session.post({ type: 'STREAM_SWITCHED', stream: session.stream, streams: streamSummaries(tab) });
+                await switchEpisode(session, tab, next);
                 break;
             }
             case 'FIND_FRESH': {
@@ -1782,6 +1883,11 @@ api.runtime.onConnect.addListener((port) => {
             case 'EXPORT_CANCEL':
                 if (session.exportJob) session.exportJob.controller.abort();
                 break;
+            case 'STORE_SET':
+                if (/^fs_bm_[\w-]{1,64}$/.test(msg.key || '') && Array.isArray(msg.value)) {
+                    await writeStorage(() => api.storage.local.set({ [msg.key]: msg.value }));
+                }
+                break;
             case 'CLOSE':
                 endSession(session, { clearCache: true, restoreMedia: true });
                 break;
@@ -1797,7 +1903,7 @@ api.runtime.onConnect.addListener((port) => {
         session.port = null;
         // Give the bridge a moment to reconnect (navigation within bfcache, SW hiccup).
         session.disconnectTimer = setTimeout(() => {
-            if (!session.port) endSession(session, { clearCache: true, restoreMedia: false });
+            if (!session.port) endSession(session);
         }, RECONNECT_GRACE_MS);
     });
 });
@@ -1824,8 +1930,10 @@ async function pingFrame(tabId, frameId) {
  * Frame choice: the frame the user clicked in (badge) -> the frame that requested the stream
  * -> any frame known to contain a <video> -> the top frame in full-page mode.
  */
-async function launchPlayer(tabId, streamId, preferFrameId) {
+async function launchPlayer(tabId, streamId, preferFrameId, explicitTime = null) {
     const tab = await getTab(tabId);
+    const version = tab.routeVersion;
+    const current = () => tabs.get(tabId) === tab && tab.routeVersion === version;
     const stream = tab.streams.get(streamId);
     if (!stream) throw new Error('Stream no longer available. Reload the page.');
 
@@ -1838,9 +1946,14 @@ async function launchPlayer(tabId, streamId, preferFrameId) {
     await api.tabs.sendMessage(tabId, { action: 'UNMOUNT_PLAYER' }).catch(() => { });
 
     const sessionId = crypto.randomUUID();
+    const page = await api.tabs.get(tabId).then(t => t.url || '', () => '');
+    if (!current()) throw new Error('The page changed before the player could open.');
+    const timestamp = /[#&?]velostream-t=(\d+(?:\.\d+)?)$/.exec(page);
+    const startTime = explicitTime ?? (timestamp ? Number(timestamp[1]) : null);
     const url = api.runtime.getURL(`player/player.html?session=${encodeURIComponent(sessionId)}&stream=${encodeURIComponent(streamId)}`);
     // Registered before mounting: the player page says HELLO as soon as it loads.
     tab.playerSessionId = sessionId;
+    tab.activeStreamId = stream.id;
     persistTab(tabId);
 
     const candidates = [];
@@ -1856,9 +1969,19 @@ async function launchPlayer(tabId, streamId, preferFrameId) {
     let mounted = null;
     for (const frameId of candidates) {
         const ping = await pingFrame(tabId, frameId);
+        if (!current()) break;
         if (!ping || !ping.hasVideo) continue;
-        const res = await api.tabs.sendMessage(tabId, { action: 'MOUNT_PLAYER', sessionId, url, streamUrl: stream.url }, { frameId }).catch(() => null);
+        const res = await api.tabs.sendMessage(tabId, { action: 'MOUNT_PLAYER', sessionId, url, streamUrl: stream.url, startTime }, { frameId }).catch(() => null);
         if (res && res.ok) { mounted = { frameId, mode: res.mode }; break; }
+    }
+    if (!current()) {
+        if (tab.playerSessionId === sessionId) {
+            tab.playerSessionId = null;
+            tab.activeStreamId = null;
+            api.tabs.sendMessage(tabId, { action: 'UNMOUNT_PLAYER', sessionId }).catch(() => { });
+            api.tabs.sendMessage(tabId, { action: 'RESTORE_MEDIA' }).catch(() => { });
+        }
+        throw new Error('The page changed before the player could open.');
     }
     if (!mounted) {
         // No <video> element anywhere (stream found on the network only): cover the page.
@@ -1866,12 +1989,14 @@ async function launchPlayer(tabId, streamId, preferFrameId) {
         if (!ping) {
             tab.playerSessionId = null;
             persistTab(tabId);
+            api.tabs.sendMessage(tabId, { action: 'RESTORE_MEDIA' }).catch(() => { });
             throw new Error('This page cannot be scripted by extensions (browser or store page).');
         }
-        const res = await api.tabs.sendMessage(tabId, { action: 'MOUNT_PLAYER', sessionId, url, streamUrl: stream.url, forcePage: true }, { frameId: 0 });
+        const res = await api.tabs.sendMessage(tabId, { action: 'MOUNT_PLAYER', sessionId, url, streamUrl: stream.url, startTime, forcePage: true }, { frameId: 0 }).catch(() => null);
         if (!res || !res.ok) {
             tab.playerSessionId = null;
             persistTab(tabId);
+            api.tabs.sendMessage(tabId, { action: 'RESTORE_MEDIA' }).catch(() => { });
             throw new Error((res && res.error) || 'Could not open the player on this page.');
         }
         mounted = { frameId: 0, mode: 'page' };
@@ -1908,6 +2033,124 @@ async function launchManualUrl(tabId, rawUrl, typeHint) {
 // ============================================================================
 // RUNTIME MESSAGES (sniffer + popup)
 // ============================================================================
+const validMediaKey = key => typeof key === 'string' && /^[\w-]{1,64}$/.test(key) && !['__proto__', 'constructor', 'prototype'].includes(key);
+
+function saveSettingsPatch(patch) {
+    return writeStorage(async () => {
+        const settings = S.mergeSettings((await api.storage.local.get(S.SETTINGS_KEY))[S.SETTINGS_KEY]);
+        for (const [key, value] of Object.entries(patch || {})) {
+            if (!Object.hasOwn(settings, key)) continue;
+            if (['audio', 'subtitles', 'gestures', 'mouse', 'memory'].includes(key) && value && typeof value === 'object') {
+                settings[key] = { ...settings[key], ...value };
+            } else settings[key] = value;
+        }
+        const next = S.mergeSettings(settings);
+        await api.storage.local.set({ [S.SETTINGS_KEY]: next });
+        return { ok: true, settings: next };
+    });
+}
+
+function saveHistoryEntry({ key, legacyKey, entry }) {
+    if (!validMediaKey(key) || !entry || typeof entry.url !== 'string') throw new Error('Invalid history entry.');
+    return writeStorage(async () => {
+        const bmKey = 'fs_bm_' + key;
+        const legacyBmKey = 'fs_bm_' + legacyKey;
+        const data = await api.storage.local.get([S.HISTORY_KEY, 'fs_library', bmKey, legacyBmKey]);
+        const history = data[S.HISTORY_KEY] || {};
+        const legacy = validMediaKey(legacyKey) && legacyKey !== key ? history[legacyKey] : null;
+        const migrate = legacy?.url === entry.url && (!legacy.page || legacy.page === entry.page);
+        const previous = history[key] || (migrate ? legacy : null);
+        const previousDone = previous?.done && !(migrate && previous.d > 0 && previous.d <= 20 && previous.t / previous.d < 0.8);
+        history[key] = { ...previous, ...entry, done: !!(entry.done || previousDone), updatedAt: Date.now() };
+        const write = { [S.HISTORY_KEY]: history };
+        if (migrate) {
+            delete history[legacyKey];
+            if (!Array.isArray(data[bmKey]) && Array.isArray(data[legacyBmKey])) write[bmKey] = data[legacyBmKey];
+            const lib = data.fs_library;
+            if (lib && Array.isArray(lib.favorites) && Array.isArray(lib.collections)) {
+                const replaceKey = keys => [...new Set(keys.map(k => k === legacyKey ? key : k))];
+                write.fs_library = {
+                    ...lib, favorites: replaceKey(lib.favorites),
+                    collections: lib.collections.map(c => Array.isArray(c?.keys) ? { ...c, keys: replaceKey(c.keys) } : c)
+                };
+            }
+        }
+        const keys = Object.keys(history).sort((a, b) => history[b].updatedAt - history[a].updatedAt);
+        const evicted = keys.slice(200);
+        for (const k of evicted) delete history[k];
+        await api.storage.local.set(write);
+        if (migrate) evicted.push(legacyKey);
+        if (evicted.length) await api.storage.local.remove(evicted.map(k => 'fs_bm_' + k));
+        return { ok: true };
+    });
+}
+
+function pruneLibrary(raw, history) {
+    const library = S.sanitizeLibrary(raw);
+    const live = key => Object.hasOwn(history, key);
+    library.favorites = library.favorites.filter(live);
+    for (const collection of library.collections) collection.keys = collection.keys.filter(live);
+    return library;
+}
+
+function commitLibrary({ base, library }) {
+    return writeStorage(async () => {
+        const stored = await api.storage.local.get([S.HISTORY_KEY, 'fs_library']);
+        if (JSON.stringify(S.sanitizeLibrary(stored.fs_library)) !== JSON.stringify(S.sanitizeLibrary(base))) {
+            return { ok: false, conflict: true };
+        }
+        const next = pruneLibrary(library, stored[S.HISTORY_KEY] || {});
+        await api.storage.local.set({ fs_library: next });
+        return { ok: true, library: next };
+    });
+}
+
+function clearLibraryResume(tabId) {
+    const pending = resumeRequests.get(tabId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    clearTimeout(pending.expiry);
+    resumeRequests.delete(tabId);
+}
+
+function scheduleLibraryResume(tabId) {
+    const pending = resumeRequests.get(tabId);
+    if (!pending || pending.timer) return;
+    pending.timer = setTimeout(async () => {
+        pending.timer = null;
+        try {
+            const [tab, browserTab] = await Promise.all([getTab(tabId, { create: false }), api.tabs.get(tabId)]);
+            if (resumeRequests.get(tabId) !== pending || !tab) return;
+            if (S.withoutResumeTime(browserTab.url) !== pending.page || tab.playerSessionId) {
+                clearLibraryResume(tabId);
+                return;
+            }
+            const list = visibleStreams(tab).filter(s => !s.isAd);
+            const stream = list.find(s => s.url === pending.streamUrl) || list[0];
+            if (!stream) return;
+            clearLibraryResume(tabId);
+            await launchPlayer(tabId, stream.id, stream.frameId, pending.time);
+        } catch (_) { clearLibraryResume(tabId); }
+    }, 800);
+}
+
+async function openLibraryResume(message) {
+    const page = new URL(S.withoutResumeTime(message.page));
+    if (!/^https?:$/.test(page.protocol) || page.username || page.password) throw new Error('Invalid website link.');
+    const browserTab = await api.tabs.create({ url: page.href });
+    const tabId = browserTab.id;
+    if (Number.isInteger(tabId)) {
+        resumeRequests.set(tabId, {
+            page: page.href,
+            streamUrl: S.normalizeUrl(message.streamUrl, page.href),
+            time: Number.isFinite(message.time) && message.time >= 0 ? message.time : null,
+            expiry: setTimeout(clearLibraryResume, 30000, tabId)
+        });
+        scheduleLibraryResume(tabId);
+    }
+    return { ok: true };
+}
+
 function respondAsync(promise, sendResponse) {
     promise.then(sendResponse, err => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
@@ -1919,6 +2162,24 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     switch (message.action) {
         // ---- From sniffer.js ------------------------------------------------
+        case 'ROUTE_CHANGE':
+            if (fromTab !== undefined && sender.frameId === 0 && /^https?:\/\//i.test(message.pageUrl || '')) {
+                updateRoute(fromTab, message.pageUrl).catch(() => { });
+            }
+            return false;
+        case 'PAGE_META':
+            if (fromTab !== undefined && sender.frameId === 0 && message.pageMeta?.pageUrl) {
+                getTab(fromTab).then(tab => {
+                    const { pageUrl, kind, siteName, showTitle, season, episode, poster } = message.pageMeta;
+                    if (tab.pageUrl && tab.pageUrl !== pageUrl) return;
+                    if (!/^https?:\/\//i.test(pageUrl)) return;
+                    tab.pageUrl = pageUrl;
+                    tab.pageMeta = S.sanitizePageMeta({ pageUrl, kind, siteName, showTitle, season, episode, poster });
+                    persistTab(fromTab);
+                    sessions.get(tab.playerSessionId)?.post({ type: 'PAGE_META', pageUrl, pageMeta: tab.pageMeta });
+                }).catch(() => { });
+            }
+            return false;
         case 'STREAM_FOUND':
             handleDetection(fromTab, sender.frameId ?? 0, sender.url || '', message.payload);
             return false;
@@ -1936,9 +2197,39 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (fromTab !== undefined) getTab(fromTab).then(tab => {
                 tab.drm = { keySystem: String((message.payload && message.payload.keySystem) || '').slice(0, 80), frameId: sender.frameId ?? 0 };
                 persistTab(fromTab);
+                sessions.get(tab.playerSessionId)?.post({ type: 'DRM', drm: tab.drm });
                 notifyFrames(fromTab);
             }).catch(() => { });
             return false;
+
+        case 'LIBRARY_RESUME':
+            if (sender.url !== api.runtime.getURL('popup/library.html') && !sender.url?.startsWith(api.runtime.getURL('popup/library.html#'))) return false;
+            return respondAsync(openLibraryResume(message), sendResponse);
+        case 'HISTORY_SAVE':
+            if (!sender.url?.startsWith(api.runtime.getURL('player/player.html'))) return false;
+            return respondAsync(Promise.resolve().then(() => saveHistoryEntry(message)), sendResponse);
+        case 'LIBRARY_WRITE':
+            if (!sender.url?.startsWith(api.runtime.getURL('popup/library.html'))) return false;
+            return respondAsync(commitLibrary(message), sendResponse);
+        case 'HISTORY_REMOVE':
+            if (!sender.url?.startsWith(api.runtime.getURL(''))) return false;
+            return respondAsync(writeStorage(async () => {
+                const key = message.key;
+                if (!validMediaKey(key)) throw new Error('Invalid history key.');
+                const all = await api.storage.local.get([S.HISTORY_KEY, 'fs_library']);
+                const history = all[S.HISTORY_KEY] || {};
+                delete history[key];
+                const library = pruneLibrary(all.fs_library, history);
+                await api.storage.local.set({ [S.HISTORY_KEY]: history, fs_library: library });
+                if (message.removeBookmarks) await api.storage.local.remove('fs_bm_' + key);
+                return { ok: true, history, library };
+            }), sendResponse);
+        case 'BACKUP_RESTORE':
+            if (!sender.url?.startsWith(api.runtime.getURL(''))) return false;
+            return respondAsync(writeStorage(async () => ({ ok: true, ...await S.restoreBackup(api, message.json) })), sendResponse);
+        case 'SETTINGS_PATCH':
+            if (!sender.url?.startsWith(api.runtime.getURL(''))) return false;
+            return respondAsync(saveSettingsPatch(message.patch), sendResponse);
 
         // ---- From popup -------------------------------------------------------
         case 'GET_STREAMS':
@@ -2007,22 +2298,33 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // ============================================================================
 async function teardownTab(tabId, { keepPlayer = false, removed = false } = {}) {
     const tab = tabs.get(tabId);
-    const session = tab && tab.playerSessionId ? sessions.get(tab.playerSessionId) : null;
-    if (session && !keepPlayer) await endSession(session, { clearCache: true, restoreMedia: false });
+    const active = [...sessions.values()].filter(s => s.tabId === tabId);
+    const session = active.find(s => s.id === tab?.playerSessionId);
+    clearTimeout(notifyTimers.get(tabId));
+    notifyTimers.delete(tabId);
+    clearTimeout(tab?.episodeTimer);
+    const ending = active.filter(s => !keepPlayer || s !== session)
+        .map(s => endSession(s, { clearCache: true, restoreMedia: false }));
     if (keepPlayer && tab && session) {
         // Keep only the stream being played.
         for (const [id, s] of tab.streams) if (s.id !== session.stream.id) { tab.streams.delete(id); tab.byUrl.delete(s.url); }
         tab.children.clear();
-        tab.autoLaunched = false; // new page: auto-replace may run again
-        persistTab(tabId);
+        resetRouteState(tab);
+        persistTab(tabId, { subtitles: true });
     } else {
         tabs.delete(tabId);
         clearTimeout(persistTimers.get(tabId));
         persistTimers.delete(tabId);
         subsDirty.delete(tabId);
-        api.storage.session.remove([tabKey(tabId), tabSubsKey(tabId)]).catch(() => { });
-        if (!keepPlayer) BufferManager.clearTab(tabId).catch(() => { });
+        const clearing = Promise.allSettled([
+            api.storage.session.remove([tabKey(tabId), tabSubsKey(tabId)]),
+            ...(!keepPlayer ? [BufferManager.clearTab(tabId)] : [])
+        ]);
+        tabClears.set(tabId, clearing);
+        await clearing;
+        if (tabClears.get(tabId) === clearing) tabClears.delete(tabId);
     }
+    await Promise.all(ending);
     if (!removed) {
         updateIcon(tabId);
         notifyFrames(tabId);
@@ -2030,19 +2332,49 @@ async function teardownTab(tabId, { keepPlayer = false, removed = false } = {}) 
 }
 
 api.tabs.onRemoved.addListener((tabId) => {
+    clearLibraryResume(tabId);
     teardownTab(tabId, { removed: true });
 });
 
+function resetRouteState(tab) {
+    tab.routeVersion++;
+    clearTimeout(tab.episodeTimer);
+    tab.episodeTimer = null;
+    tab.subtitles = [];
+    tab.drm = null;
+    tab.mseFrames.clear();
+    tab.videoFrames.clear();
+    tab.autoLaunched = false;
+    tab.autoLaunchPending = false;
+}
+
+async function updateRoute(tabId, pageUrl) {
+    const tab = await getTab(tabId, { create: false });
+    if (!tab || tab.pageUrl === pageUrl) return;
+    if (tab.pageUrl && S.withoutResumeTime(tab.pageUrl) === S.withoutResumeTime(pageUrl)) { tab.pageUrl = pageUrl; return; }
+    tab.pageUrl = pageUrl;
+    tab.pageMeta = null;
+    const session = sessions.get(tab.playerSessionId);
+    tab.staleStreamId = session?.stream.id || (tab.playerSessionId ? tab.activeStreamId : null) || null;
+    for (const [id, stream] of tab.streams) {
+        if (id === tab.staleStreamId) continue;
+        tab.streams.delete(id);
+        tab.byUrl.delete(stream.url);
+    }
+    tab.children.clear();
+    resetRouteState(tab);
+    persistTab(tabId, { subtitles: true });
+    session?.post({ type: 'ROUTE_CHANGE', pageUrl });
+    api.tabs.sendMessage(tabId, { action: 'ROUTE_RESET', pageUrl }).catch(() => { });
+    updateIcon(tabId);
+    notifyFrames(tabId);
+}
+
 api.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    // A new document is loading in the tab: every detected stream and cached segment is stale.
-    if (changeInfo.status === 'loading' && changeInfo.url !== undefined) {
-        // keepPlayer: SPA history navigations can also report a URL change; a real navigation
-        // destroys the page, which disconnects the player port and ends the session anyway.
-        teardownTab(tabId, { keepPlayer: true });
-    } else if (changeInfo.status === 'loading') {
-        // Same-URL reload: drop streams (they will be re-detected) and the cache. getTab also
-        // restores a tab the idle worker forgot, so a reload after a restart still resets it.
-        getTab(tabId, { create: false }).then(tab => { if (tab && !tab.playerSessionId) teardownTab(tabId); }).catch(() => { });
+    if (changeInfo.status === 'loading') {
+        teardownTab(tabId).catch(() => { });
+    } else if (changeInfo.url !== undefined) {
+        updateRoute(tabId, changeInfo.url).catch(() => { });
     }
 });
 

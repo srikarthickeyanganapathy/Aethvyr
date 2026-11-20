@@ -255,7 +255,7 @@ function parseMeta(m) {
 function sanitizeHistEntry(a) {
     if (!Array.isArray(a) || a.length < 8) return null;
     const [k, url, page, title, t, d, done, updatedAt, subOffset, loopA, loopB] = a;
-    if (typeof k !== 'string' || !KEY_RE.test(k) || !httpUrl(url) || !fin(updatedAt) || updatedAt <= 0) return null;
+    if (typeof k !== 'string' || !KEY_RE.test(k) || ['__proto__', 'constructor', 'prototype'].includes(k) || !httpUrl(url) || !fin(updatedAt) || updatedAt <= 0) return null;
     const num = (n, lo, hi) => (fin(n) && n >= lo && n <= hi ? n : null);
     return [
         k, url, httpUrl(page), str(title, 200),
@@ -423,7 +423,7 @@ class SyncError extends Error {
     constructor(message, code) { super(message); this.code = code; }
 }
 
-function createSync(api, S, clock) {
+function createSync(api, S, clock, writeStorage) {
     const local = api.storage.local;
     const syncArea = api.storage && api.storage.sync && typeof api.storage.sync.get === 'function' ? api.storage.sync : null;
     const sessionArea = api.storage && api.storage.session && typeof api.storage.session.get === 'function' ? api.storage.session : local;
@@ -438,7 +438,6 @@ function createSync(api, S, clock) {
     const loggedErrors = new Set();
     const expectedLocal = new Map(); // key -> {h, at}: writes made by this module
     const expectedSync = new Map();
-    const recentSyncKeys = new Map(); // history key -> time our merge wrote it (see onLocalChange)
     const recentLibKeys = new Map();  // favorite / collection member keys our projection just added
 
     // ---- infrastructure ---------------------------------------------------
@@ -482,7 +481,6 @@ function createSync(api, S, clock) {
             setHash: typeof s.setHash === 'string' ? s.setHash : '',
             bmAt: isObj(s.bmAt) ? sanitizeTimes(s.bmAt, 1000) : {},
             histDel: isObj(s.histDel) ? sanitizeTimes(s.histDel, TOMB_MAX) : {},
-            histCut: fin(s.histCut) && s.histCut >= 0 ? s.histCut : 0,
             lib: isObj(s.lib) ? normalizeLibView(s.lib) : null
         };
         if (!s.dev) await saveState();
@@ -557,11 +555,11 @@ function createSync(api, S, clock) {
         schedulePush();
     }
 
-    function schedulePush() {
+    function schedulePush(notBefore = 0) {
         if (!enabled || !syncArea) return;
         const now = clock.now();
         let due = Math.min(session.lastChangeAt + DEBOUNCE_MS, session.firstDirtyAt + MAX_WAIT_MS);
-        due = Math.max(due, session.lastPushAt + MIN_SPACING_MS, writeAllowedAt(2));
+        due = Math.max(due, notBefore, session.lastPushAt + MIN_SPACING_MS, writeAllowedAt(2));
         if (pushTimer) clock.clearTimeout(pushTimer);
         pushTimer = clock.setTimeout(() => {
             pushTimer = null;
@@ -612,13 +610,17 @@ function createSync(api, S, clock) {
 
     // ---- merge ------------------------------------------------------------
     /** Merge a remote snapshot into storage.local. Returns the decoded sections. */
-    async function mergeRemote(remote) {
+    function mergeRemote(remote) { return writeStorage(() => mergeRemoteLocked(remote)); }
+
+    async function mergeRemoteLocked(remote) {
         const meta = parseMeta(remote[META_KEY]);
         if (!meta) return { meta: null, sections: {} };
         if (meta.newer) throw new SyncError('Synced data comes from a newer Velostream. Update this device to keep syncing.', 'newer');
         const sections = {};
         for (const sec of SECTIONS) sections[sec] = await decodeSection(remote, meta, sec);
 
+        for (const [key, at] of recentLibKeys) if (clock.now() - at >= RECENT_SYNC_MS) recentLibKeys.delete(key);
+        while (recentLibKeys.size > 1000) recentLibKeys.delete(recentLibKeys.keys().next().value);
         const all = await readLocal();
         const writes = {};
         let stateChanged = false;
@@ -645,7 +647,6 @@ function createSync(api, S, clock) {
         if (rh.status === 'ok') {
             const tomb = capTimes(maxTimes(state.histDel, rh.data.x), TOMB_MAX);
             if (canon(tomb) !== canon(state.histDel)) { state.histDel = tomb; stateChanged = true; }
-            if (rh.data.c > state.histCut) { state.histCut = rh.data.c; stateChanged = true; }
             const localHist = isObj(all[S.HISTORY_KEY]) ? all[S.HISTORY_KEY] : {};
             const merged = { ...localHist };
             for (const r of rh.data.e) {
@@ -654,8 +655,7 @@ function createSync(api, S, clock) {
                 const lc = cur ? compactEntry(k, cur) : null;
                 if (lc && canon(lc) === canon(r)) continue;
                 if (!cur || !lc || r[7] > lc[7] || (r[7] === lc[7] && canon(r) > canon(lc))) {
-                    merged[k] = expandEntry(r);
-                    recentSyncKeys.set(k, clock.now());
+                    merged[k] = { ...cur, ...expandEntry(r) };
                 }
             }
             for (const [k, t] of Object.entries(tomb)) {
@@ -678,7 +678,7 @@ function createSync(api, S, clock) {
                 const llist = compactBookmarks(lraw);
                 const lat = state.bmAt[k] || 0;
                 let list, at;
-                if (lat > 0 && rat > 0 && lat !== rat) {
+                if (lat !== rat) {
                     [list, at] = lat > rat ? [llist, lat] : [rlist, rat];
                 } else {
                     list = unionBookmarks(llist, rlist);
@@ -865,25 +865,19 @@ function createSync(api, S, clock) {
 
         // History (newest first) + tombstones
         const histObj = isObj(all[S.HISTORY_KEY]) ? all[S.HISTORY_KEY] : {};
-        // Only entries newer than the shared cutoff `c` sync. When the budget (or the 200 cap) drops
-        // entries, the cutoff moves up to the newest dropped one, so every device agrees on the synced
-        // set even when they hold different old entries (otherwise one device keeps re-adding them).
-        const all200 = Object.entries(histObj).map(([k, e]) => compactEntry(k, e)).filter(e => e && e[7] > state.histCut).sort(byNewest);
+        // Fit the newest eligible entries each time, including older restored records.
+        const all200 = Object.entries(histObj).map(([k, e]) => compactEntry(k, e)).filter(e => e).sort(byNewest);
         const cand = all200.slice(0, HISTORY_SYNC_MAX);
         const x = capTimes(state.histDel, TOMB_MAX);
-        const cutFor = (n) => (n < all200.length ? Math.max(state.histCut, all200[n][7]) : state.histCut);
-        const trim = (n) => { const c = cutFor(n); let m = n; while (m > 0 && cand[m - 1][7] <= c) m--; return m; };
-        const histPayload = (n) => ({ e: cand.slice(0, trim(n)), x, c: cutFor(n) });
+        const histPayload = (n) => ({ e: cand.slice(0, n), x, c: 0 });
         let histKeys = [];
-        if (cand.length || Object.keys(x).length || state.histCut) {
+        if (cand.length || Object.keys(x).length) {
             const fit = cand.length
                 ? await fitList('hist', cand, histPayload, Math.min(HIST_MAX, left))
                 : { enc: await encodeSection('hist', histPayload(0), S), n: 0 };
             if (fit && fit.enc.bytes <= left) {
                 take('hist', fit.enc);
-                histKeys = cand.slice(0, trim(fit.n)).map(e => e[0]);
-                const c = cutFor(fit.n);
-                if (c !== state.histCut) { state.histCut = c; await saveState(); }
+                histKeys = cand.slice(0, fit.n).map(e => e[0]);
             }
         }
 
@@ -895,7 +889,7 @@ function createSync(api, S, clock) {
         }
 
         // Bookmarks of the synced videos
-        const bmKeys = histKeys.filter(k => Array.isArray(all[BM_PREFIX + k]) && (all[BM_PREFIX + k].length || state.bmAt[k]));
+        const bmKeys = histKeys.filter(k => state.bmAt[k] || compactBookmarks(all[BM_PREFIX + k]).length);
         if (bmKeys.length && left > 200) {
             const items = bmKeys.map(k => [k, [state.bmAt[k] || 0, compactBookmarks(all[BM_PREFIX + k])]]);
             const fit = await fitList('bm', items, n => Object.fromEntries(items.slice(0, n)), left);
@@ -926,7 +920,11 @@ function createSync(api, S, clock) {
         // Keep the remote settings unless this device changed them later.
         const keep = {};
         const rs = sections.set;
-        const remoteSetUsable = rs && (rs.status === 'ok' || (rs.status === 'incomplete' && now - meta.at < INCOMPLETE_GRACE_MS));
+        if (meta && now - meta.at < INCOMPLETE_GRACE_MS && Object.values(sections).some(s => s.status === 'incomplete')) {
+            schedulePush(Math.min(meta.at, now) + INCOMPLETE_GRACE_MS);
+            return;
+        }
+        const remoteSetUsable = rs?.status === 'ok';
         if (remoteSetUsable && !(rs.status === 'ok' && state.setAt > rs.data.at)) {
             const chunks = [];
             for (let i = 0; i < rs.meta.n; i++) chunks.push(remote[`${PREFIX}set_${i}`]);
@@ -938,7 +936,6 @@ function createSync(api, S, clock) {
         const built = await buildLocal(all, keep);
         const nextS = {};
         const items = {};
-        let retry = false;
         for (const sec of SECTIONS) {
             const b = built[sec];
             if (!b) continue;
@@ -946,12 +943,6 @@ function createSync(api, S, clock) {
             const rsec = sections[sec];
             // Same content already remote (maybe compressed by another engine): leave it untouched.
             if (r && r.h === b.h && rsec && rsec.status === 'ok') { nextS[sec] = r; continue; }
-            // Another device's write still propagating: do not clobber it yet.
-            if (rsec && rsec.status === 'incomplete' && meta && now - meta.at < INCOMPLETE_GRACE_MS && sec !== 'set') {
-                nextS[sec] = r;
-                retry = true;
-                continue;
-            }
             nextS[sec] = { n: b.chunks.length, h: b.h, e: b.e };
             b.chunks.forEach((c, i) => {
                 const key = `${PREFIX}${sec}_${i}`;
@@ -970,7 +961,6 @@ function createSync(api, S, clock) {
             session.firstDirtyAt = 0;
             await saveSession();
             await setStatus('ok', null);
-            if (retry) markDirty(false);
         };
         if (!Object.keys(items).length && sameMeta && !stale.length) {
             await finish();
@@ -1005,6 +995,7 @@ function createSync(api, S, clock) {
 
     // ---- local change tracking ----------------------------------------------
     async function onLocalChange(changes) {
+        for (const [key, at] of recentLibKeys) if (clock.now() - at >= RECENT_SYNC_MS) recentLibKeys.delete(key);
         const now = clock.now();
         let dirty = false;
         let stateChanged = false;
@@ -1025,19 +1016,14 @@ function createSync(api, S, clock) {
                 const newV = isObj(ch.newValue) ? ch.newValue : {};
                 const newKeys = Object.keys(newV);
                 const minKept = newKeys.reduce((m, k) => Math.min(m, fin(newV[k] && newV[k].updatedAt) ? newV[k].updatedAt : 0), Infinity);
-                let lostSynced = false;
                 for (const k of Object.keys(oldV)) {
                     if (k in newV || !KEY_RE.test(k)) continue;
                     const upd = fin(oldV[k] && oldV[k].updatedAt) ? oldV[k].updatedAt : 0;
                     // Eviction of the oldest entries past the 200 cap is not a deletion.
                     if (newKeys.length >= HISTORY_LOCAL_MAX && upd <= minKept) continue;
-                    // An entry our merge just added that vanished is most likely a read-modify-write
-                    // race with the player (stale read), not a user deletion: fetch it again instead.
-                    if (now - (recentSyncKeys.get(k) || -Infinity) < RECENT_SYNC_MS) { lostSynced = true; continue; }
                     state.histDel[k] = Math.max(now, upd + 1);
                     stateChanged = true;
                 }
-                if (lostSynced) schedulePull();
                 if (stateChanged) state.histDel = capTimes(state.histDel, TOMB_MAX);
                 dirty = true;
             } else if (key === LIBRARY_KEY) {
@@ -1096,11 +1082,11 @@ function createSync(api, S, clock) {
 
     // ---- lifecycle ----------------------------------------------------------
     function start(fromToggle) {
-        enabled = true;
         if (!syncArea) {
             setStatus('error', 'Sync storage is not available in this browser.');
             return;
         }
+        enabled = true;
         queue(async () => {
             if (!enabled) return;
             await pull();
@@ -1176,11 +1162,11 @@ function createSync(api, S, clock) {
  * @param {{api: object, S: object, clock?: object}} deps  api = chrome/browser namespace,
  *        S = globalThis.VelostreamShared, clock = test hook ({now, setTimeout, clearTimeout}).
  */
-export function initSync({ api, S, clock } = {}) {
+export function initSync({ api, S, clock, writeStorage = fn => fn() } = {}) {
     const noop = { syncNow: () => Promise.resolve(), clearSync: () => Promise.resolve(), getStatus: () => null, whenIdle: () => Promise.resolve(), ready: Promise.resolve() };
     try {
         if (!api || !api.storage || !api.storage.local || !S) return noop;
-        const ctl = createSync(api, S, clock || defaultClock);
+        const ctl = createSync(api, S, clock || defaultClock, writeStorage);
         api.storage.onChanged.addListener(ctl.onStorageChanged);
         if (api.runtime && api.runtime.onMessage) api.runtime.onMessage.addListener(ctl.onMessage);
         const ready = ctl.init().catch(err => { console.warn('[Velostream] Sync init failed:', err); });

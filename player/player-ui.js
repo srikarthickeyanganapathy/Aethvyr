@@ -252,7 +252,7 @@
     }
 
     function parseTimestamp(t) {
-        const m = /(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})/.exec(t.trim());
+        const m = /^(?:(\d+):)?(\d{1,2}):([0-5]?\d)[.,](\d{1,3})$/.exec(t.trim());
         if (!m) return NaN;
         return (+m[1] || 0) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4].padEnd(3, '0')) / 1000;
     }
@@ -420,6 +420,7 @@
 
         async write(chunk) {
             this.bytes += chunk.byteLength || chunk.size || 0;
+            if (!this.writable && this.bytes > 128 * 1024 * 1024) throw new Error('This browser can only save up to 128 MB per export without a file picker.');
             if (this.writable) await this.writable.write(chunk);
             else this.parts.push(chunk instanceof Blob ? chunk : new Blob([chunk]));
         }
@@ -504,7 +505,7 @@
             port.onmessage = (e) => {
                 const m = e.data;
                 if (!m) return;
-                if (m.reqId && this.waiters.has(m.reqId) && (m.type === 'SETTINGS' || m.type === 'STORE_VALUE')) {
+                if (m.reqId && this.waiters.has(m.reqId) && (m.type === 'SETTINGS' || m.type === 'STORE_VALUE' || m.type === 'HISTORY_SAVED')) {
                     const w = this.waiters.get(m.reqId);
                     this.waiters.delete(m.reqId);
                     w(m);
@@ -567,12 +568,13 @@
                 if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => { });
                 return true;
             }
-            if (!this.allowed()) return false;
+            if (this.sourceBound || !this.allowed()) return false;
             const AC = window.AudioContext || window.webkitAudioContext;
             if (!AC) return false;
+            let context;
             try {
-                const ctx = new AC({ latencyHint: 'playback' });
-                const source = ctx.createMediaElementSource(this.video);
+                context = new AC({ latencyHint: 'playback' });
+                const ctx = context;
                 const delay = ctx.createDelay(2);
                 const eq = EQ_BANDS.map(b => {
                     const f = ctx.createBiquadFilter();
@@ -597,6 +599,8 @@
                 normLimit.release.value = 0.3;
                 const out = ctx.createGain(); // processing exit; the spatial stage reads from it
                 const post = ctx.createGain(); // after the spatial stage; channel routing hangs off it
+                const source = ctx.createMediaElementSource(this.video);
+                this.sourceBound = true;
                 this.ctx = ctx;
                 this.nodes = { source, delay, eq, comp, gain, analyser, normGain, normLimit, out, post, compressing: null, normalizing: null, spatialKey: null };
                 source.connect(delay);
@@ -614,6 +618,7 @@
                 return true;
             } catch (e) {
                 console.warn('[Velostream] Audio graph unavailable:', e);
+                context?.close().catch(() => { });
                 this.ctx = null;
                 return false;
             }
@@ -658,7 +663,7 @@
             if (!n || !n.normalizing || !this.ctx || this.video.paused) return;
             const level = this.rms();
             const db = 20 * Math.log10(Math.max(level, 1e-6));
-            if (db < -45) return; // silence / pause: hold the current gain
+            if (!Number.isFinite(db) || db < -45) return; // silence / pause: hold the current gain
             const L = this.loud;
             const e = level * level;
             L.energy = L.primed ? L.energy * 0.92 + e * 0.08 : e;
@@ -856,6 +861,17 @@
             this.shakaVisible = false;
             this.lastHtml = '';
             this.lastTopHtml = '';
+        }
+
+        clearExternal() {
+            this.externalCues = null;
+            this.externalName = '';
+            this.capturedIndex = null;
+            this.secondaryCues = null;
+            this.secondaryName = '';
+            this.secondaryIndex = null;
+            this.lastHtml = this.lastTopHtml = null;
+            if (this.source === 'external') this.source = 'off';
         }
 
         activeCues() {
@@ -1316,7 +1332,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 .popover { position: absolute; z-index: 11; width: min(calc(var(--u) * 320), calc(100% - 32px)); max-height: min(70vh, 560px); display: none; flex-direction: column; border-radius: 20px; padding: 12px; touch-action: pan-y; }
 .popover.wide { width: min(calc(var(--u) * 360), calc(100% - 32px)); }
 /* Fixed height so switching Studio tabs never moves the tab bar under the user's finger. */
-.popover.studio { height: min(70vh, 560px, calc(100% - 140px)); }
+.popover.studio { height: min(70vh, 560px); }
 .popover.studio .pop-body { flex: 1; }
 .popover.open { display: flex; animation: popIn 360ms var(--fs-spring); }
 .popover.center { left: 50% !important; top: 50% !important; bottom: auto !important; transform: translate(-50%, -50%); width: min(520px, calc(100% - 32px)); }
@@ -1324,7 +1340,23 @@ button:disabled { opacity: 0.4; cursor: default; }
 @keyframes popIn { from { opacity: 0; transform: translateY(8px) scale(0.97); } to { opacity: 1; transform: none; } }
 .pop-head { display: flex; align-items: center; justify-content: space-between; padding: 0 0 4px 8px; }
 .pop-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
-.pop-body { overflow-y: auto; overscroll-behavior: contain; margin: 0 -4px; padding: 0 4px; user-select: text; -webkit-user-select: text; }
+.pop-body { min-height: 0; overflow: auto; touch-action: pan-y; overscroll-behavior: contain; margin: 0 -4px; padding: 0 4px; user-select: text; -webkit-user-select: text; }
+.root, .root * { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.28) transparent; }
+.root *::-webkit-scrollbar { width: 7px; height: 7px; }
+.root *::-webkit-scrollbar-thumb { border-radius: 8px; background: rgba(255,255,255,0.28); }
+.root select, .root option { color-scheme: dark; background: #1c1c1e; color: #fff; }
+.root .row, .root .popover button, .root .popover select { min-height: 44px; }
+.root .popover .segmented { grid-auto-columns: minmax(0, 1fr); }
+.root .popover .segmented button { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 420px) {
+  .popover { padding: 8px; }
+  .root .popover .ib { min-width: 44px; }
+  .popover .pop-head { gap: 4px; }
+  .popover .field { padding-inline: 4px; gap: 4px; }
+  .popover .field > * { min-width: 0; max-width: 100%; }
+  .popover .row { padding-inline: 4px; grid-template-columns: 20px minmax(0, 1fr) minmax(0, auto); }
+  .popover .row .meta { max-width: 25vw; overflow: hidden; text-overflow: ellipsis; }
+}
 .section-label { padding: 12px 10px 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fs-text-2); }
 .row {
   display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 8px; width: 100%; height: 40px; padding: 0 10px; border-radius: 10px;
@@ -1473,8 +1505,11 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.setStatus('loading');
             const [settingsMsg, init] = await Promise.all([this.port.request('SETTINGS_GET'), this.initPromise]);
             this.pageUrl = init.pageUrl || '';
+            this.playbackPageUrl = this.pageUrl;
+            this.pageMeta = this.playbackPageMeta = init.pageMeta || null;
             this.stream = init.stream;
-            this.rawSettings = cloneSettings(settingsMsg.settings);
+            this.rawSettings = cloneSettings(this.bootSettings || settingsMsg.settings);
+            this.bootSettings = null;
             this.recomputeSettings();
             if (!this.settings.hwTier) this.applyHardwareTier(false); // first run on this device
             if (this.profile) this.island('studio', `Site profile · ${this.profile.host}`, null, 2500);
@@ -1593,6 +1628,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             const t = (this.subs.capturedTracks || [])[i];
             if (!t) return false;
             const text = t.vtt || (t.url ? await this.fetchText(t.url) : '');
+            if (this.closed || this.subs.capturedTracks[i] !== t) return false;
             const cues = text ? parseSubtitleFile(text) : [];
             if (!cues.length) {
                 if (announce) this.announce('Could not load that subtitle track', 'warn');
@@ -1676,7 +1712,8 @@ input[type="text"] { width: 100%; min-width: 0; }
                 clearTimeout(this.saveTimer);
                 this.saveTimer = null;
                 this.pendingPatch = null;
-                const res = await S.restoreBackup(extApi, await file.text());
+                const res = await extApi.runtime.sendMessage({ action: 'BACKUP_RESTORE', json: await file.text() });
+                if (!res?.ok) throw new Error(res?.error || 'Could not restore backup.');
                 // storage.onChanged brings SETTINGS_CHANGED; bookmarks of this video reload here.
                 await this.loadBookmarks();
                 this.renderMarks();
@@ -1974,6 +2011,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             const reqId = `n${++this.netSeq}`;
             const started = performance.now();
             let entry = null;
+            let cancelled = false;
+            const abortError = () => new E(E.Severity.RECOVERABLE, E.Category.PLAYER, E.Code.OPERATION_ABORTED);
             const send = (zeroCopy) => new Promise((resolve, reject) => {
                 entry = { resolve, reject };
                 this.net.set(reqId, entry);
@@ -1983,6 +2022,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 if (res.ok && res.inCache) {
                     // Zero-copy: the engine stored the segment; read it from IndexedDB directly.
                     const rec = await this.readCache(res.cacheKey).catch(() => null);
+                    if (cancelled) throw abortError();
                     if (rec && rec.data) {
                         res = { ...res, data: rec.data, headers: { ...(res.headers || {}), ...(rec.mime ? { 'content-type': rec.mime } : {}) } };
                     } else {
@@ -2001,10 +2041,11 @@ input[type="text"] { width: 100%; min-width: 0; }
                 };
             });
             return new shaka.util.AbortableOperation(promise, () => {
+                cancelled = true;
                 if (this.net.has(reqId)) {
                     this.net.delete(reqId);
                     this.port.send({ type: 'ABORT', reqId });
-                    entry.reject(new E(E.Severity.RECOVERABLE, E.Category.PLAYER, E.Code.OPERATION_ABORTED));
+                    entry.reject(abortError());
                 }
                 return Promise.resolve();
             });
@@ -2012,7 +2053,7 @@ input[type="text"] { width: 100%; min-width: 0; }
 
         destroy({ notify = true } = {}) {
             if (this.closed) return;
-            this.saveHistory(true);
+            const saved = this.saveHistory(true, true);
             this.closed = true;
             for (const t of this.timers) { clearInterval(t); clearTimeout(t); }
             this.timers.clear();
@@ -2035,17 +2076,21 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (this.resizeObserver) this.resizeObserver.disconnect();
             this.destroyGpu();
             this.resetFileThumbs();
+            this.clearThumbCache();
             this.stopSubsPip();
             try { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => { }); } catch (_) { /* ignore */ }
             try { if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); } catch (_) { /* ignore */ }
             try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (_) { /* ignore */ }
             this.audio.destroy();
             const v = this.video;
-            const finish = () => {
+            const finish = async () => {
+                await saved;
+                if (notify) this.port.send({ type: 'CLOSE' });
                 try { v.pause(); v.removeAttribute('src'); v.load(); } catch (_) { /* ignore */ }
                 this.host.remove();
                 // The content script removes this iframe and restores the site's own player.
                 this.hostApi.layout({ cmd: 'close' });
+                this.port.close();
             };
             if (this.player) {
                 // shaka.destroy() revokes its MediaSource object URL and detaches SourceBuffers.
@@ -2059,8 +2104,6 @@ input[type="text"] { width: 100%; min-width: 0; }
                     try { navigator.mediaSession.setActionHandler(a, null); } catch (_) { /* unsupported */ }
                 }
             }
-            if (notify) this.port.send({ type: 'CLOSE' });
-            setTimeout(() => this.port.close(), 100);
         }
 
         every(ms, fn) { const t = setInterval(fn, ms); this.timers.add(t); return t; }
@@ -2073,6 +2116,15 @@ input[type="text"] { width: 100%; min-width: 0; }
         // -----------------------------------------------------------------
         // Engine / bridge messages
         // -----------------------------------------------------------------
+        updatePageMeta(msg) {
+            this.pageUrl = msg.pageUrl || '';
+            this.pageMeta = msg.pageMeta || null;
+            if (window.VelostreamShared.withoutResumeTime(this.playbackPageUrl) === window.VelostreamShared.withoutResumeTime(this.pageUrl) || !this.playbackPageUrl) {
+                this.playbackPageUrl = this.pageUrl;
+                this.playbackPageMeta = this.pageMeta;
+            }
+        }
+
         onMessage(msg) {
             if (this.closed) return;
             switch (msg.type) {
@@ -2085,6 +2137,29 @@ input[type="text"] { width: 100%; min-width: 0; }
                 case 'INIT':
                     if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
                     if (this.resolveInit) { this.resolveInit(msg); this.resolveInit = null; }
+                    else {
+                        this.updatePageMeta(msg);
+                        this.drmInfo = msg.drm || null;
+                        if (msg.stream && this.stream?.id !== msg.stream.id) this.finishStreamSwitch(msg);
+                        else if (this.setCaptured(msg.subtitles)) { this.loadChapters(); this.autoSelectCaptured(); }
+                    }
+                    break;
+                case 'ROUTE_CHANGE':
+                    this.updatePageMeta(msg);
+                    this.drmInfo = null;
+                    this.setCaptured([]);
+                    if (this.subs.capturedIndex != null || this.subs.secondaryIndex != null) {
+                        this.subs.clearExternal();
+                        this.subs.render(this.video.currentTime);
+                        this.updateCcButton();
+                    }
+                    this.refreshPopover();
+                    break;
+                case 'PAGE_META':
+                    this.updatePageMeta(msg);
+                    break;
+                case 'DRM':
+                    this.drmInfo = msg.drm || null;
                     break;
                 case 'STREAMS': {
                     const before = (this.tabStreams || []).map(s => s.id).join();
@@ -2113,7 +2188,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                     this.applyAbrSwitch(msg.variantId);
                     break;
                 case 'SETTINGS_CHANGED':
-                    if (!this.rawSettings) break; // start() has not read the settings yet
+                    if (!this.rawSettings) { this.bootSettings = msg.settings; break; }
                     this.rawSettings = cloneSettings(msg.settings);
                     // Edits still waiting in the debounce are not in storage yet: keep them.
                     if (this.pendingPatch) overlaySettings(this.rawSettings, this.pendingPatch);
@@ -2155,7 +2230,6 @@ input[type="text"] { width: 100%; min-width: 0; }
             this.shadow = host.attachShadow({ mode: 'open' });
             const spinner = '<svg viewBox="0 0 44 44" aria-hidden="true"><circle cx="22" cy="22" r="18" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="3.5"/><path d="M22 4a18 18 0 0 1 18 18" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/></svg>';
             setHTML(this.shadow, `
-<style>${CSS}</style>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <filter id="fs-sharpen"><feConvolveMatrix id="fs-kernel" order="3" kernelMatrix="0 0 0 0 1 0 0 0 0" preserveAlpha="true"/></filter>
 </svg>
@@ -2282,6 +2356,9 @@ input[type="text"] { width: 100%; min-width: 0; }
 </div>`);
             document.body.appendChild(host);
             this.root = this.$('.root');
+            const style = document.createElement('style');
+            style.textContent = CSS;
+            this.shadow.prepend(style);
             this.video = this.$('video');
             this.vbox = this.$('.vbox');
             this.glCanvas = this.$('.gl-canvas');
@@ -2718,7 +2795,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             });
             media('durationchange', () => this.renderMarks());
             media('resize', () => { this.layoutVideo(); this.updateQualityBadge(); });
-            media('seeked', () => { this.subs.render(v.currentTime); if (this.gpu) this.gpu.renderOnce(); this.updateAmbient(true); });
+            media('seeked', () => { this.subs.render(v.currentTime); if (this.gpu) this.gpu.renderOnce(); this.updateAmbient(true); this.saveHistory(true); });
             media('loadeddata', () => { if (this.gpu) this.gpu.renderOnce(); });
             this.listen(document, 'visibilitychange', () => { if (!document.hidden && this.gpu && this.gpu.active && !v.paused && !this.audioOnly) this.gpu.start(); });
             media('enterpictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'true'));
@@ -2896,6 +2973,10 @@ input[type="text"] { width: 100%; min-width: 0; }
         // Playback
         // -----------------------------------------------------------------
         togglePlay() {
+            if (this.pausedByHover) {
+                this.pausedByHover = false;
+                return;
+            }
             const v = this.video;
             if (v.paused || v.ended) {
                 const p = v.play();
@@ -3560,16 +3641,16 @@ input[type="text"] { width: 100%; min-width: 0; }
         // Subtitle extras: hover pause, click-to-copy, voice sync, speed, dual subtitles
         // -----------------------------------------------------------------
         bindSubtitleInteraction() {
-            let pausedByHover = false;
+            this.pausedByHover = false;
             for (const layer of this.$$('.subs')) {
                 this.listen(layer, 'pointerover', (e) => {
                     const st = this.settings && this.settings.subtitles;
                     if (!st || !st.pauseOnHover || e.pointerType !== 'mouse' || !e.target.classList.contains('cue-line')) return;
-                    if (!this.video.paused) { pausedByHover = true; this.video.pause(); }
+                    if (!this.video.paused) { this.pausedByHover = true; this.video.pause(); }
                 });
                 this.listen(layer, 'pointerout', (e) => {
-                    if (!pausedByHover || (e.relatedTarget && layer.contains(e.relatedTarget))) return;
-                    pausedByHover = false;
+                    if (!this.pausedByHover || (e.relatedTarget && layer.contains(e.relatedTarget))) return;
+                    this.pausedByHover = false;
                     this.video.play().catch(() => { });
                 });
                 this.listen(layer, 'pointerdown', (e) => { if (e.target.classList.contains('cue-line')) e.stopPropagation(); });
@@ -3713,8 +3794,11 @@ input[type="text"] { width: 100%; min-width: 0; }
         }
 
         clampPan() {
-            const maxX = (this.stage.clientWidth * (this.xf.zoom - 1)) / 2;
-            const maxY = (this.stage.clientHeight * (this.xf.zoom - 1)) / 2;
+            const rotated = this.xf.rotate % 180 !== 0;
+            const width = rotated ? this.stage.clientHeight : this.stage.clientWidth;
+            const height = rotated ? this.stage.clientWidth : this.stage.clientHeight;
+            const maxX = width * (this.xf.zoom - 1) / 2;
+            const maxY = height * (this.xf.zoom - 1) / 2;
             this.xf.panX = clamp(this.xf.panX, -maxX, maxX);
             this.xf.panY = clamp(this.xf.panY, -maxY, maxY);
         }
@@ -3833,14 +3917,31 @@ input[type="text"] { width: 100%; min-width: 0; }
         }
 
         mediaKey() {
+            const page = window.VelostreamShared.withoutResumeTime(this.playbackPageUrl);
+            const value = JSON.stringify([page, this.stream.url.split('#')[0]]);
+            let hash = 0xcbf29ce484222325n;
+            for (let i = 0; i < value.length; i++) {
+                hash = BigInt.asUintN(64, (hash ^ BigInt(value.charCodeAt(i))) * 0x100000001b3n);
+            }
+            return hash.toString(16).padStart(16, '0');
+        }
+
+        legacyMediaKey() {
             let base = this.stream.url;
             try { const u = new URL(base); base = u.origin + u.pathname; } catch (_) { /* raw */ }
             return hashKey(base);
         }
 
+        async legacyHistory() {
+            const legacy = await this.port.request('HISTORY_GET', { key: this.legacyMediaKey() }).catch(() => null);
+            const entry = legacy?.value;
+            return entry?.url === this.stream.url && (!entry.page || !this.playbackPageUrl || entry.page === window.VelostreamShared.withoutResumeTime(this.playbackPageUrl)) ? entry : null;
+        }
+
         async loadBookmarks() {
             try {
-                const res = await this.port.request('STORE_GET', { key: `fs_bm_${this.mediaKey()}` });
+                let res = await this.port.request('STORE_GET', { key: `fs_bm_${this.mediaKey()}` });
+                if (res.value == null && await this.legacyHistory()) res = await this.port.request('STORE_GET', { key: `fs_bm_${this.legacyMediaKey()}` });
                 this.bookmarks = Array.isArray(res.value) ? res.value.filter(b => Number.isFinite(b.t)).slice(0, 200) : [];
             } catch (_) {
                 this.bookmarks = [];
@@ -3904,8 +4005,8 @@ input[type="text"] { width: 100%; min-width: 0; }
             }
         }
 
-        saveHistory(force) {
-            if (!this.stream || !this.settings || this.closed || this.isLive()) return;
+        saveHistory(force, confirm = false) {
+            if (!this.stream || !this.settings || this.closed || this.changingMedia || this.isLive()) return;
             const v = this.video;
             const d = Number.isFinite(v.duration) ? v.duration : 0;
             if (!force && v.paused) return;
@@ -3913,28 +4014,32 @@ input[type="text"] { width: 100%; min-width: 0; }
             if (!d && !v.currentTime) return;
             // The site page the video plays on (Continue Watching opens it), never this
             // chrome-extension:// iframe.
-            const page = [this.pageUrl, this.stream.frameUrl].find(u => typeof u === 'string' && /^https?:\/\//i.test(u)) || '';
-            this.port.send({
-                type: 'HISTORY_SAVE',
+            const page = window.VelostreamShared.withoutResumeTime([this.playbackPageUrl, this.stream.frameUrl].find(u => typeof u === 'string' && /^https?:\/\//i.test(u)));
+            const payload = {
                 key: this.mediaKey(),
+                legacyKey: this.legacyMediaKey(),
                 entry: {
                     url: this.stream.url, title: this.$('.title').textContent, page, t: v.currentTime, d,
-                    done: d > 0 && v.currentTime > d - 20,
+                    pageMeta: this.playbackPageMeta,
+                    done: d > 0 && (v.ended || v.currentTime / d >= 0.8),
                     subOffset: this.subs.offset, loopA: this.loop.a, loopB: this.loop.b
                 }
-            });
+            };
+            if (confirm) return this.port.request('HISTORY_SAVE', payload, 2000).catch(() => { });
+            this.port.send({ type: 'HISTORY_SAVE', ...payload });
         }
 
         async checkResume() {
             if (!this.settings || this.isLive() || this.closed) return;
             let entry = null;
             try { entry = (await this.port.request('HISTORY_GET', { key: this.mediaKey() })).value; } catch (_) { return; }
+            if (!entry) entry = await this.legacyHistory();
             if (!entry) return;
             // Per-video memory is restored even when the position itself is not.
             if (Number.isFinite(entry.subOffset) && entry.subOffset) { this.subs.offset = entry.subOffset; this.subs.lastHtml = null; }
             if (Number.isFinite(entry.loopA)) { this.loop = { a: entry.loopA, b: Number.isFinite(entry.loopB) ? entry.loopB : null }; this.renderMarks(); }
-            if (this.settings.autoResume === 'off') return;
-            if (entry.done || entry.t < 15) return;
+            if (this.settings.autoResume === 'off' || this.hostApi.explicitStart) return;
+            if (entry.done && !(entry.d > 0 && entry.d <= 20 && entry.t / entry.d < 0.8) || entry.t < Math.min(15, entry.d * 0.2 || 15)) return;
             // The site's own player may hand over its (often stale, paused) position; the
             // furthest point actually reached wins.
             if (this.hostApi.startTime && entry.t <= this.hostApi.startTime + 5) return;
@@ -5124,9 +5229,15 @@ input[type="text"] { width: 100%; min-width: 0; }
         }
 
         /** Thumbnail sprites are fetched through the engine (site Referer) and cached as blob URLs. */
+        clearThumbCache() {
+            if (!this.thumbCache) return;
+            for (const url of this.thumbCache.values()) url.then(u => { if (u) URL.revokeObjectURL(u); });
+            this.thumbCache.clear();
+        }
+
         async thumbImage(uri, startByte, endByte) {
             if (!this.thumbCache) this.thumbCache = new Map();
-            const key = `${uri}|${startByte || 0}`;
+            const key = `${uri}|${startByte || 0}|${endByte || 0}`;
             if (this.thumbCache.has(key)) return this.thumbCache.get(key);
             const p = new Promise(resolve => {
                 const reqId = `n${++this.netSeq}`;
@@ -5364,7 +5475,7 @@ input[type="text"] { width: 100%; min-width: 0; }
             };
 
             this.listen(layer, 'pointerdown', (e) => {
-                if (this.errorShown || !this.settings) return;
+                if (this.errorShown || !this.settings || this.popKind) return;
                 if (this.locked) {
                     const u = this.$('.unlock-pill');
                     u.classList.add('show');
@@ -5375,7 +5486,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
                 this.lastPointerType = e.pointerType;
                 if (this.mini) {
-                    g = { mode: 'mini', sx: e.screenX, sy: e.screenY, moved: false };
+                    g = { mode: 'mini', sx: e.screenX, sy: e.screenY, type: e.pointerType, moved: false };
                     return;
                 }
                 const settings = gs();
@@ -5409,7 +5520,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
                 if (g.mode === 'mini') {
                     if (!g.moved) {
-                        if (Math.hypot(e.screenX - g.sx, e.screenY - g.sy) < 6) return;
+                        if (Math.hypot(e.screenX - g.sx, e.screenY - g.sy) < (g.type === 'mouse' ? 8 : 22)) return;
                         g.moved = true;
                         this.dragOrigin = { x: g.sx, y: g.sy };
                         this.hostApi.layout({ cmd: 'move-start' });
@@ -5429,8 +5540,11 @@ input[type="text"] { width: 100%; min-width: 0; }
                 const dy = e.clientY - g.y;
                 const rect = layer.getBoundingClientRect();
                 if (!g.mode) {
-                    if (Math.abs(dx) < 14 && Math.abs(dy) < 14) return;
+                    const slop = g.type === 'mouse' ? 10 : 22;
+                    if (Math.hypot(dx, dy) < slop) return;
+                    g.moved = true;
                     clearTimeout(g.longTimer);
+                    if (this.xf.zoom <= 1 && Math.abs(dx) < Math.abs(dy) * 1.25 && Math.abs(dy) < Math.abs(dx) * 1.25) return;
                     // Mouse: panning a zoomed picture always works; swipe gestures only when opted in.
                     if (this.xf.zoom > 1) g.mode = 'pan';
                     else if (g.type === 'mouse' && !settings.allowMouseDrag) g.mode = 'none';
@@ -5516,6 +5630,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                 clearTimeout(g.longTimer);
                 const mode = g.mode;
                 const cancelled = e.type === 'pointercancel';
+                if (cancelled) { clearTimeout(tapTimer); lastTap = null; this.justUnmuted = false; }
                 if (mode === 'boost') {
                     this.video.playbackRate = boostRestore || 1;
                     this.hideIsland();
@@ -5530,7 +5645,7 @@ input[type="text"] { width: 100%; min-width: 0; }
                     if (g.boost != null) this.saveSettings({ audio: { boost: g.boost } });
                     this.announceOnly(`Volume ${Math.round(this.video.volume * 100)}%`);
                     this.later(600, () => this.hideIsland());
-                } else if (!mode && !cancelled) {
+                } else if (!mode && !cancelled && !g.moved) {
                     this.handleTap(g, side(e.clientX), () => lastTap, (val) => { lastTap = val; }, () => tapTimer, (val) => { tapTimer = val; });
                 } else {
                     this.hideIsland();
@@ -5789,7 +5904,9 @@ input[type="text"] { width: 100%; min-width: 0; }
             const br = (this.popButton || this.deck).getBoundingClientRect();
             const w = p.offsetWidth;
             p.style.top = 'auto';
-            p.style.bottom = `${rr.bottom - dr.top + 12}px`;
+            const bottom = Math.max(8, Math.min(rr.height - 80, rr.bottom - dr.top + 12));
+            p.style.bottom = `${bottom}px`;
+            p.style.maxHeight = `${Math.max(44, rr.height - bottom - 8)}px`;
             p.style.left = `${clamp(br.left - rr.left + br.width / 2 - w / 2, 16, Math.max(16, rr.width - w - 16))}px`;
         }
 
@@ -5940,10 +6057,21 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
 
         async finishStreamSwitch(msg) {
             if (!msg.stream) return;
+            this.saveHistory(true);
+            this.changingMedia = true;
             this.switching = false;
+            if (msg.pageUrl !== undefined) this.updatePageMeta(msg);
+            if (msg.subtitles) this.setCaptured(msg.subtitles);
+            if (msg.drm !== undefined) this.drmInfo = msg.drm;
             const v = this.video;
             const prevType = this.stream ? this.stream.type : '';
             this.stream = msg.stream;
+            this.playbackPageUrl = this.pageUrl;
+            this.playbackPageMeta = this.pageMeta;
+            this.subs.offset = 0;
+            this.subs.speed = 1;
+            this.subs.lastHtml = null;
+            this.clearThumbCache();
             if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
             // Per-stream state starts over.
             this.loop = { a: null, b: null };
@@ -5961,7 +6089,10 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             this.smartSkip = null;
             this.lastQuality = {};
             this.subs.clearShaka();
-            if (this.subs.source === 'shaka') this.subs.source = 'off';
+            this.subs.clearExternal();
+            this.subs.source = 'off';
+            this.subs.render(v.currentTime);
+            this.updateCcButton();
             // Unload the old media. Shaka is torn down when the next stream is a plain file (it
             // must not keep the element), and reused for the next HLS/DASH stream.
             if (this.player && (this.stream.type === 'progressive' || prevType === 'progressive')) {
@@ -5974,6 +6105,9 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             let domain = '';
             try { domain = new URL(this.stream.url).hostname; } catch (_) { /* opaque */ }
             this.$('.domain').textContent = domain;
+            const title = this.stream.title || this.playbackPageMeta?.showTitle || this.titleFromUrl(this.stream.url);
+            this.$('.title').textContent = this.$('.title').title = title;
+            this.root.setAttribute('aria-label', `Velostream player: ${title}`);
             await this.loadBookmarks();
             this.renderMarks();
             this.hideIsland();
@@ -5982,9 +6116,12 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             } catch (e) {
                 this.showError('Cannot play this stream', String((e && e.message) || e));
                 return;
+            } finally {
+                this.changingMedia = false;
             }
             this.checkResume();
             this.loadChapters();
+            this.autoSelectCaptured();
             this.updateDownloadButton();
             this.announce(`Now playing ${this.stream.title || (this.stream.type === 'progressive' ? 'the file' : `the ${this.stream.type.toUpperCase()} stream`)}`, 'play');
             this.refreshPopover();

@@ -311,7 +311,7 @@
                     <div class="meta num">${fmtTime(e.t)}${e.d ? ` / ${fmtTime(e.d)}` : ''} · ${esc(fmtAgo(e.updatedAt))}</div>
                     <div class="bar" role="progressbar" aria-label="Watched" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" aria-valuetext="${pct}% watched"><i style="width:${pct}%"></i></div>
                 </div>
-                ${target ? `<button type="button" class="btn small" data-open="${esc(key)}" title="${esc(target)}" aria-label="Open the page of ${esc(title)} to resume">Open</button>` : '<span aria-hidden="true"></span>'}
+                ${target ? `<button type="button" class="btn small" data-open="${esc(key)}" title="${esc(target)}" aria-label="${e.page ? 'Resume' : 'Direct stream'} for ${esc(title)}">${e.page ? 'Resume' : 'Direct stream'}</button>` : '<span aria-hidden="true"></span>'}
                 <button type="button" class="icon-btn" data-del="${esc(key)}" aria-label="Remove ${esc(title)} from history">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
                 </button>`);
@@ -321,9 +321,8 @@
                 // Move focus to a neighbour first so keyboard users are not dropped to <body>.
                 const next = li.nextElementSibling || li.previousElementSibling;
                 const nextKey = next && next.querySelector('[data-del]') ? next.querySelector('[data-del]').dataset.del : null;
-                const cur = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
-                delete cur[key];
-                await api.storage.local.set({ [S.HISTORY_KEY]: cur });
+                const result = await api.runtime.sendMessage({ action: 'HISTORY_REMOVE', key }).catch(() => null);
+                if (!result?.ok) { showMessage('Could not remove history.'); return; }
                 lastHistorySig = '';
                 await renderHistory();
                 const el = nextKey && list.querySelector(`[data-del="${CSS.escape(nextKey)}"]`);
@@ -427,8 +426,17 @@
             } catch (_) { /* fall back to the in-memory copy */ }
             const next = JSON.parse(JSON.stringify(base));
             mutate(next);
-            settings = S.mergeSettings(next);
-            await api.storage.local.set({ [S.SETTINGS_KEY]: settings });
+            const patch = {};
+            for (const [key, value] of Object.entries(next)) {
+                if (JSON.stringify(value) === JSON.stringify(base[key])) continue;
+                if (['audio', 'subtitles', 'gestures', 'mouse', 'memory'].includes(key) && value && typeof value === 'object') {
+                    patch[key] = Object.fromEntries(Object.entries(value).filter(([field, v]) =>
+                        JSON.stringify(v) !== JSON.stringify(base[key]?.[field])));
+                } else patch[key] = value;
+            }
+            const result = await api.runtime.sendMessage({ action: 'SETTINGS_PATCH', patch });
+            if (!result?.ok) throw new Error(result?.error || 'Settings write failed');
+            settings = result.settings;
             applyPopupTheme();
             if (label) announce(`${label} saved`);
         };
@@ -557,7 +565,8 @@
             if (!file) return;
             if (file.size > 5 * 1024 * 1024) { showMessage('That file is too large to be a Velostream backup.'); return; }
             try {
-                const res = await S.restoreBackup(api, await file.text());
+                const res = await api.runtime.sendMessage({ action: 'BACKUP_RESTORE', json: await file.text() });
+                if (!res?.ok) throw new Error(res?.error || 'Could not restore backup.');
                 const fresh = await api.storage.local.get(S.SETTINGS_KEY);
                 settings = S.mergeSettings(fresh[S.SETTINGS_KEY]);
                 fillForm();
@@ -662,8 +671,7 @@
             if (changes[S.SETTINGS_KEY]) {
                 settings = S.mergeSettings(changes[S.SETTINGS_KEY].newValue);
                 // Refresh every control except the one being edited (it used to leave the whole form stale).
-                const active = $('settings-form').contains(document.activeElement) ? document.activeElement : null;
-                fillForm(active);
+                fillForm();
             }
             if (changes[S.HISTORY_KEY]) renderHistory();
         });

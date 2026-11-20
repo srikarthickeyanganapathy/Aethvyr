@@ -21,6 +21,11 @@
     const IS_TOP = window === window.top;
     const TAG_FROM_PAGE = 'velostream-interceptor';
     const TAG_TO_PAGE = 'velostream-sniffer';
+    const frameOrigin = window.origin;
+    const bridgeNonce = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+    const postToPage = message => {
+        if (frameOrigin !== 'null') window.postMessage({ source: TAG_TO_PAGE, ...message }, frameOrigin);
+    };
     const PROXY_TIMEOUT_MS = 55000;
 
     let contextValid = true;
@@ -80,7 +85,7 @@
         for (let i = 0; i < n; i++) {
             const c = cues[i];
             const text = c && typeof c.text === 'string' ? c.text : '';
-            if (!text) continue;
+            if (!text || !Number.isFinite(c.startTime) || !Number.isFinite(c.endTime) || c.endTime <= c.startTime) continue;
             out += `${vttTime(c.startTime)} --> ${vttTime(c.endTime)}\n${text.replace(/\n{2,}/g, '\n')}\n\n`;
             if (out.length > 1500000) break;
         }
@@ -95,7 +100,7 @@
     const SUB_MAX_RUNS = 15;       // ~30 s of re-checks after the last real change
     const SUB_STABLE_MS = 1500;    // cue count must be unchanged this long before serializing
     const SUB_MAX_REPORTS = 3;     // per track (first report + 2 substantial growths)
-    const trackState = new WeakMap(); // TextTrack -> { count, changedAt, reported, reports }
+    let trackState = new WeakMap(); // TextTrack -> { count, changedAt, reported, reports }
     const subWatch = new WeakMap();   // <video> -> { timer, runs, off: [], tracks: WeakSet }
 
     /** @returns {{pending: boolean, grew: boolean}} */
@@ -115,11 +120,11 @@
             st.count = count;
             st.changedAt = now;
         }
-        const min = t.kind === 'chapters' ? 1 : 3;
+        const min = 1;
         if (count < min) return { pending: true, grew };
         if (st.reports >= SUB_MAX_REPORTS || count <= st.reported) return { pending: false, grew };
         // After a first report, only substantial growth is worth another (size-keyed) entry.
-        if (st.reported && count < Math.max(st.reported + 5, st.reported * 1.25)) return { pending: true, grew };
+        if (st.reported >= 5 && count < Math.max(st.reported + 5, st.reported * 1.25)) return { pending: true, grew };
         if (now - st.changedAt < SUB_STABLE_MS) return { pending: true, grew }; // still being filled
         st.reported = count;
         st.reports++;
@@ -213,11 +218,67 @@
     // ------------------------------------------------------------------
     const pendingFetches = new Map();
 
+    let routeUrl = location.href;
+    let lastMeta = '';
+
+    function reportPageMeta() {
+        if (!IS_TOP) return;
+        const meta = name => document.querySelector('meta[property="og:' + name + '"]')?.content || '';
+        const titles = [meta('title'), document.querySelector('h1')?.textContent, document.title].map(v => (v || '').trim()).filter(Boolean);
+        let path = location.pathname;
+        try { path = decodeURIComponent(path); } catch (_) { /* malformed escape */ }
+        const source = [...titles, path].join(' ');
+        const episode = source.match(/(?:\b(?:episodes?|ep)[\s._/-]*|\bs\d+e)(\d+(?:\.\d+)?)/i);
+        const season = source.match(/\b(?:season[\s._/-]*|s)(\d+)(?:e\d|\b)/i);
+        const titleFromPath = path.match(/\/(?:series|shows?|anime|movies?)\/([^/]+)/i)?.[1]?.replace(/[-_]/g, ' ') || '';
+        const showTitle = [...titles, titleFromPath].map(title => title.replace(/\s*(?:[-–—:|]\s*)?(?:\b(?:season|episodes?|ep)[\s._-]*\d|\bs\d+e\d).*$/i, '').trim()).find(Boolean) || '';
+        const poster = meta('image') ? S.normalizeUrl(meta('image'), location.href) : '';
+        const pageMeta = {
+            pageUrl: location.href,
+            siteName: (meta('site_name') || location.hostname).slice(0, 200),
+            showTitle: showTitle.slice(0, 200),
+            kind: episode || season || /^(?:video\.episode|video\.tv_show)$/.test(meta('type')) ? 'series' :
+                meta('type') === 'video.movie' || /(?:^|\/)movies?(?:\/|$)/i.test(path) ? 'movie' : 'video',
+            season: season ? Number(season[1]) : null,
+            episode: episode ? Number(episode[1]) : null,
+            poster: /^https?:/i.test(poster || '') ? poster : ''
+        };
+        const snapshot = JSON.stringify(pageMeta);
+        if (snapshot !== lastMeta) {
+            lastMeta = snapshot;
+            send({ action: 'PAGE_META', pageMeta });
+        }
+    }
+
+    function resetDetection(rescan = false) {
+        reportedUrls.clear();
+        reportedSubs.clear();
+        mseReported = videoReported = drmReported = false;
+        trackState = new WeakMap();
+        badge.dismissed = false;
+        if (rescan) postToPage({ type: 'RESCAN', nonce: bridgeNonce() });
+        else {
+            restoreMedia(false);
+            badge.state.count = 0;
+            renderBadge();
+            if (IS_TOP) send({ action: 'ROUTE_CHANGE', pageUrl: routeUrl });
+        }
+        clearTimeout(scanTimer);
+        scanTimer = setTimeout(scanMedia, 350);
+    }
+
     window.addEventListener('message', (event) => {
-        if (event.source !== window) return;
+        if (!event.isTrusted || event.source !== window || event.origin !== frameOrigin) return;
         const msg = event.data;
         if (!msg || msg.source !== TAG_FROM_PAGE) return;
+        if (msg.type !== 'FETCH_RESULT' && msg.pageUrl !== location.href) return;
         switch (msg.type) {
+            case 'ROUTE_CHANGE':
+                if (msg.pageUrl === location.href && routeUrl !== location.href) {
+                    routeUrl = location.href;
+                    resetDetection();
+                }
+                break;
             case 'STREAM_FOUND':
                 reportStream(msg.payload);
                 break;
@@ -238,7 +299,7 @@
                 break;
             case 'FETCH_RESULT': {
                 const pending = pendingFetches.get(msg.id);
-                if (pending) pending(msg);
+                if (pending?.nonce === msg.nonce) pending.complete(msg);
                 break;
             }
             default:
@@ -247,15 +308,20 @@
     });
 
     function proxyFetch(message, sendResponse) {
-        const id = message.id || crypto.randomUUID();
+        if (frameOrigin === 'null') {
+            sendResponse({ ok: false, status: 0, error: 'Page fetch is unavailable in an opaque frame.' });
+            return;
+        }
+        const nonce = bridgeNonce();
+        const id = message.id || nonce;
         const timer = setTimeout(() => {
             if (!pendingFetches.has(id)) return;
             pendingFetches.delete(id);
-            window.postMessage({ source: TAG_TO_PAGE, type: 'FS_ABORT', id }, '*');
+            postToPage({ type: 'FS_ABORT', id, nonce });
             sendResponse({ ok: false, status: 0, error: `Page fetch timeout (${PROXY_TIMEOUT_MS}ms)` });
         }, PROXY_TIMEOUT_MS);
 
-        pendingFetches.set(id, (result) => {
+        pendingFetches.set(id, { nonce, complete(result) {
             pendingFetches.delete(id);
             clearTimeout(timer);
             if (!result.ok) {
@@ -273,16 +339,16 @@
             } catch (err) {
                 sendResponse({ ok: false, status: 0, error: `Encode failed: ${err.message}` });
             }
-        });
+        } });
 
-        window.postMessage({
-            source: TAG_TO_PAGE,
+        postToPage({
             type: 'FS_FETCH',
             id,
+            nonce,
             url: message.url,
             method: message.method || 'GET',
             headers: message.headers || {}
-        }, '*');
+        });
     }
 
     // ------------------------------------------------------------------
@@ -306,6 +372,11 @@
     function scanMedia() {
         scanTimer = null;
         if (!document.documentElement) return;
+        if (routeUrl !== location.href) { routeUrl = location.href; resetDetection(); return; }
+        reportPageMeta();
+        if (suspended) for (const el of suspended.keys()) {
+            if (!el.isConnected) { el.muted = suspended.get(el).muted; suspended.delete(el); }
+        }
         const media = collectMedia(document, []);
         for (const el of media) {
             if (el.tagName === 'VIDEO' && !videoReported) {
@@ -335,6 +406,13 @@
 
     const observer = new MutationObserver((mutations) => {
         for (const m of mutations) {
+            if (IS_TOP && document.head?.contains(m.target)) { scheduleScan(); return; }
+            for (const node of m.removedNodes) {
+                if (node.nodeType === 1 && (node.matches('video, audio, source') || node.querySelector('video, audio, source'))) {
+                    scheduleScan();
+                    return;
+                }
+            }
             if (m.type === 'attributes') { scheduleScan(); return; }
             for (const n of m.addedNodes) {
                 if (n.nodeType === 1 && (n.tagName === 'VIDEO' || n.tagName === 'AUDIO' || n.tagName === 'SOURCE' ||
@@ -352,13 +430,16 @@
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['src']
+            characterData: IS_TOP,
+            attributeFilter: ['src', 'content']
         });
         scheduleScan();
     }
     if (document.documentElement) startObserving();
     else document.addEventListener('readystatechange', startObserving, { once: true });
     window.addEventListener('load', scheduleScan, { once: true });
+    window.addEventListener('popstate', scheduleScan);
+    window.addEventListener('hashchange', scheduleScan);
     // Native players set src late; catch the actual load.
     document.addEventListener('loadstart', (e) => {
         const t = e.target;
@@ -389,14 +470,14 @@
 
     function suspendElement(el) {
         if (!suspended || !(el instanceof HTMLMediaElement)) return;
-        if (!suspended.has(el)) suspended.set(el, { muted: el.muted });
+        if (!suspended.has(el)) suspended.set(el, { muted: el.muted, playing: !el.paused && !el.ended });
         try { el.pause(); } catch (_) { /* ignore */ }
         el.muted = true;
     }
 
     function onNativePlay(e) {
         // Media events do not escape shadow roots, so Velostream's own <video> never lands here.
-        suspendElement(e.target);
+        if (suspended?.has(e.target)) suspendElement(e.target);
     }
 
     function suspendMedia() {
@@ -407,11 +488,14 @@
         collectMedia(document, []).forEach(suspendElement);
     }
 
-    function restoreMedia() {
+    function restoreMedia(resume = true) {
         if (!suspended) return;
         document.removeEventListener('play', onNativePlay, true);
         for (const [el, state] of suspended) {
-            try { el.muted = state.muted; } catch (_) { /* detached */ }
+            try {
+                el.muted = state.muted;
+                if (resume && state.playing && el.isConnected) el.play()?.catch(() => { });
+            } catch (_) { /* detached */ }
         }
         suspended = null;
     }
@@ -806,7 +890,10 @@
 
         suspendMedia();
         const url = new URL(message.url);
-        if (video && Number.isFinite(video.currentTime) && video.currentTime > 1 && Number.isFinite(video.duration)) {
+        if (Number.isFinite(message.startTime) && message.startTime >= 0) {
+            url.searchParams.set('t', String(message.startTime));
+            url.searchParams.set('explicitStart', '1');
+        } else if (video && Number.isFinite(video.currentTime) && video.currentTime > 1 && Number.isFinite(video.duration)) {
             url.searchParams.set('t', String(Math.floor(video.currentTime)));
         }
         if (IS_TOP && document.title) url.searchParams.set('title', document.title.slice(0, 200));
@@ -856,8 +943,7 @@
 
     // ------------------------------------------------------------------
     // 6. On-page "Play in Velostream" glass pill
-    //    Shown over the largest visible <video> of this frame (or bottom-right of the top
-    //    frame when no frame reports a <video>). Draggable, dismissible, keyboard accessible.
+    //    The top frame anchors the badge to its largest video, or the viewport corner for embeds.
     //    Closed shadow root: page CSS cannot restyle it, page JS cannot read it.
     // ------------------------------------------------------------------
     const badge = {
@@ -889,7 +975,7 @@ button { all: unset; box-sizing: border-box; display: inline-flex; align-items: 
 .play:active { transform: scale(0.96); }
 .meta { color: rgba(235, 235, 245, 0.82); font-variant-numeric: tabular-nums; font-weight: 500; }
 .divider { width: 1px; height: 20px; background: rgba(255, 255, 255, 0.12); }
-.close { width: 36px; height: 36px; margin-left: 4px; }
+.close { width: 44px; height: 44px; margin-left: 4px; }
 .close:hover, .play:hover { background: rgba(255, 255, 255, 0.10); }
 button:focus-visible { outline: 2px solid #0A84FF; outline-offset: 2px; }
 svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
@@ -917,7 +1003,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         const host = document.createElement('velostream-badge');
         host.style.cssText = 'all: initial; position: fixed; top: 0; left: 0; width: 0; height: 0; z-index: 2147483646;';
         const shadow = host.attachShadow({ mode: 'closed' });
-        S.setHTML(shadow, `<style>${BADGE_CSS}</style>
+        S.setHTML(shadow, `
 <div class="pill" role="group" aria-label="Velostream" hidden>
   <button type="button" class="play" aria-label="Play this video in Velostream">
     <svg class="bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4.5 13.2a.6.6 0 0 0 .5 1H11l-1 7.8 8.5-11.2a.6.6 0 0 0-.5-1H12z"/></svg>
@@ -928,6 +1014,9 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
   </button>
 </div>`);
+        const style = document.createElement('style');
+        style.textContent = BADGE_CSS;
+        shadow.prepend(style);
         badge.host = host;
         badge.shadow = shadow;
         const pill = shadow.querySelector('.pill');
@@ -1006,13 +1095,10 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 
     function renderBadge() {
         const s = badge.state;
-        badge.target = largestVideo();
-        const fallbackTop = IS_TOP && !s.videoFrames.length;
-        const show = badge.enabled && !badge.dismissed && !s.playerOpen && s.count > 0 && (badge.target || fallbackTop);
+        const show = IS_TOP && badge.enabled && !badge.dismissed && !s.playerOpen && s.count > 0;
+        badge.target = show ? largestVideo() : null;
         if (!show) {
             if (badge.shadow) badge.shadow.querySelector('.pill').hidden = true;
-            clearInterval(badge.timer);
-            badge.timer = null;
             return;
         }
         ensureBadge();
@@ -1024,7 +1110,6 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         badge.shadow.querySelector('.play').setAttribute('aria-label', `Play this video in Velostream${s.label ? `, ${s.label}` : ''}`);
         pill.hidden = false;
         positionBadge();
-        if (!badge.timer) badge.timer = setInterval(() => { badge.target = largestVideo() || badge.target; positionBadge(); }, 1000);
     }
 
     async function launchFromBadge() {
@@ -1077,7 +1162,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
                 return true;
             case 'FETCH_ABORT':
                 if (pendingFetches.has(message.id)) {
-                    window.postMessage({ source: TAG_TO_PAGE, type: 'FS_ABORT', id: message.id }, '*');
+                    postToPage({ type: 'FS_ABORT', id: message.id, nonce: pendingFetches.get(message.id).nonce });
                 }
                 return false;
             case 'SUSPEND_MEDIA':
@@ -1086,11 +1171,12 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
             case 'RESTORE_MEDIA':
                 if (!mount.frame) restoreMedia();
                 return false;
+            case 'ROUTE_RESET':
+                if (!IS_TOP) { restoreMedia(false); resetDetection(true); }
+                return false;
             case 'RESCAN':
-                reportedUrls.clear();
-                mseReported = false;
-                videoReported = false;
-                scanMedia();
+                resetDetection(true);
+                sendResponse({ ok: true });
                 return false;
             case 'MOUNT_PLAYER':
                 sendResponse(mountPlayer(message));

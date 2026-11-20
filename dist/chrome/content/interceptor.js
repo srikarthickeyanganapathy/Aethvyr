@@ -27,6 +27,18 @@
     const MAX_SUBS = 24;
     const reportedSubs = new Set();
     const reported = new Set();
+    let signalled = false;
+    let drmSignalled = false;
+    let route = window.location.href;
+    let generation = 0;
+
+    function resetDetection() {
+        generation++;
+        reported.clear();
+        reportedSubs.clear();
+        sniffed.clear();
+        signalled = drmSignalled = false;
+    }
 
     // Capture pristine references before any page script can monkey-patch them.
     const origFetch = window.fetch;
@@ -36,10 +48,11 @@
     const OrigAbortController = window.AbortController;
     const OrigHeaders = window.Headers;
     const location = window.location;
+    const frameOrigin = window.origin;
 
     function emit(type, payload, transfer) {
         try {
-            postMessage({ source: TAG_OUT, type, ...payload }, '*', transfer || []);
+            if (frameOrigin !== 'null') postMessage({ source: TAG_OUT, type, pageUrl: location.href, ...payload }, frameOrigin, transfer || []);
         } catch (_) { /* detached frame */ }
     }
 
@@ -59,6 +72,7 @@
         if (!byExt && !byMime) return;
         const key = url.split('#')[0];
         if (reported.has(key)) return;
+        if (reported.size >= 256) reported.delete(reported.values().next().value);
         reported.add(key);
         const isHls = /m3u8|=hls(&|#|$)|mpegurl/i.test(url) || /mpegurl/i.test(mime || '');
         emit('STREAM_FOUND', { payload: { url: key, method, mime: mime || '', type: isHls ? 'hls' : 'dash' } });
@@ -93,6 +107,10 @@
     const SNIFF_SKIP = /\.(js|mjs|css|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|ts|m4s|mp4|m4a|aac|webm|json)(\?|#|$)/i;
     const SNIFF_TYPES = /^(text\/plain|application\/octet-stream|binary\/octet-stream|application\/x-mpegurl|audio\/mpegurl|application\/xml|text\/xml|)$/i;
     const sniffed = new Set();
+    function rememberSniff(url) {
+        if (sniffed.size >= 512) sniffed.delete(sniffed.values().next().value);
+        sniffed.add(url);
+    }
     function sniffKind(text) {
         const head = text.slice(0, 512).replace(/^\uFEFF/, '').trimStart();
         if (head.startsWith('#EXTM3U')) return 'application/vnd.apple.mpegurl';
@@ -141,19 +159,25 @@
     }
 
     window.fetch = function (resource, init) {
+        const requestGeneration = generation;
         const url = urlOf(resource);
         if (url) { report(url, 'fetch'); reportSubtitle(url); }
         const p = origFetch.apply(this, arguments);
         if (url && !MANIFEST_RE.test(url)) {
             p.then(res => {
+                if (generation !== requestGeneration) return;
                 try {
                     const ct = res.headers.get('content-type');
                     const final = res.url || url;
                     if (ct && MANIFEST_MIME.test(ct)) { report(final, 'fetch', ct); return; }
                     if (ct && SUB_MIME.test(ct)) { reportSubtitle(final, ct); return; }
                     if (res.ok && res.type !== 'opaque' && shouldSniff(final, ct, res.headers.get('content-length'))) {
-                        sniffed.add(final);
-                        sniffHead(res, t => { const k = sniffKind(t); if (k === 'text/vtt') reportSubtitle(final, k); else if (k) report(final, 'fetch', k); });
+                        rememberSniff(final);
+                        sniffHead(res, t => {
+                            if (generation !== requestGeneration) return;
+                            const k = sniffKind(t);
+                            if (k === 'text/vtt') reportSubtitle(final, k); else if (k) report(final, 'fetch', k);
+                        });
                     }
                 } catch (_) { /* opaque */ }
             }, () => { });
@@ -163,6 +187,7 @@
     try { Object.defineProperty(window.fetch, 'name', { value: 'fetch' }); } catch (_) { /* ignore */ }
 
     OrigXHR.prototype.open = function (method, url) {
+        const requestGeneration = generation;
         try {
             const u = urlOf(url);
             if (u) {
@@ -170,13 +195,14 @@
                 reportSubtitle(u);
                 if (!MANIFEST_RE.test(u)) {
                     this.addEventListener('load', function onLoad() {
+                        if (generation !== requestGeneration) return;
                         try {
                             const ct = this.getResponseHeader('content-type');
                             const final = this.responseURL || u;
                             if (ct && MANIFEST_MIME.test(ct)) { report(final, 'xhr', ct); return; }
                             if (ct && SUB_MIME.test(ct)) { reportSubtitle(final, ct); return; }
                             if ((this.responseType === '' || this.responseType === 'text') && shouldSniff(final, ct, this.getResponseHeader('content-length'))) {
-                                sniffed.add(final);
+                                rememberSniff(final);
                                 const k = sniffKind(this.responseText || '');
                                 if (k === 'text/vtt') reportSubtitle(final, k); else if (k) report(final, 'xhr', k);
                             }
@@ -231,14 +257,17 @@
     // Blob behind each live object URL the page creates (script-like types only), so a
     // worker's source can be re-exposed under a URL that the page cannot revoke.
     const scriptBlobs = new Map();
-    const SCRIPT_BLOB_TYPE = /^$|javascript|ecmascript|^text\/plain/i;
+    const SCRIPT_BLOB_TYPE = /javascript|ecmascript|^text\/plain/i;
     function trackObjectUrls() {
         if (typeof origCreateObjectURL !== 'function' || typeof origRevokeObjectURL !== 'function' || !OrigBlob) return;
         const createObjectURL = {
             createObjectURL(obj) {
                 const url = rApply(origCreateObjectURL, this, arguments);
                 try {
-                    if (obj instanceof OrigBlob && SCRIPT_BLOB_TYPE.test(obj.type || '') && typeof url === 'string') scriptBlobs.set(url, obj);
+                    if (obj instanceof OrigBlob && SCRIPT_BLOB_TYPE.test(obj.type) && obj.size <= 4 * 1024 * 1024) {
+                        scriptBlobs.set(url, obj);
+                        if (scriptBlobs.size > 16) scriptBlobs.delete(scriptBlobs.keys().next().value);
+                    }
                 } catch (_) { /* never break the page */ }
                 return url;
             }
@@ -271,6 +300,11 @@
                 clearTimeout(o.timer);
                 for (const u of o.urls) { try { origRevokeObjectURL.call(OrigURL, u); } catch (_) { /* ignore */ } }
             };
+            window.addEventListener('pagehide', event => {
+                if (event.persisted) return;
+                bc.close();
+                for (const token of owned.keys()) release(token);
+            });
             bc.onmessage = (e) => {
                 const d = e.data;
                 if (!d) return;
@@ -299,6 +333,7 @@
             };
             window.Worker = new Proxy(OrigWorker, {
                 construct(target, args, newTarget) {
+                    if (args[1]?.type === 'module') return rConstruct(target, args, newTarget);
                     const urls = [];
                     try {
                         const raw = args[0];
@@ -341,7 +376,6 @@
     // ------------------------------------------------------------------
     if (window.MediaSource && window.MediaSource.prototype.addSourceBuffer) {
         const origAdd = window.MediaSource.prototype.addSourceBuffer;
-        let signalled = false;
         window.MediaSource.prototype.addSourceBuffer = function (mimeType) {
             // Ignore Velostream's own player (its host element lives in the top document).
             if (!signalled && !document.getElementById('velostream-host')) {
@@ -359,7 +393,6 @@
     // ------------------------------------------------------------------
     if (navigator.requestMediaKeySystemAccess) {
         const origRmksa = navigator.requestMediaKeySystemAccess;
-        let drmSignalled = false;
         navigator.requestMediaKeySystemAccess = function (keySystem) {
             if (!drmSignalled && !/clearkey/i.test(String(keySystem))) {
                 drmSignalled = true;
@@ -429,14 +462,10 @@
     // ------------------------------------------------------------------
     const controllers = new Map();
 
-    function sameOrigin(url) {
-        try { return new URL(url).origin === location.origin; } catch (_) { return false; }
-    }
-
     async function doFetch(url, method, headers, signal, credentials) {
         const h = new OrigHeaders();
         for (const [k, v] of Object.entries(headers || {})) {
-            if (/^(host|cookie|origin|referer|content-length|connection)$/i.test(k)) continue;
+            if (!/^(range|accept|content-type)$/i.test(k)) continue;
             try { h.set(k, v); } catch (_) { /* forbidden header */ }
         }
         return origFetch.call(window, url, {
@@ -453,26 +482,17 @@
     async function handleFetch(msg) {
         const { id, url, method, headers } = msg;
         const controller = new OrigAbortController();
-        controllers.set(id, controller);
+        controllers.set(id, { controller, nonce: msg.nonce });
         try {
-            let res;
-            const firstCreds = sameOrigin(url) ? 'include' : 'same-origin';
-            try {
-                // Cross-origin CDNs typically answer with ACAO:* which forbids credentials,
-                // so try without cookies first and retry with them on a CORS failure.
-                res = await doFetch(url, method, headers, controller.signal, firstCreds);
-            } catch (err) {
-                if (err && err.name === 'AbortError') throw err;
-                if (firstCreds === 'include') throw err;
-                res = await doFetch(url, method, headers, controller.signal, 'include');
-            }
+            const res = await doFetch(url, method, headers, controller.signal, 'same-origin');
             const outHeaders = {};
             res.headers.forEach((v, k) => { outHeaders[k] = v; });
             const buffer = (method === 'HEAD') ? new ArrayBuffer(0) : await res.arrayBuffer();
-            emit('FETCH_RESULT', { id, ok: true, status: res.status, headers: outHeaders, url: res.url || url, buffer }, [buffer]);
+            emit('FETCH_RESULT', { id, nonce: msg.nonce, ok: true, status: res.status, headers: outHeaders, url: res.url || url, buffer }, [buffer]);
         } catch (err) {
             emit('FETCH_RESULT', {
                 id,
+                nonce: msg.nonce,
                 ok: false,
                 aborted: !!(err && err.name === 'AbortError'),
                 status: 0,
@@ -483,15 +503,35 @@
         }
     }
 
+    function routeChanged() {
+        if (location.href === route) return;
+        route = location.href;
+        resetDetection();
+        emit('ROUTE_CHANGE', { pageUrl: route });
+    }
+
+    for (const method of ['pushState', 'replaceState']) {
+        const original = history[method];
+        history[method] = function (...args) {
+            const result = Reflect.apply(original, this, args);
+            routeChanged();
+            return result;
+        };
+    }
+    window.addEventListener('popstate', routeChanged);
+    window.addEventListener('hashchange', routeChanged);
+
     window.addEventListener('message', (event) => {
-        if (event.source !== window) return;
+        if (!event.isTrusted || event.source !== window || event.origin !== frameOrigin) return;
         const msg = event.data;
-        if (!msg || msg.source !== TAG_IN || typeof msg.id !== 'string') return;
-        if (msg.type === 'FS_FETCH' && typeof msg.url === 'string' && /^https?:/i.test(msg.url)) {
+        if (!msg || msg.source !== TAG_IN || typeof msg.nonce !== 'string' || !/^[0-9a-f]{32}$/i.test(msg.nonce)) return;
+        if (msg.type === 'RESCAN') { resetDetection(); return; }
+        if (typeof msg.id !== 'string') return;
+        if (msg.type === 'FS_FETCH' && typeof msg.url === 'string' && /^https?:\/\//i.test(msg.url) && ['GET', 'HEAD'].includes(msg.method) && !controllers.has(msg.id)) {
             handleFetch(msg);
         } else if (msg.type === 'FS_ABORT') {
             const c = controllers.get(msg.id);
-            if (c) c.abort();
+            if (c?.nonce === msg.nonce) c.controller.abort();
         }
     });
 

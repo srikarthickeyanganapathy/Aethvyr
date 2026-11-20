@@ -20,9 +20,6 @@
     const params = new URLSearchParams(location.search);
     const sessionId = params.get('session');
     const streamId = params.get('stream');
-    /** Must match DEEP_SETTINGS in player-ui.js. */
-    const DEEP_SETTINGS = ['audio', 'subtitles', 'gestures', 'mouse', 'memory'];
-    const isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
 
     class EnginePort {
         constructor() {
@@ -108,14 +105,7 @@
                 case 'SETTINGS_SET':
                     // The player sends only the fields the user edited; sub-objects arrive as
                     // partial objects and are merged field by field (keymap: null = defaults).
-                    await this.serial(async () => {
-                        const current = await this.readSettings();
-                        const next = { ...current };
-                        for (const [k, v] of Object.entries(msg.patch || {})) {
-                            next[k] = DEEP_SETTINGS.includes(k) && isPlainObject(v) && isPlainObject(current[k]) ? { ...current[k], ...v } : v;
-                        }
-                        await api.storage.local.set({ [S.SETTINGS_KEY]: S.mergeSettings(next) });
-                    });
+                    await this.serial(() => api.runtime.sendMessage({ action: 'SETTINGS_PATCH', patch: msg.patch }));
                     return true;
                 case 'STORE_GET': {
                     if (typeof msg.key !== 'string' || !msg.key.startsWith('fs_bm_')) return true;
@@ -124,26 +114,15 @@
                     return true;
                 }
                 case 'STORE_SET':
-                    if (typeof msg.key === 'string' && /^fs_bm_[\w-]{1,64}$/.test(msg.key)) {
-                        await api.storage.local.set({ [msg.key]: msg.value });
-                    }
-                    return true;
+                    return false;
                 case 'HISTORY_GET': {
                     const all = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
                     this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: all[msg.key] || null });
                     return true;
                 }
                 case 'HISTORY_SAVE': {
-                    if (typeof msg.key !== 'string' || !msg.entry) return true;
-                    await this.serial(async () => {
-                        const all = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
-                        all[msg.key] = { ...msg.entry, updatedAt: Date.now() };
-                        const keys = Object.keys(all);
-                        if (keys.length > 200) {
-                            keys.sort((a, b) => (all[a].updatedAt || 0) - (all[b].updatedAt || 0)).slice(0, keys.length - 200).forEach(k => delete all[k]);
-                        }
-                        await api.storage.local.set({ [S.HISTORY_KEY]: all });
-                    });
+                    const result = await api.runtime.sendMessage({ action: 'HISTORY_SAVE', key: msg.key, legacyKey: msg.legacyKey, entry: msg.entry });
+                    if (msg.reqId) this.deliver({ type: 'HISTORY_SAVED', reqId: msg.reqId, ok: !!result?.ok });
                     return true;
                 }
                 default:
@@ -158,6 +137,7 @@
                 console.warn('[Velostream] Local storage request failed:', err);
                 if (msg.type === 'SETTINGS_GET') this.deliver({ type: 'SETTINGS', reqId: msg.reqId, settings: S.mergeSettings(undefined) });
                 else if (msg.type === 'STORE_GET' || msg.type === 'HISTORY_GET') this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: null });
+                else if (msg.type === 'HISTORY_SAVE' && msg.reqId) this.deliver({ type: 'HISTORY_SAVED', reqId: msg.reqId, ok: false });
                 return true;
             }).then(handled => {
                 if (handled) return;
@@ -199,7 +179,8 @@
     new globalThis.VelostreamPlayer(new EnginePort(), {
         layout,
         mountMode: params.get('mode') || 'inline',
-        startTime: Number.isFinite(startTime) && startTime > 1 ? startTime : null,
+        startTime: Number.isFinite(startTime) && startTime >= 0 ? startTime : null,
+        explicitStart: params.get('explicitStart') === '1',
         pageTitle: params.get('title') || ''
     });
 })();

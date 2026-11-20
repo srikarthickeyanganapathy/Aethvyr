@@ -18,7 +18,13 @@
     const MAX_COLLECTIONS = 50;
     const MAX_KEYS = 500;
     const NAME_MAX = 60;
+    const SERIES_STATUS = ['Watching', 'Completed', 'Plan to Watch', 'On Hold', 'Dropped'];
+    const SERIES_PREFIX = 'fs_series_';
+    const seriesStatuses = new Map();
+    const expandedSeries = new Set();
     const VIEWS = {
+        series: { title: 'Series', empty: 'Series appear here as you watch episodes.' },
+        movies: { title: 'Movies', empty: 'Movies appear here as you watch them.' },
         continue: { title: 'Continue watching', empty: 'Nothing in progress. Videos you stop partway through show up here so you can pick up where you left off.' },
         recent: { title: 'Recently watched', empty: 'No watch history yet. Play a video in Velostream and it appears here with its position.' },
         favorites: { title: 'Favorites', empty: 'No favorites yet. Select the star on any video to keep it here.' },
@@ -32,6 +38,7 @@
     const bookmarks = new Map(); // history key -> [{t, label}]
     let view = 'recent';
     let query = '';
+    let searchTimer = 0;
     let sort = 'recent';
     const openPanels = new Set(); // `${scope}|${key}|cols` / `${scope}|${key}|bms`
     let lastMarkup = '';
@@ -85,9 +92,16 @@
         }
     }
 
-    /** Same rule as the popup: the page the video was watched on, else the media URL, else nothing. */
-    function resumeTarget(e) {
-        return webUrl(e.page) || webUrl(e.url);
+    function timedLink(target, time, direct = false) {
+        if (!target || !Number.isFinite(time) || time < 0) return target;
+        const url = new URL(target);
+        const t = Math.round(time * 1000) / 1000;
+        if (direct) url.hash = 't=' + t;
+        else {
+            const separator = url.hash.startsWith('#/') && !url.hash.includes('?') ? '?' : url.hash ? '&' : '#';
+            url.hash += separator + 'velostream-t=' + t;
+        }
+        return url.href;
     }
 
     function cleanName(v) {
@@ -97,36 +111,6 @@
 
     function cleanTitle(v) {
         return typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, 200) : '';
-    }
-
-    function cleanKeys(arr) {
-        const out = [];
-        const seen = new Set();
-        if (!Array.isArray(arr)) return out;
-        for (const k of arr) {
-            if (typeof k !== 'string' || !k || k.length > 512 || seen.has(k)) continue;
-            seen.add(k);
-            out.push(k);
-            if (out.length >= MAX_KEYS) break;
-        }
-        return out;
-    }
-
-    /** Validate fs_library as read from storage (it may come from an older build or a hand edit). */
-    function sanitizeLibrary(raw) {
-        const src = isPlainObject(raw) ? raw : {};
-        const ids = new Set();
-        const collections = [];
-        for (const c of Array.isArray(src.collections) ? src.collections : []) {
-            if (!isPlainObject(c)) continue;
-            const id = typeof c.id === 'string' && /^[\w-]{1,40}$/.test(c.id) ? c.id : null;
-            const name = cleanName(c.name);
-            if (!id || !name || ids.has(id)) continue;
-            ids.add(id);
-            collections.push({ id, name, keys: cleanKeys(c.keys), createdAt: finite(c.createdAt) });
-            if (collections.length >= MAX_COLLECTIONS) break;
-        }
-        return { favorites: cleanKeys(src.favorites), collections };
     }
 
     function announce(text) {
@@ -157,7 +141,10 @@
         const want = keys.filter(k => !bookmarks.has(k)).map(k => BM_PREFIX + k);
         if (!want.length) return;
         const res = await api.storage.local.get(want);
-        for (const k of want) setBookmarks(k.slice(BM_PREFIX.length), res[k]);
+        for (const k of want) {
+            const key = k.slice(BM_PREFIX.length);
+            if (has(history, key) && !bookmarks.has(key)) setBookmarks(key, res[k]);
+        }
     }
 
     function setBookmarks(key, list) {
@@ -170,39 +157,30 @@
     }
 
     function setHistory(raw) {
-        history = {};
-        if (!isPlainObject(raw)) return;
-        for (const [k, e] of Object.entries(raw)) if (isPlainObject(e)) history[k] = e;
+        history = Object.create(null);
+        if (isPlainObject(raw)) for (const [k, e] of Object.entries(raw)) if (isPlainObject(e)) history[k] = e;
+        for (const k of bookmarks.keys()) if (!has(history, k)) bookmarks.delete(k);
     }
 
-    // Library writes are serialized and always applied to the freshest stored copy; keys whose
-    // history entry is gone are pruned on every write.
+    // Retry an edit if a sync merge or another window changed the library before commit.
     let writeChain = Promise.resolve();
 
-    /**
-     * mutate(lib, hist) edits `lib` in place. It may return { history } (a replacement fs_history)
-     * and/or { removeKeys } (storage keys to delete), or false to cancel the write.
-     */
+    /** Apply a local edit to the current library, or return false to cancel it. */
     function commit(mutate) {
         const run = async () => {
-            const res = await api.storage.local.get([S.HISTORY_KEY, LIBRARY_KEY]);
-            const hist = isPlainObject(res[S.HISTORY_KEY]) ? res[S.HISTORY_KEY] : {};
-            const lib = sanitizeLibrary(res[LIBRARY_KEY]);
-            const extra = mutate(lib, hist);
-            if (extra === false) return false;
-            const histAfter = (extra && extra.history) || hist;
-            const live = (k) => has(histAfter, k);
-            lib.favorites = lib.favorites.filter(live);
-            lib.collections.forEach(c => { c.keys = c.keys.filter(live); });
-            const write = { [LIBRARY_KEY]: lib };
-            if (extra && extra.history) write[S.HISTORY_KEY] = extra.history;
-            await api.storage.local.set(write);
-            if (extra && extra.removeKeys && extra.removeKeys.length) await api.storage.local.remove(extra.removeKeys);
-            library = lib;
-            setHistory(histAfter);
-            if (extra && extra.removeKeys) extra.removeKeys.forEach(k => { if (k.startsWith(BM_PREFIX)) bookmarks.delete(k.slice(BM_PREFIX.length)); });
-            render();
-            return true;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const res = await api.storage.local.get(LIBRARY_KEY);
+                const base = S.sanitizeLibrary(res[LIBRARY_KEY]);
+                const next = structuredClone(base);
+                if (mutate(next) === false) return false;
+                const result = await api.runtime.sendMessage({ action: 'LIBRARY_WRITE', base, library: next });
+                if (result?.conflict) continue;
+                if (!result?.ok) throw new Error(result?.error || 'Could not save the library.');
+                library = S.sanitizeLibrary(result.library);
+                render();
+                return true;
+            }
+            throw new Error('The library changed while saving. Try again.');
         };
         writeChain = writeChain.then(run, run);
         return writeChain.catch((err) => {
@@ -220,18 +198,21 @@
         for (const [key, e] of Object.entries(history)) {
             const t = Math.max(0, finite(e.t));
             const d = Math.max(0, finite(e.d));
-            const target = resumeTarget(e);
+            const page = webUrl(e.page);
+            const direct = webUrl(e.url);
+            const target = page || direct;
+            const meta = e.pageMeta || {};
             const host = hostOf(webUrl(e.page) || e.url) || hostOf(e.url);
             const title = cleanTitle(e.title);
-            const done = !!e.done;
+            const done = !!e.done && !(key.length <= 8 && d > 0 && d <= 20 && t / d < 0.8);
             const pct = done ? 100 : d ? Math.min(100, Math.round((t / d) * 100)) : 0;
             items.push({
-                key, t, d, done, pct, target, host,
+                key, t, d, done, pct, target, page, direct, host, meta,
                 title: title || host || 'Untitled video',
                 updatedAt: finite(e.updatedAt),
                 bms: bookmarks.get(key) || [],
                 fav: fav.has(key),
-                inProgress: t > 0 && d > 0 && t < d - 20 && !done
+                inProgress: t > 0 && d > 0 && t < d && !done
             });
         }
         return items;
@@ -239,7 +220,7 @@
 
     function matches(item, tokens) {
         if (!tokens.length) return true;
-        const hay = `${item.title} ${item.host}`.toLowerCase();
+        const hay = `${item.title} ${item.host} ${item.meta.showTitle || ''} ${item.meta.siteName || ''}`.toLowerCase();
         return tokens.every(tok => hay.includes(tok));
     }
 
@@ -272,6 +253,60 @@
         return s;
     }
 
+    function seriesGroups(items) {
+        const groups = new Map();
+        for (const item of items) {
+            if (item.meta.kind !== 'series') continue;
+            const title = item.meta.showTitle || item.title;
+            const key = SERIES_PREFIX + JSON.stringify([item.host, title.toLocaleLowerCase()]);
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(item);
+        }
+        return groups;
+    }
+
+    function websiteLink(item) {
+        if (!item.page) return '<span class="muted">Website link unavailable</span>';
+        return `<a class="website-link" href="${esc(item.page)}" target="_blank" rel="noopener noreferrer">Website Link · ${esc(item.meta.siteName || item.host || 'Website')}</a>`;
+    }
+
+    function resumeLink(item, scope = 'main') {
+        if (!item.target) return '';
+        const t = !item.done && item.t > 0 ? item.t : null;
+        const url = timedLink(item.target, t, !item.page);
+        return `<a class="btn small btn-primary vc-open" href="${esc(url)}" target="_blank" rel="noopener noreferrer" ${ctl('open', scope, item.key)}>${ICON.open}${item.page ? 'Resume' : 'Direct stream'}</a>`;
+    }
+
+    function seriesCard(key, episodes) {
+        const recent = episodes.reduce((a, b) => a.updatedAt > b.updatedAt ? a : b);
+        const poster = webUrl(recent.meta.poster) || episodes.map(e => webUrl(e.meta.poster)).find(Boolean);
+        const status = seriesStatuses.get(key) || 'Watching';
+        const unique = new Map();
+        for (const episode of [...episodes].sort((a, b) => a.updatedAt - b.updatedAt)) {
+            const id = episode.meta.episode == null ? episode.page || episode.key : `${episode.meta.season ?? 1}:${episode.meta.episode}`;
+            const watched = episode.done || unique.get(id)?.done;
+            unique.set(id, { ...episode, done: watched });
+        }
+        const episodeList = [...unique.values()].sort((a, b) => (a.meta.season ?? 1) - (b.meta.season ?? 1) ||
+            (a.meta.episode ?? Infinity) - (b.meta.episode ?? Infinity) || a.updatedAt - b.updatedAt);
+        const label = episode => episode.meta.episode == null ? episode.title :
+            `${episode.meta.season != null ? 'S' + episode.meta.season + ' · ' : ''}Ep ${episode.meta.episode}`;
+        return `<li class="card vcard">
+            ${poster ? `<img class="series-poster" src="${esc(poster)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
+            <h3 class="vc-title">${esc(recent.meta.showTitle || recent.title)}</h3>
+            <p class="meta vc-meta">${websiteLink(recent)}</p>
+            <p class="meta vc-meta">${esc(label(recent))} · ${fmtTime(recent.t)} · ${episodeList.filter(e => e.done).length}/${episodeList.length} watched</p>
+            <div class="vc-actions">${resumeLink(recent)}
+                <select aria-label="Watch status" data-series-status="${esc(key)}">${SERIES_STATUS.map(s => `<option${s === status ? ' selected' : ''}>${s}</option>`).join('')}</select>
+            </div>
+            <details data-series="${esc(key)}"${expandedSeries.has(key) ? ' open' : ''}>
+                <summary>Episodes (${episodeList.length})</summary>
+                <ol class="series-episodes">${episodeList.map(e => `<li><strong>${esc(label(e))}</strong> · ${fmtTime(e.t)}${e.done ? ' · Watched' : ''}
+                    <div class="vc-actions">${websiteLink(e)} ${resumeLink(e)}</div></li>`).join('')}</ol>
+            </details>
+        </li>`;
+    }
+
     function cardMarkup(item, scope, level, collection) {
         const n = ++uid;
         const title = item.title;
@@ -283,9 +318,7 @@
         const valueText = item.done ? 'Finished' : item.d ? `${item.pct}% watched, ${fmtTime(item.t)} of ${fmtTime(item.d)}` : `${fmtTime(item.t)} watched, length unknown`;
         const memberOf = library.collections.filter(c => c.keys.includes(item.key));
 
-        const open = item.target
-            ? `<a class="btn small btn-primary vc-open" href="${esc(item.target)}" target="_blank" rel="noopener noreferrer" ${ctl('open', scope, item.key)} aria-label="Open ${t} in a new tab" title="${esc(item.target)}">${ICON.open}Open</a>`
-            : `<button type="button" class="btn small vc-open" disabled aria-label="Open ${t}: no web page was saved for this video">${ICON.open}Open</button>`;
+        const open = resumeLink(item, scope);
 
         let colsPanel = '';
         if (colsOpen) {
@@ -301,16 +334,16 @@
             const rows = item.bms.map((b, i) => {
                 const label = esc(b.label || `Bookmark ${i + 1}`);
                 return item.target
-                    ? `<li><a class="bm-link" href="${esc(item.target)}" target="_blank" rel="noopener noreferrer" ${ctl('bm-open', scope, item.key, { i })} aria-label="${esc(fmtTime(b.t))}, ${label}: open the page in a new tab"><span class="num bm-t">${fmtTime(b.t)}</span><span class="bm-label">${label}</span></a></li>`
+                    ? `<li><a class="bm-link" href="${esc(timedLink(item.target, b.t, !item.page))}" target="_blank" rel="noopener noreferrer" ${ctl('bm-open', scope, item.key, { i })} aria-label="${esc(fmtTime(b.t))}, ${label}: open ${item.page ? 'website' : 'direct stream'} at this time"><span class="num bm-t">${fmtTime(b.t)}</span><span class="bm-label">${label}</span></a></li>`
                     : `<li><span class="bm-link is-static"><span class="num bm-t">${fmtTime(b.t)}</span><span class="bm-label">${label}</span></span></li>`;
             }).join('');
-            bmsPanel = `<div class="vc-panel" id="p${n}b"><p class="muted vc-note">Opening a bookmark opens the page; the player resumes from your saved position, then use the bookmark marks on its timeline.</p><ol class="bm-list" aria-label="Bookmarks in ${t}">${rows}</ol></div>`;
+            bmsPanel = `<div class="vc-panel" id="p${n}b"><p class="muted vc-note">Bookmarks open the website and start Velostream at the saved time.</p><ol class="bm-list" aria-label="Bookmarks in ${t}">${rows}</ol></div>`;
         }
 
         const colNote = memberOf.length ? ` · <span class="vc-cols">${esc(memberOf.map(c => c.name).join(', '))}</span>` : '';
         return `<li class="card vcard${item.fav ? ' is-fav' : ''}">
             <h${level} class="vc-title name" title="${t}">${t}</h${level}>
-            <p class="meta vc-meta"><span>${esc(item.host || 'Unknown site')}</span>${colNote}</p>
+            <p class="meta vc-meta">${websiteLink(item)}${colNote}</p>
             <p class="meta num vc-meta">${timeText} · Watched ${esc(fmtAgo(item.updatedAt))}${item.bms.length ? ` · ${plural(item.bms.length, 'bookmark')}` : ''}</p>
             <div class="vc-progress">
                 <div class="bar" role="progressbar" aria-label="Progress of ${t}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${item.pct}" aria-valuetext="${esc(valueText)}"><i style="width:${item.pct}%"></i></div>
@@ -354,7 +387,10 @@
         const items = buildItems();
         const byKey = new Map(items.map(i => [i.key, i]));
         const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+        const groups = seriesGroups(items);
         const counts = {
+            series: groups.size,
+            movies: items.filter(i => i.meta.kind === 'movie').length,
             continue: items.filter(i => i.inProgress).length,
             recent: items.length,
             favorites: items.filter(i => i.fav).length,
@@ -373,7 +409,12 @@
         let markup;
         let countText;
         $('new-collection').hidden = view !== 'collections';
-        if (view === 'collections') {
+        if (view === 'series') {
+            const groupsByRecent = [...groups].sort((a, b) => Math.max(...b[1].map(i => i.updatedAt)) - Math.max(...a[1].map(i => i.updatedAt)));
+            const shown = groupsByRecent.filter(([, episodes]) => episodes.some(i => matches(i, tokens)));
+            markup = shown.length ? `<ul class="lib-grid">${shown.map(([key, episodes]) => seriesCard(key, episodes)).join('')}</ul>` : emptyMarkup(groups.size ? 'No series match your search.' : VIEWS.series.empty, !!groups.size);
+            countText = plural(shown.length, 'series', 'series');
+        } else if (view === 'collections') {
             if (!library.collections.length) {
                 markup = emptyMarkup(VIEWS.collections.empty);
                 countText = '';
@@ -400,7 +441,7 @@
                 countText = `${plural(library.collections.length, 'collection')}${tokens.length ? ` · ${plural(shown, 'match', 'matches')}` : ''}`;
             }
         } else {
-            const base = items.filter(i => view === 'continue' ? i.inProgress : view === 'favorites' ? i.fav : view === 'bookmarked' ? i.bms.length > 0 : true);
+            const base = items.filter(i => view === 'continue' ? i.inProgress : view === 'favorites' ? i.fav : view === 'bookmarked' ? i.bms.length > 0 : view === 'movies' ? i.meta.kind === 'movie' : true);
             const list = sortItems(base.filter(i => matches(i, tokens)));
             if (!base.length) markup = emptyMarkup(VIEWS[view].empty);
             else if (!list.length) markup = emptyMarkup(`No videos here match “${query.trim()}”.`, true);
@@ -585,13 +626,11 @@
         // A live update may have re-rendered the list while the dialog was open.
         const live = (desc && $('view').querySelector(selectorFor(desc))) || el;
         const next = live.isConnected ? neighbourDescriptor(live, 'remove') : null;
-        const ok = await commit((lib, hist) => {
-            if (!has(hist, key)) return { history: hist };
-            const copy = { ...hist };
-            delete copy[key];
-            return { history: copy, removeKeys: res.checked ? [BM_PREFIX + key] : [] };
-        });
-        if (!ok) return;
+        const result = await api.runtime.sendMessage({ action: 'HISTORY_REMOVE', key, removeBookmarks: res.checked }).catch(() => null);
+        if (!result?.ok) { showMessage(result?.error || 'Could not remove history.'); return; }
+        library = S.sanitizeLibrary(result.library);
+        setHistory(result.history);
+        render();
         openPanels.forEach(p => { if (p.split('|')[1] === key) openPanels.delete(p); });
         if (!next || !restoreFocus(next)) $('main').focus();
         announce(`Removed ${title} from history${res.checked ? ' with its bookmarks' : ''}`);
@@ -663,6 +702,7 @@
                 break;
             }
             case 'clear-search':
+                clearTimeout(searchTimer);
                 $('search').value = '';
                 query = '';
                 render();
@@ -670,9 +710,22 @@
                 announce('Search cleared');
                 break;
             case 'open':
-            case 'bm-open':
-                announce('Opened in a new tab');
+            case 'bm-open': {
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) break;
+                const entry = history[key];
+                if (!webUrl(entry?.page)) break;
+                e.preventDefault();
+                const time = action === 'bm-open' ? bookmarks.get(key)?.[Number(el.dataset.i)]?.t : entry.done ? null : entry.t;
+                const result = await api.runtime.sendMessage({
+                    action: 'LIBRARY_RESUME',
+                    page: webUrl(entry.page),
+                    streamUrl: webUrl(entry.url),
+                    time
+                }).catch(() => null);
+                if (result?.ok) announce('Opened in a new tab');
+                else showMessage(result?.error || 'Could not open this video.');
                 break;
+            }
             default:
                 break;
         }
@@ -680,6 +733,10 @@
 
     function onViewChange(e) {
         const el = e.target;
+        if (el.dataset.seriesStatus && SERIES_STATUS.includes(el.value)) {
+            api.storage.local.set({ [el.dataset.seriesStatus]: el.value }).catch(() => showMessage('Could not save watch status.'));
+            return;
+        }
         if (!el.dataset || el.dataset.action !== 'toggle-col') return;
         setMembership(el.dataset.col, el.dataset.key, el.checked);
     }
@@ -698,6 +755,7 @@
     }
 
     function applyTheme() {
+        $('sync-footer').textContent = settings.syncEnabled ? 'Eligible library data syncs through your browser account. Series status stays on this device.' : 'Your library is stored on this device.';
         const app = $('app');
         const accent = S.ACCENTS[settings.theme] || S.ACCENTS.blue;
         app.dataset.accent = settings.theme;
@@ -714,10 +772,6 @@
         btn.disabled = true;
         try {
             const backup = await S.buildBackup(api);
-            // fs_library is not part of the shared backup format yet; it rides along so a future
-            // restore can pick it up (sanitizeBackup ignores unknown fields today).
-            const raw = await api.storage.local.get(LIBRARY_KEY);
-            backup.library = sanitizeLibrary(raw[LIBRARY_KEY]);
             const json = JSON.stringify(backup, null, 2);
             // Chromium: a data: URL; Firefox's downloads API refuses data: URLs, so it gets a blob:
             // URL (revoked once the download finishes).
@@ -749,11 +803,12 @@
     document.addEventListener('DOMContentLoaded', async () => {
         try { $('version').textContent = `Velostream v${api.runtime.getManifest().version}`; } catch (_) { /* no manifest */ }
 
-        const res = await api.storage.local.get([S.HISTORY_KEY, LIBRARY_KEY, S.SETTINGS_KEY]);
+        const res = await api.storage.local.get(null);
+        for (const [k, v] of Object.entries(res)) if (k.startsWith(SERIES_PREFIX) && SERIES_STATUS.includes(v)) seriesStatuses.set(k, v);
         settings = S.mergeSettings(res[S.SETTINGS_KEY]);
         applyTheme();
         setHistory(res[S.HISTORY_KEY]);
-        library = sanitizeLibrary(res[LIBRARY_KEY]);
+        library = S.sanitizeLibrary(res[LIBRARY_KEY]);
         try { await loadBookmarks(Object.keys(history)); } catch (_) { /* render without bookmarks */ }
 
         const hash = location.hash.slice(1);
@@ -763,8 +818,13 @@
         window.addEventListener('hashchange', () => setView(location.hash.slice(1), true));
         $('view').addEventListener('click', onViewClick);
         $('view').addEventListener('change', onViewChange);
+        $('view').addEventListener('toggle', e => {
+            const key = e.target.dataset.series;
+            if (key && e.target.isConnected) {
+                if (e.target.open) expandedSeries.add(key); else expandedSeries.delete(key);
+            }
+        }, true);
 
-        let searchTimer = 0;
         $('search').addEventListener('input', () => {
             clearTimeout(searchTimer);
             searchTimer = setTimeout(() => {
@@ -809,9 +869,13 @@
                 settings = S.mergeSettings(changes[S.SETTINGS_KEY].newValue);
                 applyTheme();
             }
-            if (changes[LIBRARY_KEY]) { library = sanitizeLibrary(changes[LIBRARY_KEY].newValue); dirty = true; }
+            if (changes[LIBRARY_KEY]) { library = S.sanitizeLibrary(changes[LIBRARY_KEY].newValue); dirty = true; }
             for (const [k, ch] of Object.entries(changes)) {
-                if (k.startsWith(BM_PREFIX)) { setBookmarks(k.slice(BM_PREFIX.length), ch.newValue); dirty = true; }
+                if (k.startsWith(BM_PREFIX) && has(history, k.slice(BM_PREFIX.length))) { setBookmarks(k.slice(BM_PREFIX.length), ch.newValue); dirty = true; }
+                if (k.startsWith(SERIES_PREFIX)) {
+                    if (SERIES_STATUS.includes(ch.newValue)) seriesStatuses.set(k, ch.newValue); else seriesStatuses.delete(k);
+                    dirty = true;
+                }
             }
             if (changes[S.HISTORY_KEY]) {
                 setHistory(changes[S.HISTORY_KEY].newValue);

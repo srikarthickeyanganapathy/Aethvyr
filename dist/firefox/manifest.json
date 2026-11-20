@@ -7,7 +7,6 @@
   "permissions": [
     "downloads",
     "declarativeNetRequest",
-    "declarativeNetRequestWithHostAccess",
     "webRequest",
     "storage",
     "unlimitedStorage",
