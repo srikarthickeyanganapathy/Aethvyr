@@ -178,13 +178,14 @@
         }
         renderStreams(res.streams || []);
         // Explain why nothing is playable on DRM / proprietary-protocol sites (YouTube, Netflix…).
-        const empty = $('empty-state');
+        const empty = $('empty-copy');
         if (!(res.streams || []).length) {
-            empty.textContent = res.drm
+            const copy = res.drm
                 ? `This site uses DRM (${(res.drm.keySystem || 'encrypted media').replace(/^com\./, '')}). Protected video can only be decrypted by the site's own player.`
                 : res.proprietaryMse
                     ? 'This site streams with its own protocol (no HLS/DASH link on the network), so only its own player can drive it. Try a site that serves .m3u8, .mpd or MP4.'
                     : 'Looking for videos… Start the video on the page if nothing appears.';
+            if (empty.textContent !== copy) empty.textContent = copy;
         }
     }
 
@@ -511,6 +512,7 @@
         checkPermissions();
         renderHistory();
 
+        $('empty-rescan').addEventListener('click', () => $('rescan-btn').click());
         $('settings-form').addEventListener('change', (e) => { if (e.target.name) saveField(e.target); });
         document.querySelectorAll('.swatch').forEach((b, i, all) => {
             b.addEventListener('click', () => saveSettings(next => { next.theme = b.dataset.accent; }, `${b.getAttribute('aria-label')} accent`));
@@ -527,7 +529,18 @@
         // focus (always on Firefox), so: export saves straight to Downloads without a dialog, and
         // import continues in this same page opened as a tab.
         const inTab = new URLSearchParams(location.search).has('tab');
-        if (inTab && location.hash === '#settings') { $('settings').open = true; $('backup-import').focus(); }
+        const panelButtons = [...document.querySelectorAll('[data-panel]')];
+        function showPanel(id) {
+            for (const button of panelButtons) {
+                const active = button.dataset.panel === id;
+                button.setAttribute('aria-pressed', String(active));
+                $(button.dataset.panel).hidden = !active;
+            }
+            document.querySelector('.popup-main').scrollTop = 0;
+        }
+        for (const button of panelButtons) button.addEventListener('click', () => showPanel(button.dataset.panel));
+        document.querySelector('.skip-link').addEventListener('click', () => showPanel('streams-panel'));
+        if (inTab && location.hash === '#settings') { showPanel('settings-panel'); $('backup-import').focus(); }
         $('backup-export').addEventListener('click', async () => {
             try {
                 const json = JSON.stringify(await S.buildBackup(api), null, 2);
@@ -629,7 +642,8 @@
             input.focus();
         });
         $('history-clear').addEventListener('click', async () => {
-            await api.storage.local.remove(S.HISTORY_KEY);
+            const res = await send({ action: 'HISTORY_CLEAR' });
+            if (!res?.ok) { showMessage(res?.error || 'Could not clear history.'); return; }
             lastHistorySig = '';
             renderHistory();
             announce('History cleared');

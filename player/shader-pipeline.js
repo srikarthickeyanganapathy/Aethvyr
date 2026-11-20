@@ -375,6 +375,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             // that dead context: report it plainly instead of a misleading "Shader compile failed".
             if (gl.isContextLost()) { this.fail('GPU context lost'); return false; }
             this.gl = gl;
+            this.textureLimit = 0;
             this.canvas.addEventListener('webglcontextlost', this.onContextLost);
             this.canvas.addEventListener('webglcontextrestored', this.onContextRestored);
             try {
@@ -562,11 +563,11 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             const dpr = Math.min(3, window.devicePixelRatio || 1);
             let w = Math.max(2, Math.round(this.contentRect.w * dpr));
             let h = Math.max(2, Math.round(this.contentRect.h * dpr));
-            const cap = this.maxRenderRes;
-            if (h > cap) { w = Math.round(w * cap / h); h = cap; }
-            // Never render below the source: sharpening at a lower resolution wastes detail.
-            const vh = this.video.videoHeight;
-            if (vh && h < vh && this.preset === 'cas') { w = Math.round(w * vh / h); h = vh; }
+            const sourceHeight = this.preset === 'cas' ? this.video.videoHeight : 0;
+            const textureLimit = this.textureLimit || (this.textureLimit = this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
+            const targetHeight = Math.min(Math.max(h, sourceHeight), this.maxRenderRes, textureLimit, textureLimit * h / w);
+            w = Math.max(2, Math.round(w * targetHeight / h));
+            h = Math.max(2, Math.round(targetHeight));
             if (this.canvas.width !== w || this.canvas.height !== h) {
                 this.canvas.width = w;
                 this.canvas.height = h;

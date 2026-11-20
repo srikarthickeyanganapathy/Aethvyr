@@ -815,6 +815,11 @@
         const initial = VIEWS[hash] ? hash : (buildItems().some(i => i.inProgress) ? 'continue' : 'recent');
         setView(initial, false);
 
+        $('library-filters').addEventListener('click', () => {
+            const button = $('library-filters');
+            const expanded = button.getAttribute('aria-expanded') === 'true';
+            button.setAttribute('aria-expanded', String(!expanded));
+        });
         window.addEventListener('hashchange', () => setView(location.hash.slice(1), true));
         $('view').addEventListener('click', onViewClick);
         $('view').addEventListener('change', onViewChange);

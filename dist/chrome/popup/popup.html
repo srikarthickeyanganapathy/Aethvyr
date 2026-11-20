@@ -5,17 +5,26 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Velostream</title>
+    <link rel="stylesheet" href="../common/tokens.css">
     <link rel="stylesheet" href="css/style.css">
 </head>
 
-<body>
+<body class="popup-page">
     <a class="skip-link" href="#streams">Skip to detected streams</a>
     <div id="app" data-accent="blue">
         <header class="app-header">
             <img class="app-icon" src="../icons/icon-48.png" alt="" width="28" height="28">
             <h1>Velostream</h1>
             <span id="status-pill" class="status-pill" role="status"><span class="dot" aria-hidden="true"></span><span id="status-text">Ready</span></span>
+            <a class="icon-btn header-library" href="library.html" target="_blank" rel="noopener noreferrer" aria-label="Open library" title="Open library"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h6l2 2h8v12H4z"/></svg></a>
         </header>
+        <nav class="popup-nav" aria-label="Extension views">
+            <button type="button" data-panel="streams-panel" aria-controls="streams-panel" aria-pressed="true">Streams</button>
+            <button type="button" data-panel="activity-panel" aria-controls="activity-panel" aria-pressed="false">Activity</button>
+            <button type="button" data-panel="settings-panel" aria-controls="settings-panel" aria-pressed="false">Settings</button>
+        </nav>
+        <main class="popup-main">
+        <div id="streams-panel" class="popup-panel">
 
         <div id="announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
         <p id="message" class="message" role="alert" hidden></p>
@@ -67,7 +76,7 @@
                 </div>
             </div>
             <ul id="stream-list" class="stream-list" aria-labelledby="streams-title"></ul>
-            <p id="empty-state" class="empty muted">Looking for videos… Start the video on the page if nothing appears.</p>
+            <div id="empty-state" class="empty muted"><p id="empty-copy">Looking for videos…</p><button id="empty-rescan" class="btn btn-quiet small" type="button">Rescan tab</button></div>
         </section>
 
         <section id="site-card" class="card site" hidden aria-labelledby="site-title">
@@ -88,7 +97,9 @@
             </button>
         </form>
 
-        <details id="history" class="card fold">
+        </div>
+        <div id="activity-panel" class="popup-panel" hidden>
+        <details id="history" class="card fold" open>
             <summary><span class="section-title">Continue watching</span><span id="history-count" class="count num">0</span></summary>
             <ul id="history-list" class="history-list"></ul>
             <p id="history-empty" class="muted">Videos you watch in Velostream appear here with their position.</p>
@@ -98,7 +109,9 @@
             </div>
         </details>
 
-        <details id="settings" class="card fold">
+        </div>
+        <div id="settings-panel" class="popup-panel" hidden>
+        <details id="settings" class="card fold" open>
             <summary><span class="section-title">Settings</span></summary>
             <form id="settings-form" novalidate>
                 <fieldset>
@@ -267,7 +280,9 @@
                 <button type="button" id="reset-settings" class="btn btn-quiet small">Reset all settings</button>
             </form>
         </details>
-        <footer class="foot muted"><span id="version" class="num">v2.0</span></footer>
+        </div>
+        </main>
+        <footer class="foot muted"><span id="version" class="num"></span></footer>
     </div>
     <script src="../common/shared.js"></script>
     <script src="js/popup.js"></script>

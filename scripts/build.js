@@ -49,7 +49,7 @@ function readShaka() {
 }
 
 function verifyManifestFiles(manifest, targetDir) {
-    const files = new Set();
+    const files = new Set(['popup/library.html']);
     const addIcons = obj => obj && Object.values(obj).forEach(p => files.add(p));
     addIcons(manifest.icons);
     addIcons(manifest.action && manifest.action.default_icon);
@@ -61,7 +61,13 @@ function verifyManifestFiles(manifest, targetDir) {
     ((manifest.web_accessible_resources || [])).forEach(w => w.resources.forEach(f => files.add(f)));
     for (const file of files) {
         const absolute = path.join(targetDir, file);
-        if (!file.endsWith('.js') || !fs.existsSync(absolute)) continue;
+        if (!fs.existsSync(absolute)) continue;
+        if (file.endsWith('.html')) {
+            for (const [, asset] of fs.readFileSync(absolute, 'utf8').matchAll(/<(?:link|script)\b[^>]*\b(?:href|src)="([^"#:]+)"/g)) {
+                files.add(path.posix.normalize(path.posix.join(path.posix.dirname(file), asset)));
+            }
+        }
+        if (!file.endsWith('.js')) continue;
         const source = fs.readFileSync(absolute, 'utf8');
         const imports = source.matchAll(/(?:^\s*import\s+(?:[^'";\n]+\s+from\s+)?|\bimport\(\s*)['"](\.{1,2}\/[^'"]+)['"]/gm);
         for (const [, dependency] of imports) files.add(path.posix.normalize(path.posix.join(path.posix.dirname(file), dependency)));

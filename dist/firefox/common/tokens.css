@@ -1,0 +1,36 @@
+:root {
+    --bg-base: #101012;
+    --bg-elevated: #242427;
+    --glass-surface: rgba(30, 30, 33, .92);
+    --glass-border: rgba(255, 255, 255, .14);
+    --glass-blur: blur(24px) saturate(180%);
+    --text-primary: #f7f7fa;
+    --text-secondary: #c7c7d0;
+    --text-tertiary: #aaaab5;
+    --control-fill: #ffffff18;
+    --control-hover: #ffffff29;
+    --accent-default: #6ba7ff;
+    --accent-active: #205cb9;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 20px;
+    --space-6: 24px;
+    --space-7: 28px;
+    --space-8: 32px;
+    --radius-control: 10px;
+    --radius-panel: 16px;
+    --radius-pill: 999px;
+    --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+    --z-canvas: 0;
+    --z-overlay: 2;
+    --z-dock: 5;
+    --z-popover: 11;
+    --z-drawer: 12;
+    --z-toast: 14;
+    --z-modal: 16;
+    color-scheme: dark;
+}
+
+.num { font-variant-numeric: tabular-nums; }

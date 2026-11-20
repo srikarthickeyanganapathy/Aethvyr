@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Velostream Library</title>
+    <link rel="stylesheet" href="../common/tokens.css">
     <link rel="stylesheet" href="css/style.css">
     <link rel="stylesheet" href="css/library.css">
 </head>
@@ -28,7 +29,8 @@
 
         <div class="lib-layout">
             <nav class="lib-nav" aria-label="Library sections">
-                <ul class="lib-tabs">
+                <button id="library-filters" class="btn btn-quiet small" type="button" aria-expanded="true" aria-controls="library-tabs">Filters</button>
+                <ul id="library-tabs" class="lib-tabs">
                     <li><a href="#continue" data-view="continue"><span>Continue watching</span><span class="count num" data-count="continue">0</span></a></li>
                     <li><a href="#recent" data-view="recent"><span>Recently watched</span><span class="count num" data-count="recent">0</span></a></li>
                     <li><a href="#series" data-view="series"><span>Series</span><span class="count num" data-count="series">0</span></a></li>

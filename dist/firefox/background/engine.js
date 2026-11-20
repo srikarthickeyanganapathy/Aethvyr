@@ -2211,6 +2211,12 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'LIBRARY_WRITE':
             if (!sender.url?.startsWith(api.runtime.getURL('popup/library.html'))) return false;
             return respondAsync(commitLibrary(message), sendResponse);
+        case 'HISTORY_CLEAR':
+            if (!sender.url?.startsWith(api.runtime.getURL('popup/popup.html'))) return false;
+            return respondAsync(writeStorage(async () => {
+                await api.storage.local.remove(S.HISTORY_KEY);
+                return { ok: true };
+            }), sendResponse);
         case 'HISTORY_REMOVE':
             if (!sender.url?.startsWith(api.runtime.getURL(''))) return false;
             return respondAsync(writeStorage(async () => {

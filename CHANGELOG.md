@@ -5,6 +5,11 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.4.1] - 2026-11-20
+
+- Fixed horizontal overflow and aligned the player controls, popup, and library with shared design tokens.
+- Stabilized popover and seek-tooltip placement across player sizes.
+
 ## [2.4.0] - 2026-11-16
 
 ### Added

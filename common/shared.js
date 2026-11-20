@@ -55,7 +55,7 @@
             skin: 'glass',           // glass | cinema | theater | pill | compact
             density: 'standard',     // minimal | standard | pro (pro adds frame step, A-B loop, snapshot, EQ, GPU)
             scrubber: 'classic',     // classic | chapters (gaps at chapter starts) | heatmap (loudness + buffer strip)
-            scrubHeight: 6,          // seek bar thickness, px (4-10)
+            scrubHeight: 3,          // seek bar thickness, px (3-10)
             scrim: -1,               // control background darkness %, 0-95; -1 = the skin's own
             hidden: [],              // ids from LOOK_BUTTONS the user hid
             order: [],               // ids of the right-hand buttons in the user's order (missing ids keep default order)
@@ -238,7 +238,7 @@
         if (!LOOK_SKINS.includes(lk.skin)) lk.skin = 'glass';
         if (!['minimal', 'standard', 'pro'].includes(lk.density)) lk.density = 'standard';
         if (!['classic', 'chapters', 'heatmap'].includes(lk.scrubber)) lk.scrubber = 'classic';
-        lk.scrubHeight = Math.round(Math.min(10, Math.max(4, lk.scrubHeight)));
+        lk.scrubHeight = Math.round(Math.min(10, Math.max(3, lk.scrubHeight)));
         lk.scrim = lk.scrim < 0 ? -1 : Math.round(Math.min(95, lk.scrim));
         lk.hidden = [...new Set(lk.hidden.filter(id => LOOK_BUTTONS.includes(id)))];
         lk.order = [...new Set(lk.order.filter(id => LOOK_ORDERABLE.includes(id)))];
