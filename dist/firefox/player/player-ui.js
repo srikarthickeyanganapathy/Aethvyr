@@ -6461,7 +6461,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
 
         function save() {
             if (!active || !Number.isFinite(video.currentTime) || video.readyState < 1) return;
-            active.time = video.currentTime;
+            active.time = video.ended ? 0 : video.currentTime;
             if (active.id) store.save({ id: active.id, name: active.file.name, handle: active.handle, time: active.time }).catch(() => {});
         }
         function release() {
@@ -6475,8 +6475,10 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         }
         async function addSubtitles(files, token) {
             for (const { file } of files) {
+                if (file.size > 5 * 1024 * 1024) continue;
                 const cues = parseSubtitleFile(await file.text());
                 if (token !== revision) return;
+                if (!cues.length) continue;
                 const element = document.createElement('track');
                 element.kind = 'subtitles';
                 element.label = file.name;
@@ -6512,8 +6514,8 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         }
         function showError(error) { status.textContent = error.message || String(error); }
         let selection = 0;
-        async function accept(entries) {
-            const current = ++selection;
+        async function accept(entries, current) {
+            if (current !== selection) return;
             const videos = entries.filter(({ file }) => file.type.startsWith('video/') || media.test(file.name));
             const subs = entries.filter(({ file }) => subtitle.test(file.name));
             if (!videos.length) {
@@ -6546,14 +6548,15 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             play(0);
         }
         input.onchange = () => {
-            accept([...input.files].map(file => ({ file }))).catch(showError);
+            accept([...input.files].map(file => ({ file })), ++selection).catch(showError);
             input.value = '';
         };
         root.querySelector('[data-open]').onclick = async () => {
+            const current = ++selection;
             if (!window.showOpenFilePicker) { input.click(); return; }
             try {
                 const handles = await window.showOpenFilePicker({ multiple: true });
-                await accept(await Promise.all(handles.map(async handle => ({ handle, file: await handle.getFile() }))));
+                await accept(await Promise.all(handles.map(async handle => ({ handle, file: await handle.getFile() }))), current);
             } catch (error) {
                 if (error.name === 'SecurityError') input.click();
                 else if (error.name !== 'AbortError') showError(error);
@@ -6565,12 +6568,13 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         folder.multiple = true;
         folder.hidden = true;
         root.append(folder);
-        folder.onchange = () => { accept([...folder.files].map(file => ({ file }))).catch(showError); folder.value = ''; };
+        folder.onchange = () => { accept([...folder.files].map(file => ({ file })), ++selection).catch(showError); folder.value = ''; };
         root.querySelector('[data-folder]').onclick = async () => {
+            const current = ++selection;
             if (!window.showDirectoryPicker) { folder.click(); return; }
             try {
                 const directory = await window.showDirectoryPicker();
-                await accept(await localFilesFromHandle(directory));
+                await accept(await localFilesFromHandle(directory), current);
             } catch (error) {
                 if (error.name === 'SecurityError') folder.click();
                 else if (error.name !== 'AbortError') showError(error);
@@ -6596,11 +6600,14 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             if (!event.dataTransfer.types.includes('Files')) return;
             event.preventDefault();
             root.classList.remove('is-dropping');
-            filesFromDrop(event.dataTransfer).then(accept).catch(showError);
+            const current = ++selection;
+            filesFromDrop(event.dataTransfer).then(entries => accept(entries, current)).catch(error => {
+                if (current === selection) showError(error);
+            });
         });
         window.addEventListener('pagehide', event => {
             save();
-            if (!event.persisted) { revision++; release(); clearInterval(audioTimer); audio.destroy(); }
+            if (!event.persisted) { selection++; revision++; release(); clearInterval(audioTimer); audio.destroy(); }
         });
         if (resumeId) {
             const savedEntry = store.get(resumeId).catch(() => null);
@@ -6609,13 +6616,14 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             resume.textContent = 'Resume Local File';
             root.querySelector('header').prepend(resume);
             resume.onclick = async () => {
+                const current = ++selection;
                 try {
                     const entry = await savedEntry;
                     if (!entry) throw new Error('This local file is no longer in the library.');
                     if (await entry.handle.requestPermission({ mode: 'read' }) !== 'granted') {
                         throw new Error('Read access is required to resume the file.');
                     }
-                    await accept([{ ...entry, file: await entry.handle.getFile() }]);
+                    await accept([{ ...entry, file: await entry.handle.getFile() }], current);
                     resume.remove();
                 } catch (error) { showError(error); }
             };

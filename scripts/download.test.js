@@ -86,3 +86,31 @@ test('HLS implicit byte ranges only continue the immediately preceding resource'
     assert.equal(parseMedia(continuations + next, base).segments[1].range, 'bytes=22-26');
     assert.throws(() => parseMedia(continuations + '#EXTINF:4,\nother.mp4\n' + next, base), /Invalid HLS media byte range/);
 });
+
+test('an export joins an in-flight prefetch for the same segment', async () => {
+    const segment = { uri: 'https://example.test/segment.m4s' };
+    const downloader = new SegmentDownloader({
+        buffer: { getSegment: async () => null },
+        transport: () => assert.fail('started a duplicate network request')
+    });
+    const data = bytes(3, 4);
+    downloader.inflight.set(segmentKey(segment.uri), {
+        prefetch: true, promise: Promise.resolve({ status: 200, headers: {}, data })
+    });
+    assert.deepEqual(await downloader.fetchForExport(segment, signal), data);
+});
+
+test('pausing an export stops waiting without aborting playback prefetch', async () => {
+    const controller = new AbortController();
+    const downloader = new SegmentDownloader({ buffer: { getSegment: async () => null } });
+    const url = 'https://example.test/pending.m4s';
+    let finish;
+    const prefetch = new Promise(resolve => { finish = resolve; });
+    downloader.inflight.set(segmentKey(url), { prefetch: true, promise: prefetch });
+    const result = downloader.fetchForExport({ uri: url }, controller.signal);
+    await new Promise(resolve => setImmediate(resolve));
+    controller.abort();
+    await assert.rejects(result, { name: 'AbortError' });
+    finish({ data: bytes(5) });
+    assert.deepEqual((await prefetch).data, bytes(5));
+});

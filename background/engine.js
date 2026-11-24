@@ -1660,7 +1660,6 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
 }
 
 async function exportProgressive(session, post, signal, name, checkpointId) {
-    const transport = session.downloader.transport;
     const url = session.stream.url;
     const CHUNK = 4 * 1024 * 1024;
     let ext = 'mp4';
@@ -1675,7 +1674,7 @@ async function exportProgressive(session, post, signal, name, checkpointId) {
         const chunk = await checkpoint(downloadStore, checkpointId, `byte:${offset}`, signal, async () => {
             const headers = { Range: `bytes=${offset}-${offset + CHUNK - 1}` };
             if (validator) headers['If-Range'] = validator;
-            const res = await transport(url, { method: 'GET', headers, signal });
+            const res = await session.downloader.fetchProgressiveRange(url, headers, signal);
             const reportedTotal = validateExportRange(res, offset, CHUNK, total);
             const etag = res.headers.etag;
             const identity = etag && !etag.startsWith('W/') ? etag : res.headers['last-modified'];

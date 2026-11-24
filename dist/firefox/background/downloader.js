@@ -1231,6 +1231,26 @@ export class SegmentDownloader {
         return res.data;
     }
 
+    fetchProgressiveRange(url, headers, signal) {
+        return this._fetchWithRetry(url, { method: 'GET', headers }, signal, false);
+    }
+
+    async exportPrefetch(key, signal) {
+        const request = this.inflight.get(key);
+        if (!request?.prefetch) return null;
+        signal.throwIfAborted();
+        let abort;
+        const aborted = new Promise((_, reject) => {
+            abort = () => reject(signal.reason);
+            signal.addEventListener('abort', abort, { once: true });
+        });
+        try {
+            return await Promise.race([request.promise.catch(() => null), aborted]);
+        } finally {
+            signal.removeEventListener('abort', abort);
+        }
+    }
+
     async fetchForExport(seg, signal, opts = {}) {
         const key = segmentKey(seg.uri, seg.range);
         const encrypted = isEncryptedSegment(seg);
@@ -1240,7 +1260,10 @@ export class SegmentDownloader {
         if (!cached && opts.cacheOnly) throw new Error("Part of this clip is no longer cached. Play through the range and try again.");
         let data = cached?.data;
         if (!data) {
-            const response = await this._fetchWithRetry(seg.uri, { method: 'GET', headers: seg.range ? { Range: seg.range } : {} }, signal, false, true);
+            const prefetched = await this.exportPrefetch(key, signal);
+            const response = prefetched || await this._fetchWithRetry(seg.uri, {
+                method: 'GET', headers: seg.range ? { Range: seg.range } : {}
+            }, signal, false, true);
             const range = /^bytes=(\d+)-(\d+)$/.exec(seg.range || '');
             if (range && !matchesRange(response, +range[1], +range[2])) {
                 throw new Error(`The source returned the wrong segment byte range (${seg.range}).`);
