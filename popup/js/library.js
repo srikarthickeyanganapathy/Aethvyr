@@ -980,6 +980,27 @@
         });
         window.addEventListener('hashchange', () => setView(location.hash.slice(1), true));
         window.addEventListener('focus', reloadDeviceItems);
+        $('view').addEventListener('click', event => {
+            const link = event.target.closest('a[href*="mode=local"]');
+            if (!link || view !== 'local' || event.ctrlKey || event.metaKey || event.shiftKey) return;
+            event.preventDefault();
+            const overlay = $('local-overlay');
+            const frame = overlay.querySelector('iframe');
+            const url = new URL(link.href);
+            url.searchParams.set('session', crypto.randomUUID());
+            frame.src = url.href;
+            overlay.showModal();
+            const onMessage = message => {
+                if (message.source === frame.contentWindow && message.data?.__velostream === 'layout' &&
+                    message.data.session === url.searchParams.get('session') && message.data.cmd === 'close') overlay.close();
+            };
+            window.addEventListener('message', onMessage);
+            overlay.addEventListener('close', () => {
+                window.removeEventListener('message', onMessage);
+                frame.removeAttribute('src');
+                if (link.isConnected) link.focus();
+            }, { once: true });
+        });
         $('view').addEventListener('click', removeDeviceItem);
         $('view').addEventListener('click', onViewClick);
         $('view').addEventListener('change', onViewChange);

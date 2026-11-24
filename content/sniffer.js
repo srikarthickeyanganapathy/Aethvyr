@@ -955,6 +955,40 @@
         return { ok: true, mode: video ? 'inline' : 'page' };
     }
 
+    function mountLocalOverlay(files) {
+        const sessionId = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('');
+        const url = api.runtime.getURL(`player/player.html?local=1&session=${sessionId}`);
+        const result = mountPlayer({ sessionId, url, forcePage: true });
+        if (result.ok && files?.length) {
+            const frame = mount.frame;
+            frame.addEventListener('load', () => {
+                if (mount.frame !== frame) return;
+                const target = new URL(url);
+                frame.contentWindow.postMessage({ type: 'VELOSTREAM_LOCAL_FILES', files }, target.protocol + '//' + target.host);
+            }, { once: true });
+        }
+        return result;
+    }
+
+    if (IS_TOP) {
+        const videoFile = file => file.type.startsWith('video/') || /\.(mp4|m4v|mkv|webm|mov|ogv|avi|mpg|mpeg|ts|m2ts)$/i.test(file.name);
+        const uploadTarget = event => event.target.closest?.('input, textarea, [contenteditable], [dropzone]');
+        window.addEventListener('dragover', event => {
+            if (event.isTrusted && !uploadTarget(event) &&
+                Array.from(event.dataTransfer?.items || []).some(item => item.kind === 'file' && item.type.startsWith('video/'))) {
+                event.preventDefault();
+            }
+        }, true);
+        window.addEventListener('drop', event => {
+            if (!event.isTrusted || uploadTarget(event) || event.defaultPrevented) return;
+            const files = Array.from(event.dataTransfer?.files || []);
+            if (!files.some(videoFile)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            mountLocalOverlay(files);
+        }, true);
+    }
+
     // ------------------------------------------------------------------
     // 6. On-page "Play in Velostream" glass pill
     //    The top frame anchors the badge to its largest video, or the viewport corner for embeds.
@@ -1191,6 +1225,9 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
             case 'RESCAN':
                 resetDetection(true);
                 sendResponse({ ok: true });
+                return false;
+            case 'MOUNT_LOCAL_PLAYER':
+                if (IS_TOP) sendResponse(mountLocalOverlay());
                 return false;
             case 'MOUNT_PLAYER':
                 sendResponse(mountPlayer(message));

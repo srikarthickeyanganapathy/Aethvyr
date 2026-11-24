@@ -22,7 +22,7 @@
     const streamId = params.get('stream');
 
     class EnginePort {
-        constructor() {
+        constructor(local = false) {
             this.onmessage = null;
             this.port = null;
             this.closed = false;
@@ -34,7 +34,7 @@
                 }
             };
             api.storage.onChanged.addListener(this.storageListener);
-            this.connect(false);
+            if (!local) this.connect(false);
         }
 
         deliver(msg) {
@@ -175,8 +175,11 @@
         if (window.top === window) globalThis.VelostreamVaultExport(params.get('id'));
         return;
     }
-    if (params.get('mode') === 'local') {
-        if (window.top === window) globalThis.VelostreamLocalPlayer(params.get("file"));
+    if (params.get('local') === '1' || params.get('mode') === 'local') {
+        // eslint-disable-next-line no-new
+        new globalThis.VelostreamPlayer(new EnginePort(true), {
+            local: true, fileId: params.get('file'), layout, mountMode: 'page'
+        });
         return;
     }
 

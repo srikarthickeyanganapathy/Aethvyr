@@ -1096,7 +1096,14 @@
             this.port = new PortClient(rawPort, msg => this.onMessage(msg));
             this.buildDom();
             this.bindUi();
-            this.start().catch(err => this.showError('Could not start the player', String((err && err.message) || err)));
+            this.localPlayback = !!host.local;
+            if (host.local) {
+                this.resolveInit({ stream: { id: 'local', type: 'progressive', title: 'Open Local File', url: '' } });
+                this.resolveInit = null;
+            }
+            this.ready = this.start();
+            this.ready.catch(err => this.showError('Could not start the player', String((err && err.message) || err)));
+            bindLocalFiles(this, host.fileId, !!host.local);
         }
 
         // -----------------------------------------------------------------
@@ -1126,6 +1133,12 @@
             this.$('.domain').textContent = domain;
             this.root.setAttribute('aria-label', `Velostream player: ${title}`);
             this.applySettings();
+            if (this.hostApi.local) {
+                this.setStatus('paused');
+                this.showControls(true);
+                this.updateDownloadButton();
+                return;
+            }
             await this.loadBookmarks();
             // Continue from where the site's own player was (handed over by the content script).
             this.setCaptured(init.subtitles);
@@ -1424,10 +1437,10 @@
                 this.audio.corsOk = false;
                 this.nativeMetaOk = false;
                 this.nativeStart = startTime || 0;
-                if (this.corsUnavailable) v.removeAttribute('crossorigin');
+                if (this.localPlayback || this.corsUnavailable) v.removeAttribute('crossorigin');
                 else v.crossOrigin = 'anonymous';
                 v.src = this.stream.url;
-                if (startTime) v.currentTime = startTime;
+                if (startTime && !this.localPlayback) v.currentTime = startTime;
             } else {
                 this.mode = 'mse';
                 if (!shaka || !shaka.Player.isBrowserSupported()) throw new Error('This browser does not support Media Source Extensions.');
@@ -1736,6 +1749,7 @@
 
         onMessage(msg) {
             if (this.closed) return;
+            if (this.localPlayback && !['RESPONSE', 'SETTINGS_CHANGED', 'COMMAND'].includes(msg.type)) return;
             switch (msg.type) {
                 case 'RESPONSE':
                 case 'FRESH': {
@@ -2379,7 +2393,7 @@
             media('play', () => {
                 this.updatePlayButtons();
                 if (this.audio.active) this.audio.ensure();
-                if (this.sleepPausedPrefetch) { this.sleepPausedPrefetch = false; this.port.send({ type: 'PREFETCH', enabled: true }); }
+                if (this.sleepPausedPrefetch && !this.localPlayback) { this.sleepPausedPrefetch = false; this.port.send({ type: 'PREFETCH', enabled: true }); }
             });
             media('playing', () => { if (this.gpu && this.gpu.active && !this.audioOnly) this.gpu.start(); });
             media('pause', () => { if (this.gpu) { this.gpu.stop(); this.gpu.renderOnce(); } });
@@ -2402,6 +2416,10 @@
             });
             media('loadedmetadata', () => {
                 if (this.mode === 'native') {
+                    if (this.localPlayback && this.nativeStart) {
+                        v.currentTime = Math.min(this.nativeStart, v.duration);
+                        this.nativeStart = 0;
+                    }
                     this.nativeMetaOk = true;
                     // Metadata arrived through a CORS request: the element is untainted.
                     this.audio.corsOk = v.getAttribute('crossorigin') !== null;
@@ -2420,6 +2438,10 @@
             media('leavepictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'false'));
             media('error', () => {
                 if (this.mode !== 'native' || !v.error || this.closed) return;
+                if (this.localPlayback) {
+                    this.showError('Cannot play this file', 'This browser could not read the file or its codec.');
+                    return;
+                }
                 // The CORS request failed before any metadata (no Access-Control-Allow-Origin,
                 // or the server needs the cookies an anonymous CORS request does not send):
                 // reload once without crossorigin from the same position. Web Audio / WebGL
@@ -3554,6 +3576,7 @@
         }
 
         mediaKey() {
+            if (this.localPlayback) return 'local-' + hashKey(this.stream.id);
             const page = window.VelostreamShared.withoutResumeTime(this.playbackPageUrl);
             const value = JSON.stringify([page, this.stream.url.split('#')[0]]);
             let hash = 0xcbf29ce484222325n;
@@ -3643,6 +3666,7 @@
         }
 
         saveHistory(force, confirm = false) {
+            if (this.localPlayback) return this.saveLocalPosition?.();
             if (!this.stream || !this.settings || this.closed || this.changingMedia || this.isLive()) return;
             const v = this.video;
             const d = Number.isFinite(v.duration) ? v.duration : 0;
@@ -3979,6 +4003,7 @@
 
         /** Top-right download button: export VOD, start/stop live recording, or cancel. */
         onDownloadButton() {
+            if (this.localPlayback) { this.openLocalPicker(); return; }
             // A save picker is open (or being opened): ignore repeat presses / remote commands.
             if (this.pickingSink) return;
             if (this.exportState && this.exportState.running) {
@@ -4143,6 +4168,7 @@
 
         /** @param {{clip?: {start:number,end:number}}} [opts] save only the A–B range (HLS / DASH). */
         async startExport(opts = {}) {
+            if (this.localPlayback) return;
             if (this.pickingSink || (this.exportState && this.exportState.running)) return;
             const clip = opts.clip || null;
             const hls = this.stream.type === 'hls';
@@ -4199,6 +4225,12 @@
         updateDownloadButton() {
             const b = this.$('.btn-dl');
             const ring = b.querySelector('.ring');
+            if (this.localPlayback) {
+                window.VelostreamShared.replaceWithHTML(b.firstElementChild, icon('upload', 20));
+                ring.hidden = true;
+                b.setAttribute('aria-label', 'Open Local File');
+                return;
+            }
             const st = this.exportState;
             const live = this.isLive();
             b.classList.toggle('recording', !!this.recordingSince);
@@ -4661,6 +4693,7 @@
         }
 
         sendTelemetry(withVariants) {
+            if (this.localPlayback) return;
             const v = this.video;
             const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
             if (this.player && this.mode === 'mse') {
@@ -5697,6 +5730,7 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
         }
 
         tabQuality() {
+            if (this.localPlayback) return `<div role="menu" aria-label="Local files">${this.row({ id: 'local-open', label: 'Open Local File', role: 'menuitem', lead: 'upload' })}${this.row({ id: 'local-folder', label: 'Open Folder', role: 'menuitem', lead: 'upload' })}</div>`;
             const streams = this.streamsSection();
             if (this.mode !== 'mse') return `${streams}<p class="hint">Quality selection is available for HLS and DASH streams. This is a direct media file.</p>${this.bufferSection()}`;
             return streams + this.qualitySection() + this.bufferSection();
@@ -5729,8 +5763,8 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
         }
 
         async finishStreamSwitch(msg) {
-            if (!msg.stream) return;
-            this.saveHistory(true);
+            if (!msg.stream || (this.localPlayback && !msg.local)) return;
+            if (!msg.local) this.saveHistory(true);
             this.changingMedia = true;
             this.switching = false;
             if (msg.pageUrl !== undefined) this.updatePageMeta(msg);
@@ -5776,8 +5810,8 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
                 try { await this.player.unload(); } catch (_) { /* ignore */ }
             }
             if (prevType === 'progressive') { v.removeAttribute('src'); v.removeAttribute('crossorigin'); v.load(); }
-            let domain = '';
-            try { domain = new URL(this.stream.url).hostname; } catch (_) { /* opaque */ }
+            let domain = msg.local ? 'Local file' : '';
+            if (!msg.local) try { domain = new URL(this.stream.url).hostname; } catch (_) { /* opaque */ }
             this.$('.domain').textContent = domain;
             const title = this.stream.title || this.playbackPageMeta?.showTitle || this.titleFromUrl(this.stream.url);
             this.$('.title').textContent = this.$('.title').title = title;
@@ -5786,16 +5820,18 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             this.renderMarks();
             this.hideIsland();
             try {
-                await this.load(undefined);
+                await this.load(msg.startTime);
             } catch (e) {
                 this.showError('Cannot play this stream', String((e && e.message) || e));
                 return;
             } finally {
                 this.changingMedia = false;
             }
-            this.checkResume();
-            this.loadChapters();
-            this.autoSelectCaptured();
+            if (!msg.local) {
+                this.checkResume();
+                this.loadChapters();
+                this.autoSelectCaptured();
+            }
             this.updateDownloadButton();
             this.announce(`Now playing ${this.stream.title || (this.stream.type === 'progressive' ? 'the file' : `the ${this.stream.type.toUpperCase()} stream`)}`, 'play');
             this.refreshPopover();
@@ -5931,48 +5967,52 @@ ${this.row({ id: 'tl-fb', label: 'Previous frame', meta: ',', role: 'menuitem', 
 ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead: 'frameFwd' })}</div>`;
             const st = this.exportState;
             const live = this.isLive();
-            html += `<div class="section-label">${live ? 'Record &amp; DVR' : 'Download'}</div>`;
-            if (st && (st.running || st.status)) {
-                html += `<div class="progress" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct || 0}"><i style="width:${st.pct || 0}%"></i></div><p class="hint num">${esc(st.status || '')}</p>`;
-            }
-            html += '<div role="menu" aria-label="Download">';
-            if (st && st.running) {
-                html += this.row({ id: 'tl-cancel', label: st.isClip ? 'Cancel clip export' : 'Pause download', role: 'menuitem', lead: 'stop' });
-            } else if (live) {
-                html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
-                html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
-            } else {
-                const dash = this.stream.type === 'dash';
-                let dashWebm = false;
-                if (dash) { try { const a = this.player.getVariantTracks().find(t => t.active); dashWebm = !!a && /webm/i.test(a.mimeType || ''); } catch (_) { /* not loaded */ } }
-                html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? 'Save as .mp4' : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
-            }
-            html += '</div>';
-            if (this.supportsClip()) {
-                const { start, end } = this.clip;
-                html += `<div class="section-label">Clip from buffer</div><div role="menu" aria-label="Clip from buffer">
+            if (!this.localPlayback) {
+                html += `<div class="section-label">${live ? 'Record &amp; DVR' : 'Download'}</div>`;
+                if (st && (st.running || st.status)) {
+                    html += `<div class="progress" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct || 0}"><i style="width:${st.pct || 0}%"></i></div><p class="hint num">${esc(st.status || '')}</p>`;
+                }
+                html += '<div role="menu" aria-label="Download">';
+                if (st && st.running) {
+                    html += this.row({ id: 'tl-cancel', label: st.isClip ? 'Cancel clip export' : 'Pause download', role: 'menuitem', lead: 'stop' });
+                } else if (live) {
+                    html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
+                    html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
+                } else {
+                    const dash = this.stream.type === 'dash';
+                    let dashWebm = false;
+                    if (dash) { try { const a = this.player.getVariantTracks().find(t => t.active); dashWebm = !!a && /webm/i.test(a.mimeType || ''); } catch (_) { /* not loaded */ } }
+                    html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? 'Save as .mp4' : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
+                }
+                html += '</div>';
+                if (this.supportsClip()) {
+                    const { start, end } = this.clip;
+                    html += `<div class="section-label">Clip from buffer</div><div role="menu" aria-label="Clip from buffer">
 ${this.row({ id: 'tl-clip-in', label: 'Set In at playhead', meta: start == null ? '' : fmtTime(start), role: 'menuitem', lead: 'frameBack' })}
 ${this.row({ id: 'tl-clip-out', label: 'Set Out at playhead', meta: end == null ? '' : fmtTime(end), role: 'menuitem', lead: 'frameFwd' })}`;
-                if (start != null) html += this.row({ id: 'tl-clip-clear', label: 'Clear clip marks', role: 'menuitem', lead: 'close' });
-                const clip = this.clipRange();
-                if (clip && !st?.running) html += this.row({ id: 'tl-export-clip', label: 'Export cached clip', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
-                html += '</div><p class="hint">Play through the range to cache it. Cuts follow segment boundaries.</p>';
+                    if (start != null) html += this.row({ id: 'tl-clip-clear', label: 'Clear clip marks', role: 'menuitem', lead: 'close' });
+                    const clip = this.clipRange();
+                    if (clip && !st?.running) html += this.row({ id: 'tl-export-clip', label: 'Export cached clip', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
+                    html += '</div><p class="hint">Play through the range to cache it. Cuts follow segment boundaries.</p>';
+                }
+                if (this.stream.type === 'dash' && !live) html += '<p class="hint">DASH saves the best quality within your quality cap, with the audio language you are listening to: MP4 streams as one .mp4, WebM (VP9) streams as the original video and audio files. DRM-protected streams cannot be saved.</p>';
+                if (this.stream.type === 'hls' || live) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             }
-            if (this.stream.type === 'dash' && !live) html += '<p class="hint">DASH saves the best quality within your quality cap, with the audio language you are listening to: MP4 streams as one .mp4, WebM (VP9) streams as the original video and audio files. DRM-protected streams cannot be saved.</p>';
-            if (this.stream.type === 'hls' || live) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             const sleepMode = this.sleep ? this.sleep.mode : 0;
             html += `<div class="section-label" id="lbl-sleep">Sleep timer</div><div role="menu" aria-labelledby="lbl-sleep">${SLEEP_OPTIONS.map(([m, l]) => this.row({ id: `sl-${m}`, label: l, meta: m && sleepMode === m && this.sleep.endsAt ? `${Math.max(0, Math.ceil((this.sleep.endsAt - Date.now()) / 60000))}m left` : '', checked: sleepMode === m, data: `data-sleep="${m}"` })).join('')}</div>`;
-            const android = /Android/i.test(navigator.userAgent);
-            const mac = /Mac OS X/i.test(navigator.userAgent) && !/Mobile/i.test(navigator.userAgent);
-            html += '<div class="section-label" id="lbl-ext">Open in external player</div><div role="menu" aria-labelledby="lbl-ext">';
-            for (const [k, l, m] of EXTERNAL_APPS) {
-                if ((k === 'android' && !android) || (k === 'iina' && !mac) || ((k === 'potplayer') && (android || mac))) continue;
-                html += this.row({ id: `ex-${k}`, label: l, meta: m, role: 'menuitem', lead: 'external', data: `data-ext="${k}"` });
+            if (!this.localPlayback) {
+                const android = /Android/i.test(navigator.userAgent);
+                const mac = /Mac OS X/i.test(navigator.userAgent) && !/Mobile/i.test(navigator.userAgent);
+                html += '<div class="section-label" id="lbl-ext">Open in external player</div><div role="menu" aria-labelledby="lbl-ext">';
+                for (const [k, l, m] of EXTERNAL_APPS) {
+                    if ((k === 'android' && !android) || (k === 'iina' && !mac) || ((k === 'potplayer') && (android || mac))) continue;
+                    html += this.row({ id: `ex-${k}`, label: l, meta: m, role: 'menuitem', lead: 'external', data: `data-ext="${k}"` });
+                }
+                html += this.row({ id: 'ex-ytdlp', label: 'Copy yt-dlp command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
+                html += this.row({ id: 'ex-ffmpeg', label: 'Copy ffmpeg command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
+                html += this.row({ id: 'ex-link', label: 'Copy stream link', role: 'menuitem', lead: 'copy' });
+                html += '</div>';
             }
-            html += this.row({ id: 'ex-ytdlp', label: 'Copy yt-dlp command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
-            html += this.row({ id: 'ex-ffmpeg', label: 'Copy ffmpeg command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
-            html += this.row({ id: 'ex-link', label: 'Copy stream link', role: 'menuitem', lead: 'copy' });
-            html += '</div>';
             html += `<div class="section-label">Skip</div>${this.selectField('tl-skip', 'Skip intro button', SKIP_STEPS.map(s => [s, `+${s} s`]), this.settings.skipSeconds)}${this.switchField('tl-smart', 'Smart skip black & silence', this.settings.smartSkip)}`;
             html += `<div class="section-label">Modes</div><div role="menu" aria-label="Modes">
 ${this.row({ id: 'tl-mini', label: 'Mini player', role: 'menuitem', lead: 'mini' })}
@@ -6213,6 +6253,8 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         bindStudioTab(byId, click, each, range, select, sw) {
             const tab = this.studioTab;
             if (tab === 'quality') {
+                click('local-open', () => this.openLocalPicker());
+                click('local-folder', () => this.openLocalFolder());
                 each('[data-stream]', el => this.switchToStream(el.dataset.stream));
                 each('[data-q]', el => this.selectQuality(el.dataset.q === 'auto' ? 'auto' : +el.dataset.q));
                 select('q-cap', v => { this.setQualityCap(+v); this.announce(`Resolution cap ${+v ? `${v}p` : 'off'}`, 'studio'); });
@@ -6467,67 +6509,33 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         }).catch(() => {});
     }
 
-    function mountLocalPlayer(resumeId) {
+    function bindLocalFiles(player, resumeId, initiallyLocal) {
         const store = globalThis.VelostreamLocal;
         const subtitle = /\.(srt|vtt|ass|ssa)$/i;
         const media = /\.(mp4|m4v|mkv|webm|mov|ogv|avi|mpg|mpeg|ts|m2ts)$/i;
         const sort = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-        const root = document.createElement('main');
-        root.className = 'local-player';
-        setHTML(root, `<header class="local-toolbar">
-          <div class="local-heading"><h1>Local player</h1><a class="local-control" href="../popup/library.html#local">Library</a></div>
-          <div class="local-actions">
-            <button class="local-control primary" type="button" data-open>Open Local File</button>
-            <button class="local-control" type="button" data-folder>Open Folder</button>
-            <input type="file" multiple hidden accept="video/*,.mkv,.srt,.vtt,.ass,.ssa">
-            <select class="local-control" aria-label="Playlist" hidden></select>
-          </div>
-        </header>
-        <div class="local-stage"><video controls playsinline></video><span class="local-drop-label" aria-hidden="true">Drop to open</span></div>
-        <p class="local-status" role="status">Drop videos, folders, or subtitles anywhere.</p>`);
-        document.body.append(root);
-        applyStandaloneAppearance(root);
-        const video = root.querySelector('video');
-        const audio = new AudioFx(video);
-        const header = root.querySelector('header');
-        const normalize = document.createElement('input');
-        normalize.type = 'checkbox';
-        const boost = document.createElement('input');
-        boost.type = 'range';
-        boost.min = '100';
-        boost.max = '300';
-        boost.value = '100';
-        const loudness = document.createElement('label');
-        loudness.append(normalize, ' Normalize audio');
-        const gain = document.createElement('label');
-        const gainValue = document.createElement('output');
-        gainValue.textContent = '100%';
-        gain.append('Audio boost ', boost, ' ', gainValue);
-        const sound = document.createElement('details');
-        sound.className = 'local-audio';
-        const soundLabel = document.createElement('summary');
-        soundLabel.className = 'local-control';
-        soundLabel.textContent = 'Audio controls';
-        sound.append(soundLabel, loudness, gain);
-        header.append(sound);
-        const applyAudio = () => {
-            gainValue.textContent = boost.value + '%';
-            if ((audio.active || normalize.checked || +boost.value > 100) && audio.ensure()) {
-                audio.apply({ ...window.VelostreamShared.DEFAULT_SETTINGS.audio, boost: +boost.value, loudnessNorm: normalize.checked });
-            }
-        };
-        normalize.onchange = applyAudio;
-        boost.oninput = applyAudio;
-        video.onloadeddata = applyAudio;
-        const audioTimer = setInterval(() => audio.tickLoudness(), 250);
-        const input = root.querySelector('input[type="file"]');
-        const playlist = root.querySelector('select');
-        const status = root.querySelector('[role="status"]');
+        const root = player.root;
+        const video = player.video;
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.multiple = true;
+        input.accept = 'video/*,.mkv,.srt,.vtt,.ass,.ssa';
+        input.hidden = true;
+        const prompt = document.createElement('div');
+        prompt.className = 'local-intake glass';
+        prompt.hidden = !initiallyLocal;
+        setHTML(prompt, '<p>Drop videos, folders, or subtitles here</p><div><button type="button" class="pillbtn primary" data-open>Open Local File</button><button type="button" class="pillbtn" data-folder>Open Folder</button></div>');
+        const playlist = document.createElement('select');
+        playlist.className = 'pillbtn local-playlist';
+        playlist.setAttribute('aria-label', 'Local playlist');
+        playlist.hidden = true;
+        root.append(input, prompt);
+        root.querySelector('.titles').after(playlist);
         let queue = [];
         let sidecars = [];
         let index = -1;
         let source;
-        let tracks = [];
+        let localTracks = [];
         let revision = 0;
         let lastSave = 0;
         let active;
@@ -6538,54 +6546,66 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             if (active.id) store.save({ id: active.id, name: active.file.name, handle: active.handle, time: active.time }).catch(() => {});
         }
         function release() {
+            if (!source) return;
             video.pause();
             video.removeAttribute('src');
             video.load();
             if (source) URL.revokeObjectURL(source);
             source = null;
-            for (const track of tracks) track.remove();
-            tracks = [];
+            localTracks = [];
         }
         async function addSubtitles(files, token) {
+            const tracks = [];
             for (const { file } of files) {
                 if (file.size > 5 * 1024 * 1024) continue;
-                const cues = parseSubtitleFile(await file.text());
+                const vtt = await file.text();
                 if (token !== revision) return;
-                if (!cues.length) continue;
-                const element = document.createElement('track');
-                element.kind = 'subtitles';
-                element.label = file.name;
-                video.append(element);
-                const track = element.track;
-                track.mode = tracks.some(t => t.track.mode === 'showing') ? 'hidden' : 'showing';
-                tracks.push(element);
-                for (const cue of cues) {
-                    if (cue.end > cue.start) track.addCue(new VTTCue(cue.start, cue.end, cue.text));
-                }
+                if (parseSubtitleFile(vtt).length) tracks.push({ kind: 'subtitles', label: file.name, vtt });
             }
+            if (!tracks.length || token !== revision) return;
+            localTracks = localTracks.concat(tracks);
+            player.setCaptured(localTracks);
+            await player.loadCapturedTrack(localTracks.length - tracks.length, false);
+            player.refreshPopover();
         }
         const stem = name => name.replace(/\.[^.]+$/, '').toLowerCase();
+        let switching = Promise.resolve();
         function play(i) {
             if (!queue[i]) return;
-            save();
+            const entry = queue[i];
             const token = ++revision;
-            active = null;
-            release();
-            active = queue[i];
-            index = i;
-            playlist.selectedIndex = i;
-            status.textContent = active.file.name;
-            source = URL.createObjectURL(active.file);
-            video.onloadedmetadata = () => {
-                if (token === revision && active.time > 0) video.currentTime = Math.min(active.time, video.duration);
-            };
-            video.src = source;
-            video.play().catch(() => {});
-            const base = stem(active.file.name);
-            const matching = sidecars.filter(({ file }) => stem(file.name) === base || stem(file.name).startsWith(base + '.'));
-            addSubtitles(queue.length === 1 ? sidecars : matching, token).catch(showError);
+            switching = switching.catch(() => {}).then(async () => {
+                await player.ready;
+                if (token !== revision || player.closed) return;
+                if (!player.localPlayback) {
+                    player.saveHistory(true);
+                    player.port.send({ type: 'PREFETCH', enabled: false });
+                    if (player.exportState?.running) {
+                        player.port.send({ type: 'EXPORT_CANCEL' });
+                        const state = player.exportState;
+                        await state.chain;
+                        await player.handleExportMessage(state, { type: 'EXPORT_ERROR', error: 'Download paused.' });
+                    }
+                } else save();
+                player.localPlayback = true;
+                active = null;
+                release();
+                active = entry;
+                index = i;
+                playlist.selectedIndex = i;
+                prompt.hidden = true;
+                source = URL.createObjectURL(entry.file);
+                await player.finishStreamSwitch({
+                    local: true, drm: null, subtitles: [], startTime: entry.time || undefined,
+                    stream: { id: entry.id || source, type: 'progressive', title: entry.file.name, url: source }
+                });
+                const base = stem(entry.file.name);
+                const matching = sidecars.filter(({ file }) => stem(file.name) === base || stem(file.name).startsWith(base + '.'));
+                await addSubtitles(queue.length === 1 ? sidecars : matching, token);
+            }).catch(showError);
         }
-        function showError(error) { status.textContent = error.message || String(error); }
+        function showError(error) { player.announce(error.message || String(error), 'warn'); }
+        player.saveLocalPosition = save;
         let selection = 0;
         async function accept(entries, current) {
             if (current !== selection) return;
@@ -6593,7 +6613,8 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             const subs = entries.filter(({ file }) => subtitle.test(file.name));
             if (!videos.length) {
                 if (active && subs.length) addSubtitles(subs, revision).catch(showError);
-                else status.textContent = 'Choose a video first.';
+                else if (subs.length && player.stream?.url) await player.loadSubtitleFile(subs[0].file);
+                else showError(new Error('Choose a video file first.'));
                 return;
             }
             const handles = videos.filter(entry => entry.handle && !entry.id);
@@ -6624,7 +6645,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             accept([...input.files].map(file => ({ file })), ++selection).catch(showError);
             input.value = '';
         };
-        root.querySelector('[data-open]').onclick = async () => {
+        player.openLocalPicker = async () => {
             const current = ++selection;
             if (!window.showOpenFilePicker) { input.click(); return; }
             try {
@@ -6635,6 +6656,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 else if (error.name !== 'AbortError') showError(error);
             }
         };
+        prompt.querySelector('[data-open]').onclick = player.openLocalPicker;
         const folder = document.createElement('input');
         folder.type = 'file';
         folder.webkitdirectory = true;
@@ -6642,7 +6664,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         folder.hidden = true;
         root.append(folder);
         folder.onchange = () => { accept([...folder.files].map(file => ({ file })), ++selection).catch(showError); folder.value = ''; };
-        root.querySelector('[data-folder]').onclick = async () => {
+        player.openLocalFolder = async () => {
             const current = ++selection;
             if (!window.showDirectoryPicker) { folder.click(); return; }
             try {
@@ -6653,23 +6675,23 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 else if (error.name !== 'AbortError') showError(error);
             }
         };
+        prompt.querySelector('[data-folder]').onclick = player.openLocalFolder;
         playlist.onchange = () => play(playlist.selectedIndex);
-        video.onended = () => play(index + 1);
-        video.onpause = save;
-        video.ontimeupdate = () => {
+        player.listen(video, 'ended', () => play(index + 1));
+        player.listen(video, 'timeupdate', () => {
             if (Date.now() - lastSave >= 3000) { lastSave = Date.now(); save(); }
-        };
-        video.onerror = () => { if (source) status.textContent = 'This browser cannot play this file or codec.'; };
-        window.addEventListener('dragover', event => {
+        });
+        player.disposers.push(() => { selection++; revision++; release(); });
+        player.listen(window, 'dragover', event => {
             if (!event.dataTransfer.types.includes('Files')) return;
             event.preventDefault();
             event.dataTransfer.dropEffect = 'copy';
             root.classList.add('is-dropping');
         });
-        window.addEventListener('dragleave', event => {
+        player.listen(window, 'dragleave', event => {
             if (!event.relatedTarget) root.classList.remove('is-dropping');
         });
-        window.addEventListener('drop', event => {
+        player.listen(window, 'drop', event => {
             if (!event.dataTransfer.types.includes('Files')) return;
             event.preventDefault();
             root.classList.remove('is-dropping');
@@ -6678,17 +6700,25 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 if (current === selection) showError(error);
             });
         });
-        window.addEventListener('pagehide', event => {
+        player.listen(window, 'pagehide', event => {
             save();
-            if (!event.persisted) { selection++; revision++; release(); clearInterval(audioTimer); audio.destroy(); }
+            if (!event.persisted) { selection++; revision++; release(); }
         });
+        if (initiallyLocal && window.top !== window) {
+            player.listen(window, 'message', event => {
+                const message = event.data;
+                if (event.source !== window.parent || message?.type !== 'VELOSTREAM_LOCAL_FILES' ||
+                    !Array.isArray(message.files) || !message.files.every(file => file instanceof File)) return;
+                accept(message.files.map(file => ({ file })), ++selection).catch(showError);
+            });
+        }
         if (resumeId) {
             const savedEntry = store.get(resumeId).catch(() => null);
             const resume = document.createElement('button');
             resume.type = 'button';
-            resume.className = 'local-control primary';
+            resume.className = 'pillbtn primary';
             resume.textContent = 'Resume Local File';
-            root.querySelector('.local-actions').prepend(resume);
+            prompt.querySelector('div').prepend(resume);
             resume.onclick = async () => {
                 const current = ++selection;
                 try {
@@ -6781,7 +6811,6 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
     }
 
     window.VelostreamVaultExport = mountVaultExport;
-    window.VelostreamLocalPlayer = mountLocalPlayer;
 
     // Started by player.js with an EnginePort and the host layout bridge.
     window.VelostreamPlayer = VelostreamPlayer;

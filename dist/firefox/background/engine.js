@@ -2377,6 +2377,12 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'LAUNCH_FROM_PAGE':
             if (fromTab === undefined) return false;
             return respondAsync(launchFromPage(fromTab, sender.frameId ?? 0), sendResponse);
+        case 'OPEN_LOCAL_PLAYER':
+            if (sender.url !== api.runtime.getURL('popup/popup.html') || !Number.isInteger(message.tabId)) return false;
+            return respondAsync((async () => {
+                if (!await pingFrame(message.tabId, 0)) throw new Error('Open a website tab to use the Velostream overlay.');
+                return api.tabs.sendMessage(message.tabId, { action: 'MOUNT_LOCAL_PLAYER' }, { frameId: 0 });
+            })(), sendResponse);
         case 'LAUNCH_URL':
             return respondAsync(launchManualUrl(message.tabId, message.url, message.typeHint), sendResponse);
         case 'GET_BADGE_STATE':

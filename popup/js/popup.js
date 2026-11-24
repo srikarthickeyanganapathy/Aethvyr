@@ -649,6 +649,16 @@
             renderHistory();
             announce('History cleared');
         });
+        $('open-local').addEventListener('click', async () => {
+            const button = $('open-local');
+            button.disabled = true;
+            const result = await send({ action: 'OPEN_LOCAL_PLAYER', tabId });
+            if (result?.ok) window.close();
+            else {
+                showMessage(result?.error || 'Open a website tab to use the Velostream overlay.');
+                button.disabled = false;
+            }
+        });
         $('open-library').addEventListener('click', () => {
             api.tabs.create({ url: api.runtime.getURL('popup/library.html') });
             window.close();

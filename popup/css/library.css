@@ -203,3 +203,6 @@ body.hc .lib-dialog { border: 2px solid #fff; }
 .lib-device-details p { margin: 4px 0 0; }
 .lib-device-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .lib-device-actions .btn { min-height: 44px; }
+
+#local-overlay { position: fixed; inset: 0; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; padding: 0; border: 0; background: #000; }
+#local-overlay iframe { display: block; width: 100%; height: 100%; border: 0; }
