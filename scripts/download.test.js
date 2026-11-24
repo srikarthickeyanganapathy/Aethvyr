@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { checkpoint, validateExportRange } from '../background/download-store.js';
-import { SegmentDownloader } from '../background/downloader.js';
+import { exportMediaType, SegmentDownloader } from '../background/downloader.js';
 import { parseMedia, segmentKey } from '../background/hls-parser.js';
 
 const signal = new AbortController().signal;
@@ -128,4 +128,19 @@ test('paused prefetch stops at the disk budget and resumes after playback starts
     downloader.playback.paused = false;
     downloader._pump();
     assert.equal(starts, 1);
+});
+
+test('download format detection rejects text responses and identifies actual media', () => {
+    const encode = text => new TextEncoder().encode(text);
+    const html = encode('<!doctype html><html><title>Access denied</title></html>');
+    for (const text of ['#EXTM3U\n#EXTINF:5', 'WEBVTT\n', '{"error":"expired"}', '<MPD></MPD>']) {
+        assert.equal(exportMediaType(encode(text)), null);
+    }
+    assert.equal(exportMediaType(html), null);
+    const mp4 = Uint8Array.from([0, 0, 0, 16, ...encode('ftypisom'), 0, 0, 0, 0]);
+    assert.deepEqual(exportMediaType(mp4), { mime: 'video/mp4', offset: 0 });
+    assert.deepEqual(exportMediaType(bytes(0x1a, 0x45, 0xdf, 0xa3, 0x81, 0)), { mime: 'video/webm', offset: 0 });
+    const cluster = bytes(0x1f, 0x43, 0xb6, 0x75, 0x81, 0);
+    assert.equal(exportMediaType(cluster), null);
+    assert.equal(exportMediaType(cluster, { webmFragment: true }).mime, 'video/webm');
 });

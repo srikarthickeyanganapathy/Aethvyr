@@ -379,7 +379,8 @@
                     if (item?.state === 'complete') done();
                     else if (!item || item.state === 'interrupted') done('Browser download interrupted.');
                 }).catch(() => { });
-            }, () => {
+            }, (error) => {
+                if (/cancel|abort|user.canceled/i.test(error?.message || '')) { done('Browser download cancelled.'); return; }
                 try { extApi.downloads.onChanged.removeListener(onChanged); } catch (_) { /* ignore */ }
                 viaAnchor();
                 resolve(false);
@@ -451,7 +452,10 @@
                 this.writable = null;
                 if (this.temp) {
                     let finished = true;
-                    try { finished = await downloadBlob(this.container, await this.temp.handle.getFile(), this.filename); }
+                    try {
+                        const file = await this.temp.handle.getFile();
+                        finished = await downloadBlob(this.container, new Blob([file], { type: this.mime }), this.filename);
+                    }
                     finally {
                         if (finished) await this.removeTemporaryFile();
                         else {
@@ -1909,7 +1913,7 @@
       <div class="capsule-right glass" role="toolbar" aria-label="Player tools">
         <button type="button" class="ib btn-lock" data-look="lock" aria-label="Lock touch controls">${icon('lock')}</button>
         <button type="button" class="ib btn-info adv narrow-hide" data-look="info" aria-pressed="false" aria-label="Stream statistics">${icon('info')}</button>
-        <button type="button" class="ib ring-host btn-dl adv" data-look="dl" aria-label="Download stream">${icon('download')}<svg class="ring" viewBox="0 0 44 44" aria-hidden="true" hidden><circle class="track" cx="22" cy="22" r="19"/><circle class="prog" cx="22" cy="22" r="19" stroke-dasharray="119.38" stroke-dashoffset="119.38"/></svg></button>
+        <button type="button" class="ib ring-host btn-dl" data-look="dl" aria-label="Download stream">${icon('download')}<svg class="ring" viewBox="0 0 44 44" aria-hidden="true" hidden><circle class="track" cx="22" cy="22" r="19"/><circle class="prog" cx="22" cy="22" r="19" stroke-dasharray="119.38" stroke-dashoffset="119.38"/></svg></button>
         <button type="button" class="ib btn-audio-only adv narrow-hide" data-look="audioOnly" aria-pressed="false" aria-label="Audio-only battery saver">${icon('headphones')}</button>
         <button type="button" class="ib btn-mini" data-look="mini" aria-label="Collapse to mini player">${icon('mini')}</button>
       </div>
@@ -2203,14 +2207,15 @@
             const span = r.end - r.start;
             if (!(span > 1)) return;
             const N = 120;
-            if (!this.heat || this.heat.span !== Math.round(span)) this.heat = { span: Math.round(span), lv: new Float32Array(N) };
+            if (!this.heat || this.heat.gen !== this.loadGen || this.heat.span !== Math.round(span)) this.heat = { gen: this.loadGen, span: Math.round(span), lv: new Float32Array(N) };
             const lv = this.heat.lv;
             if (!v.paused && this.audio.active) {
                 const i = clamp(Math.floor((v.currentTime - r.start) / span * N), 0, N - 1);
                 const level = Math.min(1, Math.sqrt(this.audio.rms()) * 1.6);
                 lv[i] = lv[i] ? lv[i] * 0.6 + level * 0.4 : Math.max(level, 0.05);
             }
-            if (!force && (this.tickCount || 0) % 2) return; // draw at 2 Hz
+            if (!force && performance.now() - (this.lastHeatDraw || 0) < 500) return;
+            this.lastHeatDraw = performance.now();
             const dpr = Math.min(2, window.devicePixelRatio || 1);
             const W = Math.round(c.clientWidth * dpr);
             const H = Math.round(18 * dpr);
@@ -3317,8 +3322,10 @@
                 ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
                 this.shadow.appendChild(ta);
                 ta.select();
-                try { document.execCommand('copy'); } catch (__) { /* ignore */ }
+                let copied = false;
+                try { copied = document.execCommand('copy'); } catch (_) { /* clipboard unavailable */ }
                 ta.remove();
+                if (!copied) { this.announce('Clipboard access was blocked.', 'warn'); return; }
             }
             this.island('check', done);
         }
@@ -3691,7 +3698,7 @@
         }
 
         async checkResume() {
-            if (!this.settings || this.isLive() || this.closed) return;
+            if (!this.settings || this.isLive() || this.closed || this.localPlayback) return;
             let entry = null;
             try { entry = (await this.port.request('HISTORY_GET', { key: this.mediaKey() })).value; } catch (_) { return; }
             if (!entry) entry = await this.legacyHistory();
@@ -4049,7 +4056,7 @@
             }
             this.recordingSince = 0;
             this.exportState = { running: true, files: {}, status: 'Saving recording…', pct: 0, toMp4, sink, outName: sink ? sink.filename : name, chain: Promise.resolve() };
-            this.port.send({ type: 'RECORD_STOP' });
+            this.port.send({ type: 'RECORD_STOP', format: toMp4 ? 'mp4' : 'original' });
             this.updateDownloadButton();
             this.refreshPopover();
         }
@@ -4187,8 +4194,11 @@
                 }
                 if (this.closed) return;
             }
-            const toMp4 = dash ? dashPlan.mp4 && !!window.VelostreamMux
-                : hls && (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
+            const toMp4 = this.settings.exportFormat !== 'original' && (hls || !!dashPlan?.mp4);
+            if (toMp4 && (!window.VelostreamMux || (hls && !window.shaka?.transmuxer?.TsTransmuxer))) {
+                this.announce('MP4 conversion is unavailable. Choose Original files in Studio → Tools.', 'warn');
+                return;
+            }
             let title = safeFilename(this.$('.title').textContent || 'video').replace(/\.(m3u8|mpd|mp4|ts)$/i, '');
             if (clip) {
                 const r0 = this.seekRange().start;
@@ -4198,8 +4208,8 @@
             const st = { running: true, files: {}, status: 'Starting…', pct: 0, toMp4, sink: null, muxer: null, chain: Promise.resolve() };
             this.exportState = st;
             // Ask for the destination while the click's user activation is still valid.
-            if (toMp4 || (!hls && !dash) || (dash && dashPlan.parts.length === 1)) {
-                const ext = toMp4 ? 'mp4' : dash ? dashPlan.parts[0].ext : ((/\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(this.stream.url) || ['', 'mp4'])[1]);
+            if (toMp4) {
+                const ext = 'mp4';
                 this.pickingSink = true;
                 try {
                     st.sink = await ExportSink.pick(this.shadow, `${title}.${ext}`, toMp4 ? 'video/mp4' : '');
@@ -4212,10 +4222,10 @@
             }
             st.isClip = !!clip;
             if (dash) {
-                if (!toMp4 && dashPlan.parts.length > 1) this.announce('WebM stream: saving the original video and audio files', 'download');
-                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts }, clip: !!clip });
+                if (!toMp4 && dashPlan.parts.length > 1) this.announce('Saving separate original video and audio files', 'download');
+                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts }, clip: !!clip, format: toMp4 ? 'mp4' : 'original' });
             } else {
-                this.port.send(clip ? { type: 'EXPORT_START', clip } : { type: 'EXPORT_START' });
+                this.port.send({ type: 'EXPORT_START', clip, format: toMp4 ? 'mp4' : 'original' });
             }
             this.announce(clip ? `Saving A–B clip (${fmtTime(clip.end - clip.start)})` : this.isLive() ? 'Saving live DVR buffer' : 'Download started', 'download');
             this.updateDownloadButton();
@@ -4261,27 +4271,12 @@
             });
         }
 
-        /** MP4 conversion failed on the first segment: save the original segments instead. */
-        async exportFallbackToRaw(st, err) {
-            console.warn('[Velostream] MP4 remux unavailable, saving original format', err);
-            st.toMp4 = false;
-            await st.muxer?.discardFragments();
-            st.muxer = null;
-            if (st.sink) { await st.sink.abort(); st.sink = null; }
-            for (const f of Object.values(st.files)) {
-                f.sink = new ExportSink(this.shadow, f.filename, f.mime);
-                for (const chunk of f.raw || []) await f.sink.write(chunk);
-                f.raw = null;
-            }
-            this.announce('MP4 conversion is not possible for this stream; saving the original format', 'warn');
-        }
-
         async handleExportMessage(st, msg) {
             if (this.exportState !== st && msg.type !== 'EXPORT_ERROR') return;
             switch (msg.type) {
                 case 'EXPORT_BEGIN': {
                     st.running = true;
-                    const f = { filename: msg.filename, mime: msg.mime, raw: [], muxOk: false, sink: null };
+                    const f = { filename: msg.filename, mime: msg.mime, sink: null };
                     st.files[msg.fileIndex] = f;
                     if (st.toMp4) {
                         if (!st.muxer) st.muxer = new window.VelostreamMux.ExportMuxer(st.sink, msg.fileCount || 1);
@@ -4297,19 +4292,8 @@
                     const f = st.files[msg.fileIndex];
                     if (!f || !msg.data) return;
                     if (st.toMp4 && st.muxer) {
-                        // Keep the raw bytes until this file's first segment converted, for the fallback.
-                        if (!f.muxOk) f.raw.push(new Uint8Array(msg.data).slice());
-                        try {
-                            if (msg.kind === 'init') await st.muxer.addInit(msg.fileIndex, msg.data);
-                            else {
-                                await st.muxer.addSegment(msg.fileIndex, msg.data, { start: msg.start, end: msg.end, url: msg.url });
-                                f.muxOk = true;
-                                f.raw = null;
-                            }
-                        } catch (err) {
-                            if (f.muxOk) throw err;
-                            await this.exportFallbackToRaw(st, err);
-                        }
+                        if (msg.kind === 'init') await st.muxer.addInit(msg.fileIndex, msg.data);
+                        else await st.muxer.addSegment(msg.fileIndex, msg.data, { start: msg.start, end: msg.end, url: msg.url });
                         return;
                     }
                     if (f.sink) await f.sink.write(new Uint8Array(msg.data));
@@ -4785,6 +4769,8 @@
         }
 
         async loadChapters() {
+            const gen = this.loadGen;
+            const apply = chapters => { if (!this.closed && this.loadGen === gen) this.addChapters(chapters); };
             // Shaka chapter tracks (DASH/HLS manifests that declare them).
             if (this.player && this.mode === 'mse' && this.player.getChaptersTracks) {
                 try {
@@ -4792,7 +4778,7 @@
                     if (tracks.length) {
                         const lang = (tracks.find(t => t.language) || tracks[0]).language;
                         const chs = await this.player.getChaptersAsync(lang);
-                        this.addChapters(chs.map(c => ({ start: c.startTime, title: c.title })));
+                        apply(chs.map(c => ({ start: c.startTime, title: c.title })));
                     }
                 } catch (_) { /* no chapters */ }
             }
@@ -4800,12 +4786,13 @@
             for (const t of this.capturedChapters || []) {
                 const text = t.vtt || (t.url ? await this.fetchText(t.url) : '');
                 const cues = text ? parseSubtitleFile(text) : [];
-                this.addChapters(cues.map(c => ({ start: c.start, title: c.text.replace(/\n/g, ' ') })));
+                apply(cues.map(c => ({ start: c.start, title: c.text.replace(/\n/g, ' ') })));
             }
         }
 
         /** Thumbnail preview from an image track (EXT-X-IMAGE-STREAM-INF / DASH thumbnails). */
         updateTipThumb(t) {
+            if (!this.settings) return;
             const box = this.$('.tip-thumb');
             if (this.mode === 'native') { this.fileThumb(t, box); return; }
             if (!this.player || this.mode !== 'mse' || !this.player.getImageTracks) { box.hidden = true; return; }
@@ -4820,13 +4807,15 @@
             const key = Math.floor(t);
             if (this.thumbKey === key) return;
             this.thumbKey = key;
+            box.hidden = true;
+            const generation = this.loadGen;
             clearTimeout(this.thumbTimer);
             this.thumbTimer = setTimeout(async () => {
                 try {
                     const th = await this.player.getThumbnails(this.imageTrackId, t);
-                    if (!th || !th.uris || !th.uris.length || this.thumbKey !== key) return;
+                    if (!th || !th.uris || !th.uris.length || this.thumbKey !== key || this.loadGen !== generation) return;
                     const url = await this.thumbImage(th.uris[0], th.startByte, th.endByte);
-                    if (!url || this.thumbKey !== key) return;
+                    if (!url || this.thumbKey !== key || this.loadGen !== generation) return;
                     const w = Math.min(160, th.width || 160);
                     const scale = w / (th.width || w);
                     box.style.width = `${w}px`;
@@ -4853,54 +4842,73 @@
             const v = this.video;
             const dur = v.duration;
             if (this.settings.fileThumbnails === false || !Number.isFinite(dur) || dur <= 0 || !this.stream) { box.hidden = true; return; }
-            const T = this.thumbGen || (this.thumbGen = { cache: new Map(), want: null, busy: false, el: null, failed: false, step: 1, box: null });
+            const T = this.thumbGen || (this.thumbGen = { cache: new Map(), missed: new Set(), want: null, busy: false, el: null, failed: false, step: 1, box: null });
             if (T.failed) { box.hidden = true; return; }
             T.step = Math.max(1, dur / 200);
             T.box = box;
             const key = clamp(Math.round(t / T.step), 0, Math.floor(dur / T.step));
             T.want = key;
-            let near = T.cache.get(key);
-            for (let d = 1; !near && d <= 4; d++) near = T.cache.get(key - d) || T.cache.get(key + d);
+            const near = T.cache.get(key);
             if (near) this.drawFileThumb(box, near); else box.hidden = true;
             this.pumpFileThumbs();
         }
 
         pumpFileThumbs() {
             const T = this.thumbGen;
-            if (!T || T.busy || T.failed || this.closed || T.want == null || T.cache.has(T.want)) return;
+            if (!T || T.busy || T.failed || this.closed || T.want == null ||
+                T.cache.has(T.want) || T.missed.has(T.want)) return;
             if (!T.el) {
                 const el = document.createElement('video');
                 el.muted = true;
                 el.playsInline = true;
                 el.preload = 'auto';
-                el.addEventListener('error', () => { T.failed = true; });
+                el.hidden = true;
+                this.shadow.appendChild(el);
                 el.src = this.stream.url;
                 T.el = el;
             }
             const el = T.el;
             const key = T.want;
             T.busy = true;
-            const done = () => {
-                el.removeEventListener('seeked', done);
-                clearTimeout(T.timer);
+            const target = Math.min(key * T.step, Math.max(0, this.video.duration - 0.05));
+            const finish = draw => {
+                T.cancel();
                 if (this.thumbGen !== T) return;
-                try {
-                    if (el.videoWidth) {
-                        const c = document.createElement('canvas');
-                        c.width = 160;
-                        c.height = Math.max(1, Math.round(160 * el.videoHeight / el.videoWidth));
+                if (draw && el.videoWidth) {
+                    const c = document.createElement('canvas');
+                    c.width = 160;
+                    c.height = Math.max(1, Math.round(160 * el.videoHeight / el.videoWidth));
+                    try {
                         c.getContext('2d').drawImage(el, 0, 0, c.width, c.height);
                         T.cache.set(key, c);
-                        if (T.cache.size > 240) T.cache.delete(T.cache.keys().next().value);
                         if (T.want === key && T.box) this.drawFileThumb(T.box, c);
-                    }
-                } catch (_) { /* frame not decodable: leave this one out */ }
+                    } catch (_) { T.missed.add(key); }
+                } else T.missed.add(key);
                 T.busy = false;
                 this.pumpFileThumbs();
             };
-            el.addEventListener('seeked', done);
-            T.timer = setTimeout(done, 4000);
-            el.currentTime = Math.max(0, key * T.step);
+            const draw = () => finish(true);
+            const fail = () => { T.failed = true; finish(false); };
+            const seek = () => {
+                if (Math.abs(el.currentTime - target) < 0.01) {
+                    if (el.readyState >= 2) draw();
+                    else el.addEventListener('loadeddata', draw, { once: true });
+                } else {
+                    el.addEventListener('seeked', draw, { once: true });
+                    try { el.currentTime = target; } catch (_) { finish(false); }
+                }
+            };
+            T.cancel = () => {
+                clearTimeout(T.timer);
+                el.removeEventListener('loadedmetadata', seek);
+                el.removeEventListener('loadeddata', draw);
+                el.removeEventListener('seeked', draw);
+                el.removeEventListener('error', fail);
+            };
+            el.addEventListener('error', fail, { once: true });
+            T.timer = setTimeout(() => finish(false), 4000);
+            if (el.readyState >= 1) seek();
+            else el.addEventListener('loadedmetadata', seek, { once: true });
         }
 
         drawFileThumb(box, src) {
@@ -4924,13 +4932,17 @@
             const T = this.thumbGen;
             this.thumbGen = null;
             if (!T) return;
-            clearTimeout(T.timer);
-            if (T.el) { T.el.removeAttribute('src'); try { T.el.load(); } catch (_) { /* ignore */ } }
+            T.cancel?.();
+            if (T.el) { T.el.removeAttribute('src'); T.el.load(); T.el.remove(); }
             T.cache.clear();
         }
 
         /** Thumbnail sprites are fetched through the engine (site Referer) and cached as blob URLs. */
         clearThumbCache() {
+            clearTimeout(this.thumbTimer);
+            this.thumbKey = null;
+            const tip = this.$('.tip-thumb');
+            if (tip) tip.hidden = true;
             if (!this.thumbCache) return;
             for (const url of this.thumbCache.values()) url.then(u => { if (u) URL.revokeObjectURL(u); });
             this.thumbCache.clear();
@@ -4963,7 +4975,7 @@
             const span = Math.max(0.001, r.end - r.start);
             const pos = t => clamp((t - r.start) / span * 100, 0, 100);
             let html = '';
-            for (const c of this.chapters || []) if (c.start > r.start + 0.5) html += `<div class="mark chapter" style="left:${pos(c.start)}%"></div>`;
+            for (const c of this.chapters || []) if (c.start > r.start && c.start < r.end) html += `<div class="mark chapter" style="left:${pos(c.start)}%"></div>`;
             for (const b of this.bookmarks) html += `<div class="mark" style="left:${pos(b.t)}%"></div>`;
             if (this.loop.a != null) html += `<div class="mark" style="left:${pos(this.loop.a)}%"></div>`;
             if (this.loop.b != null) html += `<div class="mark" style="left:${pos(this.loop.b)}%"></div>`;
@@ -4974,7 +4986,7 @@
             // Chapters scrubber: cut a 3 px gap into the bar at every chapter start.
             const track = this.$('.track');
             const cuts = this.settings && this.settings.look.scrubber === 'chapters'
-                ? (this.chapters || []).filter(c => c.start > r.start + 0.5 && c.start < r.end - 0.5).map(c => pos(c.start).toFixed(3)) : [];
+                ? (this.chapters || []).filter(c => pos(c.start) > 0.5 && pos(c.start) < 99.5).map(c => pos(c.start).toFixed(3)) : [];
             const mask = cuts.length
                 ? `linear-gradient(to right, #000 0, ${cuts.map(p => `#000 calc(${p}% - 1.5px), transparent calc(${p}% - 1.5px), transparent calc(${p}% + 1.5px), #000 calc(${p}% + 1.5px)`).join(', ')}, #000 100%)`
                 : '';
@@ -5140,14 +5152,19 @@
                 this.scheduleHide();
             };
             this.listen(tl, 'pointerup', end);
-            this.listen(tl, 'pointercancel', end);
+            this.listen(tl, 'pointercancel', () => {
+                if (!this.dragging) return;
+                this.dragging = false;
+                tl.classList.remove('dragging');
+                this.renderTimeline();
+            });
             this.listen(tl, 'keydown', (e) => {
                 const r = this.seekRange();
                 const span = r.end - r.start;
                 let handled = true;
                 switch (e.key) {
-                    case 'ArrowLeft': case 'ArrowDown': this.seekBy(-5, false); break;
-                    case 'ArrowRight': case 'ArrowUp': this.seekBy(5, false); break;
+                    case 'ArrowLeft': case 'ArrowDown': this.seekBy(-(this.settings?.seekStep || 5), false); break;
+                    case 'ArrowRight': case 'ArrowUp': this.seekBy(this.settings?.seekStep || 5, false); break;
                     case 'PageDown': this.seekBy(-Math.max(30, span / 10), false); break;
                     case 'PageUp': this.seekBy(Math.max(30, span / 10), false); break;
                     case 'Home': this.seekTo(r.start, false); break;
@@ -5951,7 +5968,16 @@ ${this.rangeField('dp-c-highlights', 'Highlights', -100, 100, 5, cs.highlights |
         tabTools() {
             const r = this.seekRange();
             const loopMeta = this.loop.a == null ? 'Not set' : this.loop.b == null ? `A ${fmtTime(this.loop.a - r.start)}` : `${fmtTime(this.loop.a - r.start)}–${fmtTime(this.loop.b - r.start)}`;
-            let html = `<div class="section-label">A–B loop &amp; bookmarks</div><div role="menu" aria-label="Loop and bookmarks">
+            let html = '';
+            if (this.localPlayback && this.saveLocalCopy) {
+                html += `<div role="menu" aria-label="Local file">${this.row({ id: 'tl-save-local', label: 'Save a copy of this file', role: 'menuitem', lead: 'download' })}</div>`;
+            }
+            const chapters = this.chapters || [];
+            html += `<div class="section-label">Chapters</div><div role="menu" aria-label="Chapters">
+${chapters.map((chapter, i) => this.row({ id: `chapter-${i}`, label: chapter.title, meta: fmtTime(chapter.start - r.start), role: 'menuitem', data: `data-chapter="${i}"` })).join('')}
+${this.row({ id: 'tl-chapters', label: 'Load chapter file (.vtt)', role: 'menuitem', lead: 'upload' })}
+</div><input type="file" id="tl-chapter-file" accept=".vtt,text/vtt" hidden>`;
+            html += `<div class="section-label">A–B loop &amp; bookmarks</div><div role="menu" aria-label="Loop and bookmarks">
 ${this.row({ id: 'tl-a', label: 'Set point A', meta: loopMeta, role: 'menuitem', lead: 'loop' })}
 ${this.row({ id: 'tl-b', label: 'Set point B', role: 'menuitem', lead: 'loop' })}
 ${this.row({ id: 'tl-clear', label: 'Clear loop', role: 'menuitem', lead: 'close' })}
@@ -5967,6 +5993,7 @@ ${this.row({ id: 'tl-fb', label: 'Previous frame', meta: ',', role: 'menuitem', 
 ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead: 'frameFwd' })}</div>`;
             const st = this.exportState;
             const live = this.isLive();
+            let dashWebm = false;
             if (!this.localPlayback) {
                 html += `<div class="section-label">${live ? 'Record &amp; DVR' : 'Download'}</div>`;
                 if (st && (st.running || st.status)) {
@@ -5980,9 +6007,8 @@ ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead
                     html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
                 } else {
                     const dash = this.stream.type === 'dash';
-                    let dashWebm = false;
                     if (dash) { try { const a = this.player.getVariantTracks().find(t => t.active); dashWebm = !!a && /webm/i.test(a.mimeType || ''); } catch (_) { /* not loaded */ } }
-                    html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? 'Save as .mp4' : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
+                    html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original files') : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
                 }
                 html += '</div>';
                 if (this.supportsClip()) {
@@ -5996,7 +6022,7 @@ ${this.row({ id: 'tl-clip-out', label: 'Set Out at playhead', meta: end == null 
                     html += '</div><p class="hint">Play through the range to cache it. Cuts follow segment boundaries.</p>';
                 }
                 if (this.stream.type === 'dash' && !live) html += '<p class="hint">DASH saves the best quality within your quality cap, with the audio language you are listening to: MP4 streams as one .mp4, WebM (VP9) streams as the original video and audio files. DRM-protected streams cannot be saved.</p>';
-                if (this.stream.type === 'hls' || live) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
+                if (['hls', 'dash'].includes(this.stream.type) && !dashWebm) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             }
             const sleepMode = this.sleep ? this.sleep.mode : 0;
             html += `<div class="section-label" id="lbl-sleep">Sleep timer</div><div role="menu" aria-labelledby="lbl-sleep">${SLEEP_OPTIONS.map(([m, l]) => this.row({ id: `sl-${m}`, label: l, meta: m && sleepMode === m && this.sleep.endsAt ? `${Math.max(0, Math.ceil((this.sleep.endsAt - Date.now()) / 60000))}m left` : '', checked: sleepMode === m, data: `data-sleep="${m}"` })).join('')}</div>`;
@@ -6018,7 +6044,8 @@ ${this.row({ id: 'tl-clip-out', label: 'Set Out at playhead', meta: end == null 
 ${this.row({ id: 'tl-mini', label: 'Mini player', role: 'menuitem', lead: 'mini' })}
 ${this.row({ id: 'tl-audio', label: 'Audio-only battery saver', meta: this.audioOnly ? 'On' : 'Off', role: 'menuitem', lead: 'headphones' })}
 ${document.pictureInPictureEnabled ? this.row({ id: 'tl-pip', label: 'Picture in Picture', role: 'menuitem', lead: 'pip' }) : ''}
-${this.row({ id: 'tl-lock', label: 'Lock touch controls', role: 'menuitem', lead: 'lock' })}</div>`;
+${this.row({ id: 'tl-lock', label: 'Lock touch controls', role: 'menuitem', lead: 'lock' })}
+${this.row({ id: 'tl-stats', label: this.settings.showStats ? 'Hide playback statistics' : 'Show playback statistics', role: 'menuitem', lead: 'info' })}</div>`;
             return html;
         }
 
@@ -6113,7 +6140,12 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             // Remember which collapsible sections are open, so re-renders of the panel keep them open.
             this.pop.querySelectorAll('details.look-more').forEach(d => d.addEventListener('toggle', () => { this.lookOpen[d.dataset.sec] = d.open; }));
             select('pf-density', v => set({ density: v }, `Controls: ${v}`));
-            select('pf-scrubber', v => set({ scrubber: v }));
+            select('pf-scrubber', v => {
+                if (v === 'heatmap' && this.audio.allowed() && this.audio.ensure()) this.audio.apply(this.settings.audio);
+                set({ scrubber: v });
+                if (v === 'chapters' && !this.chapters?.length) this.announce('No chapters in this video. Add a chapter file in Studio → Tools.', 'info');
+                if (v === 'heatmap' && !this.audio.active) this.announce('Showing buffer activity. Loudness needs playable audio and a tap in the player.', 'info');
+            });
             range('pf-scrubh', v => set({ scrubHeight: v }), v => `${v} px`);
             range('pf-scrim', v => set({ scrim: v < 0 ? -1 : v }), v => (v < 0 ? 'Skin default' : `${v}%`));
             for (const id of LOOK_BUTTONS) {
@@ -6363,6 +6395,32 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 click('dp-flip', () => { this.xf.flip = !this.xf.flip; this.layoutVideo(); this.announce(this.xf.flip ? 'Mirrored' : 'Mirror off', 'flip'); this.refreshPopover(); });
                 click('dp-xreset', () => { this.xf = { zoom: 1, panX: 0, panY: 0, rotate: 0, flip: false }; this.fit = 'contain'; this.layoutVideo(); this.announce('Transform reset', 'expand'); this.refreshPopover(); });
             } else if (tab === 'tools') {
+                each('[data-chapter]', el => {
+                    const chapter = this.chapters?.[+el.dataset.chapter];
+                    if (chapter) this.seekTo(chapter.start, true);
+                });
+                const chapterFile = byId('tl-chapter-file');
+                click('tl-chapters', () => chapterFile.click());
+                chapterFile?.addEventListener('change', async () => {
+                    const file = chapterFile.files[0];
+                    chapterFile.value = '';
+                    if (!file) return;
+                    const gen = this.loadGen;
+                    try {
+                        if (file.size > 1024 * 1024) throw new Error('Chapter files must be 1 MB or smaller.');
+                        const cues = parseSubtitleFile(await file.text());
+                        if (gen !== this.loadGen || this.closed) return;
+                        if (!cues.length) throw new Error('No chapter timestamps found.');
+                        this.addChapters(cues.map(c => ({ start: c.start, title: c.text.replace(/\s+/g, ' ') })));
+                        this.refreshPopover();
+                        this.announce(`Loaded ${cues.length} chapters`, 'check');
+                    } catch (error) { this.announce(error.message, 'warn'); }
+                });
+                click('tl-stats', () => {
+                    this.saveSettings({ showStats: !this.settings.showStats });
+                    this.closePopover(true);
+                });
+                click('tl-save-local', () => this.saveLocalCopy?.());
                 click('tl-a', () => this.setLoopPoint('a'));
                 click('tl-b', () => this.setLoopPoint('b'));
                 click('tl-clear', () => this.clearLoop());
@@ -6591,6 +6649,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 active = null;
                 release();
                 active = entry;
+                player.saveLocalCopy = () => downloadBlob(player.shadow, entry.file, entry.file.name).catch(showError);
                 index = i;
                 playlist.selectedIndex = i;
                 prompt.hidden = true;
@@ -6778,7 +6837,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 exportUi.updateDownloadButton();
                 port.onMessage.addListener(msg => {
                     if (exportUi.exportState !== st) return;
-                    if (msg.type === 'EXPORT_BEGIN' && msg.fileIndex === 0 &&
+                    if (msg.type === 'EXPORT_BEGIN' && msg.fileIndex === 0 && msg.format !== 'original' &&
                         ['ts', 'aac', 'fmp4'].includes(msg.container) && window.VelostreamMux) {
                         st.toMp4 = true;
                         st.outName = msg.filename.replace(/\.[^.]+$/, '.mp4');

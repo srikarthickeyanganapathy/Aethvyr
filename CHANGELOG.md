@@ -5,6 +5,12 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.6.0] - 2026-11-24
+
+- Added local playback in the Velostream overlay with playlists, sidecar subtitles, and Chromium file resume where supported.
+- Added resumable exports, Offline / Cached downloads, cached clip export, and a paused prefetch budget.
+- Reject non-media downloads, preserve the chosen export format, and improve seek previews and chapter navigation.
+
 ## [2.5.0] - 2026-11-20
 
 - Added separate Anime, Donghua, Cartoons and Other Videos shelves with website filtering and local category corrections.

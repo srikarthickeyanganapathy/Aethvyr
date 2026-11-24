@@ -104,7 +104,9 @@ function buildTarget(browser, shaka) {
 
     const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-    manifest.version = pkg.version;
+    if (manifest.version !== pkg.version) {
+        throw new Error('manifest.json and package.json must have the same release version.');
+    }
 
     if (browser === 'firefox') {
         manifest.permissions = manifest.permissions.filter(p => p !== 'declarativeNetRequestWithHostAccess');

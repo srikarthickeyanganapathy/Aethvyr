@@ -15,7 +15,7 @@
 
 import '../common/shared.js';
 import { BufferManager, sweepOrphans } from './buffer-manager.js';
-import { SegmentDownloader, sniffMedia } from './downloader.js';
+import { SegmentDownloader, exportMediaType } from './downloader.js';
 import { checkpoint, downloadStore, validateExportRange } from './download-store.js';
 import { ABRController } from './abr-controller.js';
 import { parsePlaylist, ivForSegment, decryptAes128 } from './hls-parser.js';
@@ -1522,14 +1522,15 @@ async function runExport(session, opts = {}, saved = null) {
     session.exportJob = { id: jobId, controller };
     activeExports.add(jobId);
     const signal = controller.signal;
-    const post = m => session.post({ ...m, jobId });
+    const format = saved?.format ?? (opts.format === 'original' ? 'original' : undefined);
+    const post = m => session.post({ ...m, jobId, format });
     let job = saved;
     try {
         const base = saved?.base || fileBaseName(session.stream);
         const progressive = session.stream.type === 'progressive';
         const parts = saved?.parts || exportParts(session, opts, base);
         if (!job && !opts.clip) {
-            job = { id: jobId, stream: session.stream, tabId: session.tabId, base, parts,
+            job = { id: jobId, stream: session.stream, tabId: session.tabId, base, parts, format,
                 totalSegments: parts.reduce((count, part) => count + part.segs.length, 0),
                 qualityUrl: parts[0]?.url || session.stream.url,
                 bytes: 0, completedCount: 0, byteOffset: 0, status: 'paused' };
@@ -1592,10 +1593,8 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
         throw new Error('This stream uses SAMPLE-AES/DRM encryption and cannot be exported.');
     }
     const isFmp4 = segs.some(s => s.map);
-    const firstPath = (() => { try { return new URL(segs[0].uri).pathname; } catch (_) { return ''; } })();
     let ext = isFmp4 ? (playlist.role === 'audio' ? 'm4a' : 'mp4') : 'ts';
     let mime = isFmp4 ? (playlist.role === 'audio' ? 'audio/mp4' : 'video/mp4') : 'video/mp2t';
-    if (!isFmp4 && /\.aac$/i.test(firstPath)) { ext = 'aac'; mime = 'audio/aac'; }
     if (playlist.ext) { ext = playlist.ext; mime = playlist.mime || mime; } // DASH: the player knows the container
     const webm = /^web/.test(ext);
 
@@ -1607,7 +1606,6 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
         return keyCache.get(uri);
     };
 
-    post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime, container: /^web/.test(ext) ? 'webm' : isFmp4 ? 'fmp4' : (ext === 'aac' ? 'aac' : 'ts'), role: playlist.role || 'main' });
     let lastMap = null;
     const LOOKAHEAD = 4;
     const pending = new Map();
@@ -1621,14 +1619,24 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
             if (seg.key && seg.key.method === 'AES-128') {
                 data = await decryptAes128(data, await getKey(seg.key.uri), ivForSegment(seg));
             }
-            const sniff = webm ? null : sniffMedia(data);
-            return { data: sniff && sniff.offset ? data.slice(sniff.offset) : data };
+            const media = exportMediaType(data, { webmFragment: webm });
+            if (!media) throw new Error('The server returned a non-media segment. Refresh the source before downloading.');
+            return { data: media.offset ? data.slice(media.offset) : data };
         }).then(chunk => chunk.data);
         p.catch(() => { }); // awaited in order below; avoid unhandled rejections past a failure
         pending.set(i, p);
     };
     let bytes = 0;
     try {
+        startFetch(0);
+        const firstMedia = exportMediaType(await pending.get(0), { webmFragment: webm });
+        if (!firstMedia) throw new Error('The cached segment does not contain media. Delete the cached download and try again.');
+        if (!playlist.ext && !isFmp4) {
+            ({ mime } = firstMedia);
+            ext = mime === 'audio/aac' ? 'aac' : mime === 'video/mp4' ? 'mp4' : 'ts';
+        }
+        post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime,
+            container: webm ? 'webm' : isFmp4 || ext === 'mp4' ? 'fmp4' : ext, role: playlist.role || 'main' });
         for (let i = 0; i < segs.length; i++) {
             for (let k = i; k < i + LOOKAHEAD; k++) startFetch(k);
             if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -1639,13 +1647,19 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
                     const data = await session.downloader.fetchForExport({
                         uri: seg.map.uri, range: range ? `bytes=${range.offset}-${range.offset + range.length - 1}` : null
                     }, signal, { cacheOnly, keepOriginal: webm });
+                    const media = exportMediaType(data, { webmFragment: webm });
+                    if (!media) throw new Error('The source returned an invalid initialization segment.');
                     return { data };
                 });
+                if (!exportMediaType(initData, { webmFragment: webm })) throw new Error('The cached initialization segment does not contain media.');
                 await sendExportChunk(session, post, { fileIndex, kind: 'init', data: S.packBinary(initData) }, signal);
                 bytes += initData.byteLength;
                 lastMap = seg.map;
             }
             const data = await pending.get(i);
+            if (exportMediaType(data, { webmFragment: webm })?.mime !== firstMedia.mime) {
+                throw new Error('The source changed media format or returned an invalid segment.');
+            }
             pending.delete(i);
             bytes += data.byteLength;
             await sendExportChunk(session, post, { fileIndex, kind: 'seg', start: seg.start || 0, end: (seg.start || 0) + (seg.duration || 0), url: seg.uri, data: S.packBinary(data) }, signal);
@@ -1662,11 +1676,6 @@ async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fi
 async function exportProgressive(session, post, signal, name, checkpointId) {
     const url = session.stream.url;
     const CHUNK = 4 * 1024 * 1024;
-    let ext = 'mp4';
-    const m = /\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(url);
-    if (m) ext = m[1].toLowerCase();
-    const mime = { webm: 'video/webm', mkv: 'video/x-matroska', mov: 'video/quicktime', ogv: 'video/ogg' }[ext] || 'video/mp4';
-    post({ type: 'EXPORT_BEGIN', fileIndex: 0, fileCount: 1, filename: `${name}.${ext}`, mime });
     let offset = 0;
     let total;
     let validator;
@@ -1676,11 +1685,25 @@ async function exportProgressive(session, post, signal, name, checkpointId) {
             if (validator) headers['If-Range'] = validator;
             const res = await session.downloader.fetchProgressiveRange(url, headers, signal);
             const reportedTotal = validateExportRange(res, offset, CHUNK, total);
+            if ((offset > 0 && /^(?:text\/(?:html|xml)|application\/(?:json|xml))\b/i.test(res.headers['content-type'] || '')) ||
+                (offset === 0 && exportMediaType(res.data)?.offset !== 0)) {
+                throw new Error('The source returned a page or unsupported data instead of a media file.');
+            }
             const etag = res.headers.etag;
             const identity = etag && !etag.startsWith('W/') ? etag : res.headers['last-modified'];
             if (validator && validator !== identity) throw new Error('The source file changed during export.');
             return { data: res.data, offset, total: reportedTotal, validator: identity };
         });
+        if (offset === 0) {
+            const media = exportMediaType(chunk.data);
+            if (media?.offset !== 0) throw new Error('The cached response does not contain media. Delete that download and try again.');
+            const ext = {
+                'video/webm': /\.mkv$/i.test(new URL(url).pathname) ? 'mkv' : 'webm',
+                'video/mp4': /\.mov$/i.test(new URL(url).pathname) ? 'mov' : 'mp4',
+                'video/mp2t': 'ts', 'audio/aac': 'aac', 'video/ogg': 'ogv', 'video/x-msvideo': 'avi'
+            }[media.mime];
+            post({ type: 'EXPORT_BEGIN', fileIndex: 0, fileCount: 1, filename: `${name}.${ext}`, mime: media.mime });
+        }
         total = chunk.total;
         validator ||= chunk.validator;
         await sendExportChunk(session, post, { fileIndex: 0, data: S.packBinary(chunk.data) }, signal);
@@ -1937,7 +1960,7 @@ api.runtime.onConnect.addListener((port) => {
                         session.post({ type: 'EXPORT_ERROR', error: 'This DASH stream cannot be saved.' });
                         break;
                     }
-                    runExport(session, { dash: parts, clip: !!msg.clip });
+                    runExport(session, { dash: parts, clip: !!msg.clip, format: msg.format });
                     break;
                 }
                 const clip = msg.clip && Number.isFinite(+msg.clip.start) && Number.isFinite(+msg.clip.end) && +msg.clip.end > +msg.clip.start
@@ -1946,7 +1969,7 @@ api.runtime.onConnect.addListener((port) => {
                     session.post({ type: 'EXPORT_ERROR', error: 'A–B clips can be saved from HLS streams only.' });
                     break;
                 }
-                runExport(session, clip ? { clip } : {});
+                runExport(session, { clip, format: msg.format });
                 break;
             }
             case 'RECORD_START':
@@ -1962,7 +1985,7 @@ api.runtime.onConnect.addListener((port) => {
                 }
                 session.recording = null;
                 session.persistState({ soon: true });
-                runExport(session, { recording: rec });
+                runExport(session, { recording: rec, format: msg.format });
                 break;
             }
             case 'EXPORT_ACK':

@@ -625,3 +625,8 @@ button.local-control, summary.local-control, a.local-control, select.local-contr
 .local-playlist { color: inherit; max-width: min(24vw, 240px); }
 .local-playlist[hidden] { display: none; }
 .root.is-dropping { outline: 2px dashed var(--fs-accent); outline-offset: -5px; }
+
+/* Keep playback actions in the dock. Secondary shortcuts remain in Studio → Tools. */
+.root:not([data-density="pro"]) .capsule-right :is(.btn-lock, .btn-info, .btn-audio-only, .btn-mini) { display: none; }
+.tip { z-index: 4; }
+.tip-thumb canvas { display: block; max-width: 100%; height: auto; }

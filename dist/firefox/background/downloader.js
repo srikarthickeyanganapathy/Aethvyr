@@ -163,6 +163,20 @@ export function sniffMedia(buf) {
     return null;
 }
 
+/** Container bytes are authoritative. Authentication pages and manifests can return HTTP 200. */
+export function exportMediaType(data, { webmFragment = false } = {}) {
+    const u = asBytes(data);
+    if (!u?.length) return null;
+    const four = (offset, name) => [...name].every((ch, i) => u[offset + i] === ch.charCodeAt(0));
+    if (u[0] === 0x1a && u[1] === 0x45 && u[2] === 0xdf && u[3] === 0xa3) return { mime: 'video/webm', offset: 0 };
+    if (webmFragment && u[0] === 0x1f && u[1] === 0x43 && u[2] === 0xb6 && u[3] === 0x75) return { mime: 'video/webm', offset: 0 };
+    if (four(0, 'OggS')) return { mime: 'video/ogg', offset: 0 };
+    if (four(0, 'RIFF') && four(8, 'AVI ')) return { mime: 'video/x-msvideo', offset: 0 };
+    const sniff = sniffMedia(data);
+    if (sniff && /^(?:video\/(?:mp4|mp2t)|audio\/aac)$/.test(sniff.mime)) return sniff;
+    return null;
+}
+
 /** Trim junk in front of a (plaintext) segment and report its real container. */
 export function normalizeSegment(data, mime) {
     const sniff = sniffMedia(data);
