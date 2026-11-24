@@ -42,6 +42,8 @@
                     <li><a href="#favorites" data-view="favorites"><span>Favorites</span><span class="count num" data-count="favorites">0</span></a></li>
                     <li><a href="#collections" data-view="collections"><span>Collections</span><span class="count num" data-count="collections">0</span></a></li>
                     <li><a href="#bookmarked" data-view="bookmarked"><span>Bookmarked</span><span class="count num" data-count="bookmarked">0</span></a></li>
+                    <li><a href="#local" data-view="local">Local files</a></li>
+                    <li><a href="#offline" data-view="offline">Offline / Cached</a></li>
                 </ul>
             </nav>
 
@@ -79,8 +81,6 @@
                 <div id="view"></div>
             </main>
         </div>
-        <section aria-labelledby="local-heading"><h2 id="local-heading">Local files</h2><ul id="local-files"></ul></section>
-        <section aria-labelledby="vault-heading"><h2 id="vault-heading">Offline / Cached</h2><ul id="vault-files"></ul></section>
         <footer class="foot muted"><span id="version" class="num"></span> · <span id="sync-footer">Your library is stored on this device.</span></footer>
     </div>
 
@@ -106,8 +106,6 @@
 
     <script src="../common/shared.js"></script>
     <script src="../common/local-files.js"></script>
-    <script src="js/local-library.js"></script>
-    <script src="js/vault-library.js"></script>
     <script src="js/library.js"></script>
 </body>
 

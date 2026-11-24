@@ -1066,6 +1066,7 @@
             this.variantsSig = '';
             this.lastVariantsSentAt = 0;
             this.loop = { a: null, b: null };
+            this.clip = { start: null, end: null };
             this.bookmarks = [];
             this.filters = { ...DEFAULT_FILTERS };
             this.xf = { zoom: 1, panX: 0, panY: 0, rotate: 0, flip: false };
@@ -4028,11 +4029,31 @@
             this.refreshPopover();
         }
 
-        /** A–B loop range as a clip (player time), or null when it can't be saved as one. */
+        supportsClip() {
+            return this.stream && !this.isLive() && ['hls', 'dash'].includes(this.stream.type);
+        }
+
         clipRange() {
-            const { a, b } = this.loop;
-            if (a == null || b == null || b - a < 0.5 || this.isLive() || !this.stream || !['hls', 'dash'].includes(this.stream.type)) return null;
-            return { start: a, end: b };
+            const { start, end } = this.clip;
+            return this.supportsClip() && start != null && end != null ? { start, end } : null;
+        }
+
+        setClipPoint(point) {
+            const time = this.video.currentTime;
+            if (!this.supportsClip() || !Number.isFinite(time)) return;
+            if (point === 'start') {
+                this.clip.start = time;
+                if (this.clip.end != null && this.clip.end - time < 0.5) this.clip.end = null;
+            } else {
+                if (this.clip.start == null || time - this.clip.start < 0.5) {
+                    this.announce('Set In at least half a second before Out.', 'warn');
+                    return;
+                }
+                this.clip.end = time;
+            }
+            this.announce(`Clip ${point === 'start' ? 'In' : 'Out'} set at ${fmtTime(time)}`, 'check');
+            this.renderMarks();
+            this.refreshPopover();
         }
 
         /**
@@ -4163,6 +4184,7 @@
                 if (!st.sink) { this.exportState = null; this.announce('Download cancelled', 'download'); this.refreshPopover(); return; }
                 st.outName = st.sink.filename;
             }
+            st.isClip = !!clip;
             if (dash) {
                 if (!toMp4 && dashPlan.parts.length > 1) this.announce('WebM stream: saving the original video and audio files', 'download');
                 this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts }, clip: !!clip });
@@ -4912,6 +4934,9 @@
             for (const b of this.bookmarks) html += `<div class="mark" style="left:${pos(b.t)}%"></div>`;
             if (this.loop.a != null) html += `<div class="mark" style="left:${pos(this.loop.a)}%"></div>`;
             if (this.loop.b != null) html += `<div class="mark" style="left:${pos(this.loop.b)}%"></div>`;
+            for (const t of [this.clip.start, this.clip.end]) {
+                if (t != null) html += `<div class="mark clip-mark" style="left:${pos(t)}%"></div>`;
+            }
             setHTML(this.$('.marks'), html);
             // Chapters scrubber: cut a 3 px gap into the bar at every chapter start.
             const track = this.$('.track');
@@ -5723,6 +5748,7 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
             // Per-stream state starts over.
             this.loop = { a: null, b: null };
+            this.clip = { start: null, end: null };
             this.chapters = [];
             this.imageTrackId = undefined;
             this.thumbKey = null;
@@ -5781,6 +5807,7 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             const ahead = st.cachedAhead != null ? fmtTime(st.cachedAhead) : '—';
             const workers = clamp(Math.round(Number(s.maxWorkers) || 4), 2, 8);
             return `<div class="section-label">Buffer &amp; network</div>
+${this.selectField('bf-paused-limit', 'Prefetch while paused', withCurrentOption([[0, 'Off'], [128, '128 MB'], [256, '256 MB'], [512, '512 MB'], [1024, '1 GB']], s.pausedBufferMB, v => `${v} MB`), s.pausedBufferMB)}
 ${this.selectField('bf-window', 'Pre-buffer window', withCurrentOption(PREBUFFER_WINDOWS, s.maxBufferSec, v => `${v >= 60 && v % 60 === 0 ? `${v / 60} min` : `${v} s`} (custom)`), s.maxBufferSec ?? 86400)}
 ${this.rangeField('bf-ahead', 'RAM buffer ahead', 15, 180, 5, s.mseBufferAhead, `${s.mseBufferAhead} s`)}
 ${this.rangeField('bf-behind', 'Back-buffer kept', 10, 180, 5, s.mseBufferBehind, `${s.mseBufferBehind} s`)}
@@ -5910,7 +5937,7 @@ ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead
             }
             html += '<div role="menu" aria-label="Download">';
             if (st && st.running) {
-                html += this.row({ id: 'tl-cancel', label: 'Cancel', role: 'menuitem', lead: 'stop' });
+                html += this.row({ id: 'tl-cancel', label: st.isClip ? 'Cancel clip export' : 'Pause download', role: 'menuitem', lead: 'stop' });
             } else if (live) {
                 html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
                 html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
@@ -5918,11 +5945,19 @@ ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead
                 const dash = this.stream.type === 'dash';
                 let dashWebm = false;
                 if (dash) { try { const a = this.player.getVariantTracks().find(t => t.active); dashWebm = !!a && /webm/i.test(a.mimeType || ''); } catch (_) { /* not loaded */ } }
-                const clip = this.clipRange();
-                if (clip) html += this.row({ id: 'tl-export-clip', label: dashWebm ? 'Save A–B clip (WebM originals)' : dash || (this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save A–B clip (.mp4)' : 'Save A–B clip segments', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
                 html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? 'Save as .mp4' : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
             }
             html += '</div>';
+            if (this.supportsClip()) {
+                const { start, end } = this.clip;
+                html += `<div class="section-label">Clip from buffer</div><div role="menu" aria-label="Clip from buffer">
+${this.row({ id: 'tl-clip-in', label: 'Set In at playhead', meta: start == null ? '' : fmtTime(start), role: 'menuitem', lead: 'frameBack' })}
+${this.row({ id: 'tl-clip-out', label: 'Set Out at playhead', meta: end == null ? '' : fmtTime(end), role: 'menuitem', lead: 'frameFwd' })}`;
+                if (start != null) html += this.row({ id: 'tl-clip-clear', label: 'Clear clip marks', role: 'menuitem', lead: 'close' });
+                const clip = this.clipRange();
+                if (clip && !st?.running) html += this.row({ id: 'tl-export-clip', label: 'Export cached clip', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
+                html += '</div><p class="hint">Play through the range to cache it. Cuts follow segment boundaries.</p>';
+            }
             if (this.stream.type === 'dash' && !live) html += '<p class="hint">DASH saves the best quality within your quality cap, with the audio language you are listening to: MP4 streams as one .mp4, WebM (VP9) streams as the original video and audio files. DRM-protected streams cannot be saved.</p>';
             if (this.stream.type === 'hls' || live) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             const sleepMode = this.sleep ? this.sleep.mode : 0;
@@ -6190,6 +6225,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 range('bf-ahead', v => { this.saveSettings({ mseBufferAhead: v }); this.settings.mseBufferAhead = v; shakaBuf(); }, v => `${v} s`);
                 range('bf-behind', v => { this.saveSettings({ mseBufferBehind: v }); this.settings.mseBufferBehind = v; shakaBuf(); }, v => `${v} s`);
                 range('bf-workers', v => this.saveSettings({ maxWorkers: v }), v => `${v}`);
+                select('bf-paused-limit', v => this.saveSettings({ pausedBufferMB: +v }));
                 select('bf-cache', v => this.saveSettings({ cacheSizeMB: +v }));
                 sw('bf-range', v => this.saveSettings({ rangeAccel: v }));
                 sw('bf-pause', v => {
@@ -6299,6 +6335,14 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 click('tl-cancel', () => this.port.send({ type: 'EXPORT_CANCEL' }));
                 click('tl-rec', () => this.onDownloadButton());
                 click('tl-export', () => this.startExport());
+                click('tl-clip-in', () => this.setClipPoint('start'));
+                click('tl-clip-out', () => this.setClipPoint('end'));
+                click('tl-clip-clear', () => {
+                    this.clip = { start: null, end: null };
+                    this.renderMarks();
+                    this.refreshPopover();
+                    this.announce('Clip marks cleared', 'check');
+                });
                 click('tl-export-clip', () => { const clip = this.clipRange(); if (clip) this.startExport({ clip }); });
                 select('tl-format', v => { this.saveSettings({ exportFormat: v }); this.refreshPopover(); });
                 each('[data-sleep]', el => { const m = el.dataset.sleep; this.setSleep(m === 'eov' ? 'eov' : +m); });
@@ -6411,6 +6455,18 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         }))).flat();
     }
 
+    function applyStandaloneAppearance(root) {
+        const S = globalThis.VelostreamShared;
+        extApi.storage.local.get(S.SETTINGS_KEY).then(result => {
+            const settings = S.mergeSettings(result[S.SETTINGS_KEY]);
+            const accent = S.ACCENTS[settings.theme];
+            root.style.setProperty('--player-accent', accent.fill);
+            root.style.setProperty('--player-accent-strong', accent.strong);
+            root.style.setProperty('--player-ui-scale', settings.uiScale);
+            root.classList.toggle('high-contrast', settings.highContrast);
+        }).catch(() => {});
+    }
+
     function mountLocalPlayer(resumeId) {
         const store = globalThis.VelostreamLocal;
         const subtitle = /\.(srt|vtt|ass|ssa)$/i;
@@ -6418,8 +6474,19 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         const sort = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
         const root = document.createElement('main');
         root.className = 'local-player';
-        setHTML(root, '<header><button type="button" data-open>Open Local File</button> <button type="button" data-folder>Open Folder</button> <input type="file" multiple hidden accept="video/*,.mkv,.srt,.vtt,.ass,.ssa"> <select aria-label="Playlist" hidden></select></header><video controls playsinline></video><p role="status">Drop videos, folders, or subtitles anywhere.</p>');
+        setHTML(root, `<header class="local-toolbar">
+          <div class="local-heading"><h1>Local player</h1><a class="local-control" href="../popup/library.html#local">Library</a></div>
+          <div class="local-actions">
+            <button class="local-control primary" type="button" data-open>Open Local File</button>
+            <button class="local-control" type="button" data-folder>Open Folder</button>
+            <input type="file" multiple hidden accept="video/*,.mkv,.srt,.vtt,.ass,.ssa">
+            <select class="local-control" aria-label="Playlist" hidden></select>
+          </div>
+        </header>
+        <div class="local-stage"><video controls playsinline></video><span class="local-drop-label" aria-hidden="true">Drop to open</span></div>
+        <p class="local-status" role="status">Drop videos, folders, or subtitles anywhere.</p>`);
         document.body.append(root);
+        applyStandaloneAppearance(root);
         const video = root.querySelector('video');
         const audio = new AudioFx(video);
         const header = root.querySelector('header');
@@ -6436,7 +6503,13 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         const gainValue = document.createElement('output');
         gainValue.textContent = '100%';
         gain.append('Audio boost ', boost, ' ', gainValue);
-        header.append(loudness, gain);
+        const sound = document.createElement('details');
+        sound.className = 'local-audio';
+        const soundLabel = document.createElement('summary');
+        soundLabel.className = 'local-control';
+        soundLabel.textContent = 'Audio controls';
+        sound.append(soundLabel, loudness, gain);
+        header.append(sound);
         const applyAudio = () => {
             gainValue.textContent = boost.value + '%';
             if ((audio.active || normalize.checked || +boost.value > 100) && audio.ensure()) {
@@ -6613,8 +6686,9 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             const savedEntry = store.get(resumeId).catch(() => null);
             const resume = document.createElement('button');
             resume.type = 'button';
+            resume.className = 'local-control primary';
             resume.textContent = 'Resume Local File';
-            root.querySelector('header').prepend(resume);
+            root.querySelector('.local-actions').prepend(resume);
             resume.onclick = async () => {
                 const current = ++selection;
                 try {
@@ -6632,12 +6706,22 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
 
     function mountVaultExport(id) {
         const root = document.createElement('main');
-        root.className = 'local-player';
-        setHTML(root, '<header><button type="button" data-resume>Resume / Export</button> <button type="button" data-pause disabled>Pause</button> <a href="../popup/library.html">Library</a></header><p role="status">Ready to open the cached download.</p>');
+        root.className = 'local-player vault-player';
+        setHTML(root, `<section class="vault-panel" aria-labelledby="vault-title">
+          <header class="local-heading"><h1 id="vault-title">Offline download</h1><a class="local-control" href="../popup/library.html#offline">Offline / Cached</a></header>
+          <p class="local-status" role="status">Ready to open the cached download.</p>
+          <progress aria-label="Download progress" max="100" hidden></progress>
+          <div class="local-actions">
+            <button class="local-control primary" type="button" data-resume>Resume / Export</button>
+            <button class="local-control" type="button" data-pause disabled>Pause</button>
+          </div>
+        </section>`);
         document.body.append(root);
+        applyStandaloneAppearance(root);
         const start = root.querySelector('[data-resume]');
         const pause = root.querySelector('[data-pause]');
         const status = root.querySelector('[role="status"]');
+        const progress = root.querySelector('progress');
         let port;
         const exportUi = Object.create(VelostreamPlayer.prototype);
         Object.assign(exportUi, {
@@ -6647,9 +6731,12 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             announceOnly() {},
             updateDownloadButton() {
                 const state = this.exportState;
-                status.textContent = state.status || 'Preparing download…';
+                status.textContent = state.pausing && state.running ? 'Pausing…' : state.status || 'Preparing download…';
                 start.disabled = state.running;
-                pause.disabled = !state.running;
+                pause.disabled = !state.running || !!state.pausing;
+                progress.hidden = !state.running && state.status !== 'Saved';
+                if (state.pct || !state.running) progress.value = state.pct;
+                else progress.removeAttribute('value');
                 if (!state.running) { port?.disconnect(); port = null; }
             }
         });
@@ -6686,7 +6773,9 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         };
         pause.onclick = () => {
             exportUi.port.send({ type: 'EXPORT_CANCEL' });
+            exportUi.exportState.pausing = true;
             pause.disabled = true;
+            status.textContent = 'Pausing…';
         };
         window.addEventListener('pagehide', () => port?.disconnect());
     }

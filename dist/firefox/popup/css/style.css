@@ -248,3 +248,5 @@ select, option { color-scheme: dark; background: #1c1c1e; color: #fff; }
 
 .popup-panel .frame { max-inline-size: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .popup-panel .empty p { margin: 0 0 var(--space-2); }
+
+.field input[type="number"] { width: 7ch; min-height: 44px; padding: 0 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--text); font: inherit; }

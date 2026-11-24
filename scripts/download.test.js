@@ -114,3 +114,18 @@ test('pausing an export stops waiting without aborting playback prefetch', async
     finish({ data: bytes(5) });
     assert.deepEqual((await prefetch).data, bytes(5));
 });
+
+test('paused prefetch stops at the disk budget and resumes after playback starts', () => {
+    const mb = 1024 * 1024;
+    const buffer = { capBytes: 4 * mb, currentSize: mb - 1, reserved: 1 };
+    const downloader = new SegmentDownloader({ buffer, getSettings: () => ({ pausedBufferMB: 1 }) });
+    downloader._bufferReady = true;
+    let starts = 0;
+    downloader._buildQueue = () => [{ key: 'test' }];
+    downloader._startPrefetch = () => { starts++; };
+    downloader._pump();
+    assert.equal(starts, 0);
+    downloader.playback.paused = false;
+    downloader._pump();
+    assert.equal(starts, 1);
+});

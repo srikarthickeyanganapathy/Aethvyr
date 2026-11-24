@@ -1549,7 +1549,7 @@ async function runExport(session, opts = {}, saved = null) {
         }
         post({ type: 'EXPORT_COMPLETE' });
     } catch (err) {
-        post({ type: 'EXPORT_ERROR', error: err.name === 'AbortError' ? 'Export paused' : String(err.message || err) });
+        post({ type: 'EXPORT_ERROR', error: err.name === 'AbortError' ? (opts.clip ? 'Clip export cancelled' : 'Download paused. Resume from Offline / Cached.') : String(err.message || err) });
     } finally {
         controller.abort();
         activeExports.delete(jobId);
@@ -2248,7 +2248,7 @@ function respondAsync(promise, sendResponse) {
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.action !== 'string') return false;
     if (message.action === 'VAULT_LIST' || message.action === 'VAULT_DELETE') {
-        if (sender.url !== api.runtime.getURL('popup/library.html')) return false;
+        if (sender.url?.split('#', 1)[0] !== api.runtime.getURL('popup/library.html')) return false;
         if (message.action === 'VAULT_LIST') return respondAsync(downloadStore.list().then(jobs => ({
             ok: true, jobs: jobs.map(job => ({
                 id: job.id, name: job.base, bytes: job.bytes, total: job.totalSegments,
