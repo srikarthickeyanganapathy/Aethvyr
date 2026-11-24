@@ -186,14 +186,24 @@ function concatBuffers(buffers) {
 
 function sleep(ms, signal) {
     return new Promise((resolve, reject) => {
-        const t = setTimeout(resolve, ms);
-        if (signal) {
-            signal.addEventListener('abort', () => {
-                clearTimeout(t);
-                reject(new DOMException('Aborted', 'AbortError'));
-            }, { once: true });
-        }
+        const abort = () => {
+            clearTimeout(timer);
+            reject(new DOMException('Aborted', 'AbortError'));
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', abort);
+            resolve();
+        }, ms);
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
     });
+}
+
+function matchesRange(response, start, end) {
+    const value = response.headers['content-range'];
+    const match = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/i.exec(value || '');
+    return response.status === 206 && response.data?.byteLength === end - start + 1 &&
+        (!value || (match && +match[1] === start && +match[2] === end));
 }
 
 function isRetryable(err) {
@@ -701,6 +711,10 @@ export class SegmentDownloader {
                     if (zeroCopy) return cachedReply();
                 }
             }
+            if (kind === 'key' && method === 'GET' && res.data?.byteLength === 16 &&
+                generation === this.generation && !this.destroyed) {
+                await this.buffer.storeSegment('key:' + url, res.data).catch(() => {});
+            }
             if ((kind === 'manifest') && res.data && res.status < 400) {
                 try {
                     const text = new TextDecoder().decode(res.data);
@@ -870,10 +884,16 @@ export class SegmentDownloader {
         while (this.failures.size > FAIL_TRACK_MAX) this.failures.delete(this.failures.keys().next().value);
     }
 
+    _pausedCacheLimit() {
+        return this.playback.paused ? Math.min(this.buffer.capBytes, this.getSettings().pausedBufferMB * 1024 * 1024) : undefined;
+    }
+
     _pump() {
         if (this.paused || this.destroyed) return;
         // Wait for the cache key set (re-pumps when ready) or we would refetch cached segments.
         if (!this._bufferReady) { this._bufferInitPromise(); return; }
+        const limit = this._pausedCacheLimit();
+        if (limit != null && this.buffer.currentSize + this.buffer.reserved >= limit) return;
         this.queue = this._buildQueue();
         const slots = Math.max(0, this.concurrency - this.activePrefetch - this.activeOnDemand);
         for (let i = 0; i < slots && this.queue.length; i++) {
@@ -903,7 +923,7 @@ export class SegmentDownloader {
                     generation === this.generation && !this.destroyed) {
                     // Encrypted segments are cached byte-exact (sniffing ciphertext corrupts it).
                     const norm = this._normalize(task.key, res.data, res.headers['content-type']);
-                    const stored = await this.buffer.storeSegment(task.key, norm.data, norm.mime).catch(err => {
+                    const stored = await this.buffer.storeSegment(task.key, norm.data, norm.mime, this._pausedCacheLimit()).catch(err => {
                         console.warn('[Downloader] Cache store failed:', err && err.message);
                         return false;
                     });
@@ -953,7 +973,7 @@ export class SegmentDownloader {
         for (let o = start; o <= end; o += size) {
             const e = Math.min(end, o + size - 1);
             jobs.push(this._timedRange(url, o, e, signal, timing).then(r => {
-                if (r.status !== 206 || !r.data || r.data.byteLength !== e - o + 1) {
+                if (!matchesRange(r, o, e)) {
                     const err = new Error(`Range ${o}-${e} failed (HTTP ${r.status})`);
                     err.status = r.status;
                     // 200 = Range ignored, 206 with the wrong length = Range mis-honoured,
@@ -1202,19 +1222,36 @@ export class SegmentDownloader {
      *  - without it, the ciphertext is returned byte-exact and the caller must decrypt and then
      *    call stripMediaPrefix(plaintext) itself.
      */
+    async fetchExportKey(url, signal, cacheOnly) {
+        const cached = await this.buffer.getSegment('key:' + url, { markServed: false }).catch(() => null);
+        if (cached?.data?.byteLength === 16) return cached.data;
+        if (cacheOnly) throw new Error('The encryption key for this clip is no longer cached.');
+        const res = await this._fetchWithRetry(url, { method: 'GET', headers: {} }, signal, false);
+        if (res.data.byteLength !== 16) throw new Error('Could not load AES-128 key.');
+        return res.data;
+    }
+
     async fetchForExport(seg, signal, opts = {}) {
         const key = segmentKey(seg.uri, seg.range);
         const encrypted = isEncryptedSegment(seg);
         let cached = await this.buffer.getSegment(key, { markServed: false }).catch(() => null);
         // A copy an older build trimmed (sniffed ciphertext): AES-CBC needs whole 16-byte blocks.
         if (cached && encrypted && seg.key.method === 'AES-128' && (!cached.data || cached.data.byteLength % 16 !== 0)) cached = null;
-        let data = cached ? cached.data
-            : (await this._fetchWithRetry(seg.uri, { method: 'GET', headers: seg.range ? { Range: seg.range } : {} }, signal, false, true)).data;
+        if (!cached && opts.cacheOnly) throw new Error("Part of this clip is no longer cached. Play through the range and try again.");
+        let data = cached?.data;
+        if (!data) {
+            const response = await this._fetchWithRetry(seg.uri, { method: 'GET', headers: seg.range ? { Range: seg.range } : {} }, signal, false, true);
+            const range = /^bytes=(\d+)-(\d+)$/.exec(seg.range || '');
+            if (range && !matchesRange(response, +range[1], +range[2])) {
+                throw new Error(`The source returned the wrong segment byte range (${seg.range}).`);
+            }
+            data = response.data;
+        }
         if (encrypted) {
             if (typeof opts.decrypt !== 'function') return data;
             data = await opts.decrypt(data, seg);
         }
         // Exported files must not contain the fake image headers some CDNs prepend.
-        return stripMediaPrefix(data);
+        return opts.keepOriginal ? data : stripMediaPrefix(data);
     }
 }

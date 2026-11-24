@@ -105,6 +105,7 @@
         },
         // Engine: pre-buffer the whole video in the background (bounded by the cache size)
         maxBufferSec: 86400,         // seconds ahead to pre-download; 86400 = whole video
+        pausedBufferMB: 256,         // IndexedDB prefetch limit while paused, 0 disables
         cacheSizeMB: 2048,           // IndexedDB ring buffer per tab
         maxWorkers: 6,               // parallel segment downloads (2-8)
         rangeAccel: true,            // split large downloads into parallel Range sub-requests
@@ -241,6 +242,7 @@
         // Any other value inside the 32-8192 clamp is kept as is (the UIs show it as a custom option).
         if (LEGACY_CACHE_MB[out.cacheSizeMB]) out.cacheSizeMB = LEGACY_CACHE_MB[out.cacheSizeMB];
         out.cacheSizeMB = Math.min(8192, Math.max(32, out.cacheSizeMB));
+        out.pausedBufferMB = Math.min(8192, Math.max(0, out.pausedBufferMB));
         out.memory.volume = Math.min(1, Math.max(0, out.memory.volume));
         out.autoSites = out.autoSites.filter(h => typeof h === 'string' && h.length < 256).slice(0, 500);
         out.audio.boost = Math.min(300, Math.max(100, out.audio.boost));

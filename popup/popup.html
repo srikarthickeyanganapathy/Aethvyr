@@ -48,6 +48,9 @@
             </div>
         </section>
         <span id="stat-active" class="sr-only">0</span>
+        <div class="btn-row">
+                <a class="btn btn-quiet small" href="../player/player.html?mode=local" target="_blank" rel="noopener">Open Local File</a>
+        </div>
 
         <section id="player-section" class="card now" hidden aria-labelledby="player-title">
             <div class="now-head">
@@ -240,6 +243,10 @@
                             <option value="1800">30 min</option>
                             <option value="86400">Whole video</option>
                         </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-pausedBufferMB">Prefetch while paused (MB)</label>
+                        <input id="s-pausedBufferMB" name="pausedBufferMB" type="number" data-type="number" min="0" max="8192" step="1">
                     </div>
                     <div class="field">
                         <label for="s-cacheSizeMB">Cache per tab</label>

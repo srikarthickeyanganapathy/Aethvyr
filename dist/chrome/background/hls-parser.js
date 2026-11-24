@@ -35,11 +35,12 @@ function resolve(uri, base) {
 }
 
 function parseByteRange(value, lastEnd) {
-    // "<length>[@<offset>]"
-    const [lenStr, offStr] = value.split('@');
-    const length = parseInt(lenStr, 10);
-    if (!Number.isFinite(length)) return null;
-    const offset = offStr !== undefined ? parseInt(offStr, 10) : (lastEnd || 0);
+    const match = /^(\d+)(?:@(\d+))?$/.exec(value);
+    if (!match) return null;
+    const length = Number(match[1]);
+    const offset = match[2] == null ? lastEnd : Number(match[2]);
+    if (!Number.isSafeInteger(length) || length <= 0 || !Number.isSafeInteger(offset) ||
+        offset < 0 || !Number.isSafeInteger(offset + length)) return null;
     return { offset, length };
 }
 
@@ -131,7 +132,6 @@ export function parseMedia(text, baseUrl) {
     let pendingDiscontinuity = false;
     let pendingPdt = null;
     let start = 0;
-    const lastRangeEnd = new Map(); // uri -> end offset (for implicit BYTERANGE offsets)
     let encrypted = false;
 
     for (let i = 0; i < lines.length; i++) {
@@ -176,7 +176,9 @@ export function parseMedia(text, baseUrl) {
                 const a = parseAttributes(line.slice(11));
                 if (a.URI) {
                     const uri = resolve(a.URI, baseUrl);
-                    map = { uri, byteRange: a.BYTERANGE ? parseByteRange(a.BYTERANGE, 0) : null };
+                    const byteRange = a.BYTERANGE ? parseByteRange(a.BYTERANGE, 0) : null;
+                    if (a.BYTERANGE && !byteRange) throw new Error('Invalid HLS initialization byte range.');
+                    map = { uri, byteRange };
                 }
             }
             continue;
@@ -187,8 +189,11 @@ export function parseMedia(text, baseUrl) {
         const uri = resolve(line, baseUrl);
         let byteRange = null;
         if (pendingRange) {
-            byteRange = parseByteRange(pendingRange, lastRangeEnd.get(uri));
-            if (byteRange) lastRangeEnd.set(uri, byteRange.offset + byteRange.length);
+            const previous = segments.at(-1);
+            const precedingEnd = previous?.uri === uri && previous.byteRange ?
+                previous.byteRange.offset + previous.byteRange.length : undefined;
+            byteRange = parseByteRange(pendingRange, precedingEnd);
+            if (!byteRange) throw new Error('Invalid HLS media byte range.');
         }
         const seq = mediaSequence + segments.length;
         // A segment preceded by EXT-X-DISCONTINUITY starts the next discontinuity number.

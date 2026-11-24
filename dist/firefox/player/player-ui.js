@@ -357,26 +357,32 @@
             // An <a download> gives no completion signal: keep the URL alive long enough.
             setTimeout(() => URL.revokeObjectURL(url), 10 * 60000);
         };
-        if (!extApi || !extApi.downloads || !extApi.downloads.download) { viaAnchor(); return Promise.resolve(); }
-        return new Promise(resolve => {
+        if (!extApi || !extApi.downloads || !extApi.downloads.download) { viaAnchor(); return Promise.resolve(false); }
+        return new Promise((resolve, reject) => {
             let id = null;
-            const done = () => {
+            const done = (error) => {
                 try { extApi.downloads.onChanged.removeListener(onChanged); } catch (_) { /* ignore */ }
                 URL.revokeObjectURL(url);
-                resolve();
+                if (error) reject(new Error(error));
+                else resolve(true);
             };
             const onChanged = (delta) => {
                 if (delta.id !== id || !delta.state) return;
-                if (delta.state.current === 'complete' || delta.state.current === 'interrupted') done();
+                if (delta.state.current === 'complete') done();
+                if (delta.state.current === 'interrupted') done('Browser download interrupted.');
             };
             extApi.downloads.onChanged.addListener(onChanged);
             Promise.resolve(extApi.downloads.download({ url, filename: name, saveAs })).then((dlId) => {
                 id = dlId;
-                if (id == null) done(); // cancelled before it started
+                if (id == null) done('Browser download cancelled.');
+                else extApi.downloads.search({ id }).then(([item]) => {
+                    if (item?.state === 'complete') done();
+                    else if (!item || item.state === 'interrupted') done('Browser download interrupted.');
+                }).catch(() => { });
             }, () => {
                 try { extApi.downloads.onChanged.removeListener(onChanged); } catch (_) { /* ignore */ }
                 viaAnchor();
-                resolve();
+                resolve(false);
             });
         });
     }
@@ -394,6 +400,7 @@
             this.mime = mime;
             this.parts = [];
             this.writable = null;
+            this.temp = null;
             this.bytes = 0;
         }
 
@@ -418,7 +425,20 @@
             return sink;
         }
 
+        async openTemporaryFile() {
+            const dir = await navigator.storage?.getDirectory?.().catch(() => null);
+            if (!dir) return;
+            const key = 'export-' + crypto.randomUUID();
+            try {
+                const handle = await dir.getFileHandle(key, { create: true });
+                if (!handle.createWritable) { await dir.removeEntry(key); return; }
+                this.writable = await handle.createWritable();
+                this.temp = { dir, key, handle };
+            } catch (_) { await dir.removeEntry(key).catch(() => {}); }
+        }
+
         async write(chunk) {
+            if (!this.writable && !this.bytes) await this.openTemporaryFile();
             this.bytes += chunk.byteLength || chunk.size || 0;
             if (!this.writable && this.bytes > 128 * 1024 * 1024) throw new Error('This browser can only save up to 128 MB per export without a file picker.');
             if (this.writable) await this.writable.write(chunk);
@@ -426,15 +446,39 @@
         }
 
         async close() {
-            if (this.writable) { await this.writable.close(); this.writable = null; return; }
+            if (this.writable) {
+                await this.writable.close();
+                this.writable = null;
+                if (this.temp) {
+                    let finished = true;
+                    try { finished = await downloadBlob(this.container, await this.temp.handle.getFile(), this.filename); }
+                    finally {
+                        if (finished) await this.removeTemporaryFile();
+                        else {
+                            const { dir, key } = this.temp;
+                            this.temp = null;
+                            setTimeout(() => dir.removeEntry(key).catch(() => {}), 10 * 60000);
+                        }
+                    }
+                }
+                return;
+            }
             const blob = new Blob(this.parts, { type: this.mime });
             this.parts = [];
             await downloadBlob(this.container, blob, this.filename);
         }
 
+        async removeTemporaryFile() {
+            if (!this.temp) return;
+            const { dir, key } = this.temp;
+            this.temp = null;
+            await dir.removeEntry(key).catch(() => {});
+        }
+
         async abort() {
             this.parts = [];
             if (this.writable) { try { await this.writable.abort(); } catch (_) { /* ignore */ } this.writable = null; }
+            await this.removeTemporaryFile();
         }
     }
 
@@ -1637,6 +1681,11 @@
             this.resetFileThumbs();
             this.clearThumbCache();
             this.stopSubsPip();
+            const exportState = this.exportState;
+            if (exportState?.running) {
+                this.port.send({ type: 'EXPORT_CANCEL' });
+                this.onExportMessage({ type: 'EXPORT_ERROR', error: 'Export paused.' });
+            }
             try { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => { }); } catch (_) { /* ignore */ }
             try { if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); } catch (_) { /* ignore */ }
             try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (_) { /* ignore */ }
@@ -1693,6 +1742,9 @@
                     if (e) { this.net.delete(msg.reqId); e.resolve(msg); }
                     break;
                 }
+                case 'ENGINE_DISCONNECTED':
+                    if (this.exportState?.running) this.onExportMessage({ type: 'EXPORT_ERROR', error: 'Export paused. Resume it from the library.' });
+                    break;
                 case 'INIT':
                     if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
                     if (this.resolveInit) { this.resolveInit(msg); this.resolveInit = null; }
@@ -4003,13 +4055,17 @@
             // stream played as VP9/WebM has only WebM left: those are saved as the original files.
             cands = cands.filter(v => v.video || v.audio);
             const mp4Only = cands.filter(v => (!v.video || isMp4(v.video)) && (!v.audio || isMp4(v.audio)));
-            const mp4 = mp4Only.length > 0;
-            if (mp4) cands = mp4Only;
+            const active = (p.getVariantTracks() || []).find(t => t.active);
+            const playing = active && cands.find(v => v.id === active.id);
+            if (clip) {
+                if (!playing) throw new Error('The active DASH quality is unavailable.');
+                cands = [playing];
+            }
+            const mp4 = clip ? (!playing.video || isMp4(playing.video)) && (!playing.audio || isMp4(playing.audio)) : mp4Only.length > 0;
+            if (mp4 && !clip) cands = mp4Only;
             const cap = this.qualityCap || Infinity;
             const capped = cands.filter(v => !v.video || (v.video.height || 0) <= cap);
             if (capped.length) cands = capped;
-            const active = (p.getVariantTracks() || []).find(t => t.active);
-            const playing = active && (m.variants || []).find(v => v.id === active.id);
             const lang = playing && playing.audio ? playing.audio.language : null;
             const sameLang = cands.filter(v => !lang || !v.audio || v.audio.language === lang);
             if (sameLang.length) cands = sameLang;
@@ -4109,7 +4165,7 @@
             }
             if (dash) {
                 if (!toMp4 && dashPlan.parts.length > 1) this.announce('WebM stream: saving the original video and audio files', 'download');
-                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts } });
+                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts }, clip: !!clip });
             } else {
                 this.port.send(clip ? { type: 'EXPORT_START', clip } : { type: 'EXPORT_START' });
             }
@@ -4140,10 +4196,14 @@
         onExportMessage(msg) {
             const st = this.exportState || (this.exportState = { running: true, files: {}, status: '', pct: 0 });
             if (!st.chain) st.chain = Promise.resolve();
-            st.chain = st.chain.then(() => this.handleExportMessage(st, msg)).catch((err) => {
+            st.chain = st.chain.then(async () => {
+                if (!st.running && msg.type !== 'EXPORT_ERROR') return;
+                await this.handleExportMessage(st, msg);
+                if (msg.sequence != null) this.port.send({ type: 'EXPORT_ACK', jobId: msg.jobId, sequence: msg.sequence });
+            }).catch((err) => {
                 console.warn('[Velostream] Export failed', err);
-                this.handleExportMessage(st, { type: 'EXPORT_ERROR', error: `Saving failed: ${(err && err.message) || err}` });
                 this.port.send({ type: 'EXPORT_CANCEL' });
+                return this.handleExportMessage(st, { type: 'EXPORT_ERROR', error: `Saving failed: ${(err && err.message) || err}` });
             });
         }
 
@@ -4151,6 +4211,7 @@
         async exportFallbackToRaw(st, err) {
             console.warn('[Velostream] MP4 remux unavailable, saving original format', err);
             st.toMp4 = false;
+            await st.muxer?.discardFragments();
             st.muxer = null;
             if (st.sink) { await st.sink.abort(); st.sink = null; }
             for (const f of Object.values(st.files)) {
@@ -4236,6 +4297,7 @@
                     for (const f of Object.values(st.files)) { if (f.sink && f.sink !== st.sink) await f.sink.abort(); }
                     if (st.sink) await st.sink.abort();
                     st.files = {};
+                    await st.muxer?.discardFragments();
                     st.muxer = null;
                     this.announce(msg.error, 'warn');
                     break;
@@ -6318,6 +6380,311 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             } catch (_) { /* partial support */ }
         }
     }
+
+    async function localFilesFromHandle(handle) {
+        if (handle.kind === 'file') return [{ file: await handle.getFile(), handle }];
+        const files = [];
+        for await (const child of handle.values()) files.push(...await localFilesFromHandle(child));
+        return files;
+    }
+
+    async function filesFromDrop(transfer) {
+        const readEntry = async entry => {
+            if (entry.isFile) return [{ file: await new Promise((ok, fail) => entry.file(ok, fail)) }];
+            const reader = entry.createReader();
+            const files = [];
+            for (;;) {
+                const entries = await new Promise((ok, fail) => reader.readEntries(ok, fail));
+                if (!entries.length) return files;
+                for (const child of entries) files.push(...await readEntry(child));
+            }
+        };
+        const items = [...transfer.items].filter(item => item.kind === 'file');
+        if (!items.length) return [...transfer.files].map(file => ({ file }));
+        return (await Promise.all(items.map(async item => {
+            const entry = item.webkitGetAsEntry?.();
+            const file = item.getAsFile();
+            const handle = await item.getAsFileSystemHandle?.().catch(() => null);
+            if (handle) return localFilesFromHandle(handle);
+            if (entry) return readEntry(entry);
+            return file ? [{ file }] : [];
+        }))).flat();
+    }
+
+    function mountLocalPlayer(resumeId) {
+        const store = globalThis.VelostreamLocal;
+        const subtitle = /\.(srt|vtt|ass|ssa)$/i;
+        const media = /\.(mp4|m4v|mkv|webm|mov|ogv|avi|mpg|mpeg|ts|m2ts)$/i;
+        const sort = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+        const root = document.createElement('main');
+        root.className = 'local-player';
+        setHTML(root, '<header><button type="button" data-open>Open Local File</button> <button type="button" data-folder>Open Folder</button> <input type="file" multiple hidden accept="video/*,.mkv,.srt,.vtt,.ass,.ssa"> <select aria-label="Playlist" hidden></select></header><video controls playsinline></video><p role="status">Drop videos, folders, or subtitles anywhere.</p>');
+        document.body.append(root);
+        const video = root.querySelector('video');
+        const audio = new AudioFx(video);
+        const header = root.querySelector('header');
+        const normalize = document.createElement('input');
+        normalize.type = 'checkbox';
+        const boost = document.createElement('input');
+        boost.type = 'range';
+        boost.min = '100';
+        boost.max = '300';
+        boost.value = '100';
+        const loudness = document.createElement('label');
+        loudness.append(normalize, ' Normalize audio');
+        const gain = document.createElement('label');
+        const gainValue = document.createElement('output');
+        gainValue.textContent = '100%';
+        gain.append('Audio boost ', boost, ' ', gainValue);
+        header.append(loudness, gain);
+        const applyAudio = () => {
+            gainValue.textContent = boost.value + '%';
+            if ((audio.active || normalize.checked || +boost.value > 100) && audio.ensure()) {
+                audio.apply({ ...window.VelostreamShared.DEFAULT_SETTINGS.audio, boost: +boost.value, loudnessNorm: normalize.checked });
+            }
+        };
+        normalize.onchange = applyAudio;
+        boost.oninput = applyAudio;
+        video.onloadeddata = applyAudio;
+        const audioTimer = setInterval(() => audio.tickLoudness(), 250);
+        const input = root.querySelector('input[type="file"]');
+        const playlist = root.querySelector('select');
+        const status = root.querySelector('[role="status"]');
+        let queue = [];
+        let sidecars = [];
+        let index = -1;
+        let source;
+        let tracks = [];
+        let revision = 0;
+        let lastSave = 0;
+        let active;
+
+        function save() {
+            if (!active || !Number.isFinite(video.currentTime) || video.readyState < 1) return;
+            active.time = video.currentTime;
+            if (active.id) store.save({ id: active.id, name: active.file.name, handle: active.handle, time: active.time }).catch(() => {});
+        }
+        function release() {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            if (source) URL.revokeObjectURL(source);
+            source = null;
+            for (const track of tracks) track.remove();
+            tracks = [];
+        }
+        async function addSubtitles(files, token) {
+            for (const { file } of files) {
+                const cues = parseSubtitleFile(await file.text());
+                if (token !== revision) return;
+                const element = document.createElement('track');
+                element.kind = 'subtitles';
+                element.label = file.name;
+                video.append(element);
+                const track = element.track;
+                track.mode = tracks.some(t => t.track.mode === 'showing') ? 'hidden' : 'showing';
+                tracks.push(element);
+                for (const cue of cues) {
+                    if (cue.end > cue.start) track.addCue(new VTTCue(cue.start, cue.end, cue.text));
+                }
+            }
+        }
+        const stem = name => name.replace(/\.[^.]+$/, '').toLowerCase();
+        function play(i) {
+            if (!queue[i]) return;
+            save();
+            const token = ++revision;
+            active = null;
+            release();
+            active = queue[i];
+            index = i;
+            playlist.selectedIndex = i;
+            status.textContent = active.file.name;
+            source = URL.createObjectURL(active.file);
+            video.onloadedmetadata = () => {
+                if (token === revision && active.time > 0) video.currentTime = Math.min(active.time, video.duration);
+            };
+            video.src = source;
+            video.play().catch(() => {});
+            const base = stem(active.file.name);
+            const matching = sidecars.filter(({ file }) => stem(file.name) === base || stem(file.name).startsWith(base + '.'));
+            addSubtitles(queue.length === 1 ? sidecars : matching, token).catch(showError);
+        }
+        function showError(error) { status.textContent = error.message || String(error); }
+        let selection = 0;
+        async function accept(entries) {
+            const current = ++selection;
+            const videos = entries.filter(({ file }) => file.type.startsWith('video/') || media.test(file.name));
+            const subs = entries.filter(({ file }) => subtitle.test(file.name));
+            if (!videos.length) {
+                if (active && subs.length) addSubtitles(subs, revision).catch(showError);
+                else status.textContent = 'Choose a video first.';
+                return;
+            }
+            const handles = videos.filter(entry => entry.handle && !entry.id);
+            if (handles.length) {
+                const known = await store.list().catch(() => []);
+                for (const entry of handles) {
+                    const sameName = known.filter(prior => prior.name === entry.file.name);
+                    for (const prior of sameName) {
+                        if (!await entry.handle.isSameEntry(prior.handle).catch(() => false)) continue;
+                        entry.id = prior.id;
+                        entry.time = prior.time;
+                        break;
+                    }
+                    if (!entry.id) {
+                        entry.id = crypto.randomUUID();
+                        store.save({ id: entry.id, name: entry.file.name, handle: entry.handle, time: 0 }).catch(() => {});
+                    }
+                }
+            }
+            if (current !== selection) return;
+            queue = videos.sort((a, b) => sort.compare(a.file.name, b.file.name));
+            sidecars = subs;
+            playlist.replaceChildren(...queue.map(({ file }) => new Option(file.name)));
+            playlist.hidden = queue.length < 2;
+            play(0);
+        }
+        input.onchange = () => {
+            accept([...input.files].map(file => ({ file }))).catch(showError);
+            input.value = '';
+        };
+        root.querySelector('[data-open]').onclick = async () => {
+            if (!window.showOpenFilePicker) { input.click(); return; }
+            try {
+                const handles = await window.showOpenFilePicker({ multiple: true });
+                await accept(await Promise.all(handles.map(async handle => ({ handle, file: await handle.getFile() }))));
+            } catch (error) {
+                if (error.name === 'SecurityError') input.click();
+                else if (error.name !== 'AbortError') showError(error);
+            }
+        };
+        const folder = document.createElement('input');
+        folder.type = 'file';
+        folder.webkitdirectory = true;
+        folder.multiple = true;
+        folder.hidden = true;
+        root.append(folder);
+        folder.onchange = () => { accept([...folder.files].map(file => ({ file }))).catch(showError); folder.value = ''; };
+        root.querySelector('[data-folder]').onclick = async () => {
+            if (!window.showDirectoryPicker) { folder.click(); return; }
+            try {
+                const directory = await window.showDirectoryPicker();
+                await accept(await localFilesFromHandle(directory));
+            } catch (error) {
+                if (error.name === 'SecurityError') folder.click();
+                else if (error.name !== 'AbortError') showError(error);
+            }
+        };
+        playlist.onchange = () => play(playlist.selectedIndex);
+        video.onended = () => play(index + 1);
+        video.onpause = save;
+        video.ontimeupdate = () => {
+            if (Date.now() - lastSave >= 3000) { lastSave = Date.now(); save(); }
+        };
+        video.onerror = () => { if (source) status.textContent = 'This browser cannot play this file or codec.'; };
+        window.addEventListener('dragover', event => {
+            if (!event.dataTransfer.types.includes('Files')) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'copy';
+            root.classList.add('is-dropping');
+        });
+        window.addEventListener('dragleave', event => {
+            if (!event.relatedTarget) root.classList.remove('is-dropping');
+        });
+        window.addEventListener('drop', event => {
+            if (!event.dataTransfer.types.includes('Files')) return;
+            event.preventDefault();
+            root.classList.remove('is-dropping');
+            filesFromDrop(event.dataTransfer).then(accept).catch(showError);
+        });
+        window.addEventListener('pagehide', event => {
+            save();
+            if (!event.persisted) { revision++; release(); clearInterval(audioTimer); audio.destroy(); }
+        });
+        if (resumeId) {
+            const savedEntry = store.get(resumeId).catch(() => null);
+            const resume = document.createElement('button');
+            resume.type = 'button';
+            resume.textContent = 'Resume Local File';
+            root.querySelector('header').prepend(resume);
+            resume.onclick = async () => {
+                try {
+                    const entry = await savedEntry;
+                    if (!entry) throw new Error('This local file is no longer in the library.');
+                    if (await entry.handle.requestPermission({ mode: 'read' }) !== 'granted') {
+                        throw new Error('Read access is required to resume the file.');
+                    }
+                    await accept([{ ...entry, file: await entry.handle.getFile() }]);
+                    resume.remove();
+                } catch (error) { showError(error); }
+            };
+        }
+    }
+
+    function mountVaultExport(id) {
+        const root = document.createElement('main');
+        root.className = 'local-player';
+        setHTML(root, '<header><button type="button" data-resume>Resume / Export</button> <button type="button" data-pause disabled>Pause</button> <a href="../popup/library.html">Library</a></header><p role="status">Ready to open the cached download.</p>');
+        document.body.append(root);
+        const start = root.querySelector('[data-resume]');
+        const pause = root.querySelector('[data-pause]');
+        const status = root.querySelector('[role="status"]');
+        let port;
+        const exportUi = Object.create(VelostreamPlayer.prototype);
+        Object.assign(exportUi, {
+            shadow: root,
+            port: { send: msg => { try { port?.postMessage(msg); } catch (_) {} } },
+            announce: message => { status.textContent = message; },
+            announceOnly() {},
+            updateDownloadButton() {
+                const state = this.exportState;
+                status.textContent = state.status || 'Preparing download…';
+                start.disabled = state.running;
+                pause.disabled = !state.running;
+                if (!state.running) { port?.disconnect(); port = null; }
+            }
+        });
+        start.onclick = async () => {
+            start.disabled = true;
+            try {
+                port = extApi.runtime.connect({ name: 'velostream-vault' });
+                const st = exportUi.exportState = { running: true, files: {}, status: '', pct: 0 };
+                exportUi.updateDownloadButton();
+                port.onMessage.addListener(msg => {
+                    if (exportUi.exportState !== st) return;
+                    if (msg.type === 'EXPORT_BEGIN' && msg.fileIndex === 0 &&
+                        ['ts', 'aac', 'fmp4'].includes(msg.container) && window.VelostreamMux) {
+                        st.toMp4 = true;
+                        st.outName = msg.filename.replace(/\.[^.]+$/, '.mp4');
+                        st.sink = new ExportSink(root, st.outName, 'video/mp4');
+                    }
+                    exportUi.onExportMessage(msg.data ? { ...msg, data: window.VelostreamShared.unpackBinary(msg.data) } : msg);
+                });
+                port.onDisconnect.addListener(() => {
+                    if (exportUi.exportState === st && st.running) {
+                        exportUi.onExportMessage({ type: 'EXPORT_ERROR', error: 'Export paused. Resume to continue.' });
+                    }
+                });
+                port.postMessage({ type: 'EXPORT_RESUME', id });
+            } catch (error) {
+                if (exportUi.exportState) exportUi.exportState.running = false;
+                port?.disconnect();
+                port = null;
+                status.textContent = error.message;
+                start.disabled = false;
+                pause.disabled = true;
+            }
+        };
+        pause.onclick = () => {
+            exportUi.port.send({ type: 'EXPORT_CANCEL' });
+            pause.disabled = true;
+        };
+        window.addEventListener('pagehide', () => port?.disconnect());
+    }
+
+    window.VelostreamVaultExport = mountVaultExport;
+    window.VelostreamLocalPlayer = mountLocalPlayer;
 
     // Started by player.js with an EnginePort and the host layout bridge.
     window.VelostreamPlayer = VelostreamPlayer;

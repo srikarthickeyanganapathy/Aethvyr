@@ -374,7 +374,11 @@
         async addInit(srcIndex, data) {
             const s = this.source(srcIndex);
             s.kind = 'fmp4';
-            if (!s.init) s.init = u8(data).slice();
+            const next = u8(data);
+            if (!s.init) s.init = next.slice();
+            else if (s.init.length !== next.length || s.init.some((value, i) => value !== next[i])) {
+                throw new Error('This stream changes MP4 initialization data mid-export.');
+            }
         }
 
         source(i) {
@@ -541,6 +545,33 @@
             return frag;
         }
 
+        async openSpool(s) {
+            if (s.spool !== undefined) return s.spool;
+            s.spool = null;
+            const dir = await navigator.storage?.getDirectory?.().catch(() => null);
+            if (!dir) return null;
+            const name = 'export-mux-' + crypto.randomUUID();
+            try {
+                const handle = await dir.getFileHandle(name, { create: true });
+                if (!handle.createWritable) { await dir.removeEntry(name); return null; }
+                const writable = await handle.createWritable();
+                s.spool = { dir, name, handle, writable, size: 0 };
+            } catch (_) { await dir.removeEntry(name).catch(() => {}); }
+            return s.spool;
+        }
+
+        async discardFragments() {
+            for (const s of this.src) {
+                if (!s) continue;
+                s.frags = [];
+                const spool = s.spool;
+                if (!spool) continue;
+                s.spool = null;
+                if (spool.writable) await spool.writable.abort().catch(() => {});
+                await spool.dir.removeEntry(spool.name).catch(() => {});
+            }
+        }
+
         async emit(srcIndex, frags) {
             if (!frags.length) return;
             if (this.sourceCount === 1) {
@@ -556,15 +587,18 @@
                 for (const f of frags) await this.writeFragment(0, f);
                 return;
             }
-            // Several sources: keep fragments (Blobs may be disk-backed) until every init is known,
-            // with only small per-fragment metadata (byte range + raw decode times) in memory.
-            const blob = new Blob(frags);
-            let p = 0;
+            // Keep interleaving metadata in memory and spool media to disk where supported.
+            const source = this.src[srcIndex];
+            const spool = await this.openSpool(source);
+            const blob = spool ? null : new Blob(frags);
+            let p = spool?.size || 0;
             for (const f of frags) {
+                if (spool) await spool.writable.write(f);
                 const t = fragTimings(f).filter(x => x.off >= 0).map(x => [x.id, x.base]);
-                this.src[srcIndex].frags.push({ blob, start: p, end: p + f.byteLength, t });
+                source.frags.push({ blob, start: p, end: p + f.byteLength, t });
                 p += f.byteLength;
             }
+            if (spool) spool.size = p;
         }
 
         /** Decode time (seconds, before the shared offset) of a stored fragment, or NaN. */
@@ -580,15 +614,21 @@
 
         /** Write every source's fragments merged in ascending decode time (ties: lower source). */
         async writeInterleaved() {
-            const queues = this.src.map((s, i) => {
+            const queues = await Promise.all(this.src.map(async (s, i) => {
+                let file;
+                if (s.spool) {
+                    await s.spool.writable.close();
+                    s.spool.writable = null;
+                    file = await s.spool.handle.getFile();
+                }
                 let last = -Infinity; // untimed fragments follow the previous one of their source
                 const times = s.frags.map(item => {
                     const t = this.fragTime(i, item);
                     if (!Number.isNaN(t)) last = t;
                     return last;
                 });
-                return { items: s.frags, times, k: 0 };
-            });
+                return { items: s.frags, times, file, k: 0 };
+            }));
             for (;;) {
                 let best = -1;
                 for (let i = 0; i < queues.length; i++) {
@@ -600,7 +640,7 @@
                 const q = queues[best];
                 const item = q.items[q.k];
                 q.items[q.k++] = null; // let the Blob go once every fragment of it is written
-                const buf = new Uint8Array(await item.blob.slice(item.start, item.end).arrayBuffer());
+                const buf = new Uint8Array(await (item.blob || q.file).slice(item.start, item.end).arrayBuffer());
                 await this.writeFragment(best, buf);
             }
             for (const s of this.src) s.frags = [];
@@ -611,7 +651,8 @@
             if (this.sourceCount > 1) {
                 if (!this.src.length || this.src.some(s => !s || !this.initOf(s).length)) throw new Error('A track produced no media');
                 await this.writeInit();
-                await this.writeInterleaved();
+                try { await this.writeInterleaved(); }
+                finally { await this.discardFragments(); }
             }
             if (!this.wroteInit) throw new Error('Nothing could be converted to MP4');
             await this.sink.close();

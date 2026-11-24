@@ -550,3 +550,9 @@ input[type="text"] { width: 100%; min-width: 0; }
 .root:is([data-skin="cinema"], [data-skin="theater"]) .t-left,
 .root:is([data-skin="cinema"], [data-skin="theater"]) .t-right { padding-inline: 6px; border-radius: 6px; background: #121214bf; }
 .tip { border-radius: 8px; background: #151518f0; box-shadow: none; }
+.local-player { box-sizing: border-box; min-height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: 100dvh; gap: .75rem; padding: 1rem; background: #15171c; color: #f4f5f7; }
+.local-player header { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.local-player button, .local-player select { padding: .5rem .75rem; }
+.local-player video { width: 100%; height: 100%; min-height: 0; background: #000; }
+.local-player p { margin: 0; }
+.local-player.is-dropping { outline: 3px dashed #93c5fd; outline-offset: -5px; }

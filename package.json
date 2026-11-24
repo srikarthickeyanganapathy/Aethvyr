@@ -10,7 +10,7 @@
         "build:firefox": "node scripts/build.js --target=firefox",
         "watch": "node scripts/build.js --watch",
         "lint": "eslint background common content player popup scripts",
-        "test": "node --test scripts/graphics.test.js scripts/library.test.js",
+        "test": "node --test scripts/graphics.test.js scripts/library.test.js scripts/download.test.js",
         "package": "node scripts/package.js"
     },
     "keywords": [

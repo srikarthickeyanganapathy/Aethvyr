@@ -71,6 +71,7 @@
             port.onDisconnect.addListener(() => {
                 if (this.port === port) this.port = null;
                 if (this.closed) return;
+                this.deliver({ type: 'ENGINE_DISCONNECTED' });
                 // Engine restarted (MV3 service workers are stopped by the browser): keep the
                 // in-flight requests and resend them once the session is back, instead of failing
                 // them (that surfaced as Shaka HTTP_ERROR 1002). Reconnect with the same session id
@@ -168,6 +169,15 @@
     /** Layout commands go straight to the content script that mounted this iframe. */
     function layout(cmd) {
         try { window.parent.postMessage({ __velostream: 'layout', session: sessionId, ...cmd }, '*'); } catch (_) { /* detached */ }
+    }
+
+    if (params.get('mode') === 'offline') {
+        if (window.top === window) globalThis.VelostreamVaultExport(params.get('id'));
+        return;
+    }
+    if (params.get('mode') === 'local') {
+        if (window.top === window) globalThis.VelostreamLocalPlayer(params.get("file"));
+        return;
     }
 
     if (!sessionId || !streamId || !globalThis.VelostreamPlayer) {

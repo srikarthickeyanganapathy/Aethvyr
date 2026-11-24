@@ -178,6 +178,8 @@ export class BufferManager {
         this.keys = new Set();          // segmentIds known to be stored (fast "has")
         this.ready = null;
         this.lock = Promise.resolve();
+        this.writes = new Set();
+        this.clearing = Promise.resolve();
     }
 
     /** Run `fn` after every previously queued locked operation (failures do not break the chain). */
@@ -239,11 +241,13 @@ export class BufferManager {
      * Admit a write of `size` bytes: inside the lock, evict exactly the current shortfall
      * (taking writes still in flight into account), then reserve the bytes.
      */
-    _admit(segmentId, size) {
+    _admit(segmentId, size, limit) {
         return this._serialize(async () => {
+            if (limit != null && this.currentSize + this.reserved + size > limit) return false;
             if (this._shortfall(size) > 0) await this._evictLocked(() => this._shortfall(size));
             this.reserved += size;
             this._pin(segmentId);
+            return true;
         });
     }
 
@@ -274,11 +278,19 @@ export class BufferManager {
      * (look-ahead window larger than the cap) the write still goes through, otherwise the
      * downloader would re-fetch the same segment forever.
      */
-    async storeSegment(segmentId, data, mime = '') {
+    storeSegment(segmentId, data, mime = '', limit) {
+        const write = this.clearing.then(() => this._storeSegment(segmentId, data, mime, limit));
+        this.writes.add(write);
+        const forget = () => { this.writes.delete(write); };
+        write.then(forget, forget);
+        return write;
+    }
+
+    async _storeSegment(segmentId, data, mime, limit) {
         await this.init();
         const size = data.byteLength;
         if (size > this.capBytes / 2) return false; // never let one blob evict the whole ring
-        await this._admit(segmentId, size);
+        if (!await this._admit(segmentId, size, limit)) return false;
         try {
             let prevSize;
             try {
@@ -423,20 +435,24 @@ export class BufferManager {
 
     /** Delete every record of this stream (stream switch / player close). */
     clearStream() {
-        return this._serialize(async () => {
-            const db = await openDB();
-            const deleted = await deleteRange(db, prefixRange(this.tabId, this.streamId));
-            this._forget(deleted);
-        });
+        return this._clear(prefixRange(this.tabId, this.streamId));
     }
 
     /** Delete every record of this tab (tab closed / navigated). */
     clearAll() {
-        return this._serialize(async () => {
+        return this._clear(prefixRange(this.tabId));
+    }
+
+    _clear(range) {
+        // Wait outside the admission lock so pre-existing writes can finish (including retries).
+        const writes = [...this.writes];
+        const cleared = this.clearing.then(() => Promise.allSettled(writes)).then(() => this._serialize(async () => {
             const db = await openDB();
-            const deleted = await deleteRange(db, prefixRange(this.tabId));
+            const deleted = await deleteRange(db, range);
             this._forget(deleted);
-        });
+        }));
+        this.clearing = cleared.catch(() => {});
+        return cleared;
     }
 
     /** Subtract exactly the deleted records (other streams of the tab keep their bytes). */
