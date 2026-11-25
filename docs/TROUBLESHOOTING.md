@@ -63,15 +63,15 @@ player explains it) and cannot play or save them. This is by design and will not
 
 ## Download problems
 
-- **"DASH export is not supported"**: only HLS and direct files can be saved.
-- **The MP4 has no sound**: some sites keep audio in a separate rendition; it is merged when the
-  site lists it in the master playlist. Try *Save format → Original* to get the separate files.
-- **Seeking in a saved MP4 is slow in some desktop players**: the file is fragmented MP4 (no
-  global index). VLC, mpv and browsers handle it well. To get a classic MP4:
+- **An MP4 shows only a few seconds or cannot seek**. Versions before 2.7.1 could save the media
+  fragments with a short initialization duration and no seek index. Open **Library → Offline / Cached**
+  and choose **Export** if the job is still cached. Otherwise, retry the original stream. Existing
+  files are unchanged. If you only have the old file, try repackaging a copy with
   `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4`.
-- Very large downloads are assembled in memory before saving when the browser does not offer
-  direct writing to disk. Prefer *Open in external player* or the yt-dlp command for multi-GB
-  files.
+- **MP4 has no sound**. If the source uses separate renditions, select the audio track before
+  exporting. **Original** can save video and audio separately when available.
+- Large exports use a disk-backed temporary file where supported. Browsers without disk writing
+  have a lower export limit. Check available storage before retrying.
 
 ## Resetting
 

@@ -35,6 +35,24 @@ no remote code. See [PRIVACY.md](PRIVACY.md).
 
 *Firefox screenshot captured with a generated local test clip.*
 
+## Try it in a minute
+
+| What you want to do | Where to find it |
+| --- | --- |
+| Watch a website video | Start the site video and choose **Play in Velostream** or select the stream in the popup. |
+| Watch a local file | Choose **Open Local File** in the popup on a website tab, or drop the file into the overlay. |
+| Improve picture or audio | Open **Studio → Display → Graphics** or **Studio → Audio**. |
+| Find captions, a transcript, or a chapter | Open the captions button for tracks and transcripts. Open **Studio → Tools** for chapters. |
+| Download or save a clip | Open **Studio → Tools** for format and clip controls. Find paused and completed exports in **Library → Offline / Cached**. |
+| Learn the controls | Open **Feature guide** from the popup or Studio. Press `?` in the player for keyboard shortcuts. |
+
+<details>
+<summary>See the in-extension Feature Guide</summary>
+
+![Firefox screenshot of the Velostream Feature Guide](docs/media/feature-guide.png)
+
+</details>
+
 ## Features
 
 | Area | Highlights |

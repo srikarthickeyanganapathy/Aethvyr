@@ -49,7 +49,7 @@ function readShaka() {
 }
 
 function verifyManifestFiles(manifest, targetDir) {
-    const files = new Set(['popup/library.html']);
+    const files = new Set(['popup/library.html', 'popup/guide.html']);
     const addIcons = obj => obj && Object.values(obj).forEach(p => files.add(p));
     addIcons(manifest.icons);
     addIcons(manifest.action && manifest.action.default_icon);

@@ -630,3 +630,5 @@ button.local-control, summary.local-control, a.local-control, select.local-contr
 .root:not([data-density="pro"]) .capsule-right :is(.btn-lock, .btn-info, .btn-audio-only, .btn-mini) { display: none; }
 .tip { z-index: 4; }
 .tip-thumb canvas { display: block; max-width: 100%; height: auto; }
+
+.pop-guide { margin-inline-start: auto; text-decoration: none; white-space: nowrap; font-size: 12px; }

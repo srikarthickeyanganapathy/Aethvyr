@@ -1,6 +1,6 @@
 {
     "name": "velostream",
-    "version": "2.7.0",
+    "version": "2.7.1",
     "description": "Accessible HLS/DASH/MP4 player and streaming optimizer for mobile browsers (Kiwi/Chromium & Firefox for Android)",
     "private": true,
     "type": "module",

@@ -446,6 +446,11 @@
             else this.parts.push(chunk instanceof Blob ? chunk : new Blob([chunk]));
         }
 
+        async rewriteHeader(bytes) {
+            if (this.writable) await this.writable.write({ type: 'write', position: 0, data: bytes });
+            else this.parts[0] = new Blob([bytes]);
+        }
+
         async close() {
             if (this.writable) {
                 await this.writable.close();
@@ -4079,7 +4084,7 @@
             }
             this.recordingSince = 0;
             this.exportState = { running: true, files: {}, status: 'Saving recording…', pct: 0, toMp4, sink, outName: sink ? sink.filename : name, chain: Promise.resolve() };
-            this.port.send({ type: 'RECORD_STOP', format: toMp4 ? 'mp4' : 'original' });
+            this.port.send({ type: 'RECORD_STOP', format: toMp4 ? 'mp4' : 'original', title: this.$('.title').textContent });
             this.updateDownloadButton();
             this.refreshPopover();
         }
@@ -4246,9 +4251,9 @@
             st.isClip = !!clip;
             if (dash) {
                 if (!toMp4 && dashPlan.parts.length > 1) this.announce('Saving separate original video and audio files', 'download');
-                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts }, clip: !!clip, format: toMp4 ? 'mp4' : 'original' });
+                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts }, clip: !!clip, format: toMp4 ? 'mp4' : 'original', title: this.$('.title').textContent });
             } else {
-                this.port.send({ type: 'EXPORT_START', clip, format: toMp4 ? 'mp4' : 'original' });
+                this.port.send({ type: 'EXPORT_START', clip, format: toMp4 ? 'mp4' : 'original', title: this.$('.title').textContent });
             }
             this.announce(clip ? `Saving A–B clip (${fmtTime(clip.end - clip.start)})` : this.isLive() ? 'Saving live DVR buffer' : 'Download started', 'download');
             this.updateDownloadButton();
@@ -4308,15 +4313,20 @@
                     } else {
                         f.sink = new ExportSink(this.shadow, msg.filename, msg.mime);
                     }
+                    if (f.sink && msg.container === 'fmp4') {
+                        f.muxer = new window.VelostreamMux.ExportMuxer(f.sink, 1);
+                    }
                     st.status = `Saving ${st.toMp4 ? st.outName : msg.filename}`;
                     break;
                 }
                 case 'EXPORT_CHUNK': {
                     const f = st.files[msg.fileIndex];
                     if (!f || !msg.data) return;
-                    if (st.toMp4 && st.muxer) {
-                        if (msg.kind === 'init') await st.muxer.addInit(msg.fileIndex, msg.data);
-                        else await st.muxer.addSegment(msg.fileIndex, msg.data, { start: msg.start, end: msg.end, url: msg.url });
+                    const mux = st.muxer || f.muxer;
+                    if (mux) {
+                        const source = f.muxer ? 0 : msg.fileIndex;
+                        if (msg.kind === 'init') await mux.addInit(source, msg.data);
+                        else await mux.addSegment(source, msg.data, { start: msg.start, end: msg.end, url: msg.url });
                         return;
                     }
                     if (f.sink) await f.sink.write(new Uint8Array(msg.data));
@@ -4334,7 +4344,8 @@
                     if (f && f.sink) {
                         st.status = `Finishing ${f.filename}…`;
                         this.updateDownloadButton();
-                        await f.sink.close();
+                        if (f.muxer) await f.muxer.finish();
+                        else await f.sink.close();
                         f.sink = null;
                         this.announce(`Saved ${f.filename}`, 'check');
                     }
@@ -5738,7 +5749,9 @@
             const role = kind === 'speed' ? 'menu' : 'dialog';
             this.pop.setAttribute('role', role);
             this.pop.setAttribute('aria-labelledby', 'fs-pop-title');
-            setHTML(this.pop, `<div class="pop-head"><h2 id="fs-pop-title">${titles[kind]}</h2><button type="button" class="ib pop-close" aria-label="Close ${titles[kind]}">${icon('close', 18)}</button></div><div class="pop-body">${body}</div>`);
+            const guide = ['studio', 'help'].includes(kind) ?
+                '<a class="pillbtn pop-guide" href="../popup/guide.html" target="_blank" rel="noopener">Feature guide</a>' : '';
+            setHTML(this.pop, `<div class="pop-head"><h2 id="fs-pop-title">${titles[kind]}</h2>${guide}<button type="button" class="ib pop-close" aria-label="Close ${titles[kind]}">${icon('close', 18)}</button></div><div class="pop-body">${body}</div>`);
             this.pop.querySelector('.pop-close').addEventListener('click', () => this.closePopover(true));
             this.bindPopover(kind);
             for (const section of this.pop.querySelectorAll('[data-display-section]')) {

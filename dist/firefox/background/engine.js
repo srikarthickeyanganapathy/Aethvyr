@@ -1396,7 +1396,11 @@ async function handleRequest(session, msg) {
 // Export / recording (HLS + progressive). Chunks are streamed to the player, which
 // assembles a Blob in page memory (service workers cannot create object URLs).
 // ----------------------------------------------------------------------------
-function fileBaseName(stream) {
+function fileBaseName(stream, title) {
+    const clean = value => value.replace(/\.(m3u8|mpd|mp4|webm|mkv|mov|m4v)$/i, '')
+        .replace(/[^\p{L}\p{N} ._-]+/gu, '_').replace(/^[.\s]+|[.\s]+$/g, '').slice(0, 100);
+    const name = typeof title === 'string' ? clean(title) : '';
+    if (name) return name;
     try {
         const u = new URL(stream.url);
         const last = u.pathname.split('/').filter(Boolean).pop() || 'stream';
@@ -1532,7 +1536,7 @@ async function runExport(session, opts = {}, saved = null) {
     const post = m => session.post({ ...m, jobId, format });
     let job = saved;
     try {
-        const base = saved?.base || fileBaseName(session.stream);
+        const base = saved?.base || fileBaseName(session.stream, opts.title);
         const progressive = session.stream.type === 'progressive';
         const parts = saved?.parts || exportParts(session, opts, base);
         if (!job && !opts.clip) {
@@ -1966,7 +1970,7 @@ api.runtime.onConnect.addListener((port) => {
                         session.post({ type: 'EXPORT_ERROR', error: 'This DASH stream cannot be saved.' });
                         break;
                     }
-                    runExport(session, { dash: parts, clip: !!msg.clip, format: msg.format });
+                    runExport(session, { dash: parts, clip: !!msg.clip, format: msg.format, title: msg.title });
                     break;
                 }
                 const clip = msg.clip && Number.isFinite(+msg.clip.start) && Number.isFinite(+msg.clip.end) && +msg.clip.end > +msg.clip.start
@@ -1975,7 +1979,7 @@ api.runtime.onConnect.addListener((port) => {
                     session.post({ type: 'EXPORT_ERROR', error: 'A–B clips can be saved from HLS streams only.' });
                     break;
                 }
-                runExport(session, { clip, format: msg.format });
+                runExport(session, { clip, format: msg.format, title: msg.title });
                 break;
             }
             case 'RECORD_START':
@@ -1991,7 +1995,7 @@ api.runtime.onConnect.addListener((port) => {
                 }
                 session.recording = null;
                 session.persistState({ soon: true });
-                runExport(session, { recording: rec, format: msg.format });
+                runExport(session, { recording: rec, format: msg.format, title: msg.title });
                 break;
             }
             case 'EXPORT_ACK':

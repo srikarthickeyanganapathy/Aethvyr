@@ -5,6 +5,12 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.7.1] - 2026-11-25
+
+- Finalize MP4 exports with the complete duration and an audio/video seek index.
+- Use the player title for new stream download names when available.
+- Add a feature guide to the popup, Studio, and Library, with a quick tour in the README.
+
 ## [2.7.0] - 2026-11-25
 
 - Added Eco, Balanced, Max and Custom streaming profiles with a shared background prefetch budget.
