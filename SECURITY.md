@@ -11,7 +11,7 @@ Please **do not open a public issue** for security problems. Use GitHub's privat
 **Security → Report a vulnerability** on
 <https://github.com/srikarthickeyanganapathy/Velostream>.
 
-Include the browser and version, the Velostream version, steps to reproduce and the impact. You
+Include the browser and version, the Aethvyr version, steps to reproduce and the impact. You
 should get a first response within 7 days. Please give us a reasonable time to fix the issue before
 disclosing it.
 

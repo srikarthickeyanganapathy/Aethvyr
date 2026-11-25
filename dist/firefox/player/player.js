@@ -22,10 +22,11 @@
     const streamId = params.get('stream');
 
     class EnginePort {
-        constructor() {
+        constructor(local = false) {
             this.onmessage = null;
             this.port = null;
             this.closed = false;
+            this.privateBookmarks = api.extension?.inIncognitoContext ? new Map() : null;
             this.reconnects = 0;
             this.pending = new Map(); // reqId -> REQUEST message awaiting its RESPONSE
             this.storageListener = (changes, area) => {
@@ -34,7 +35,7 @@
                 }
             };
             api.storage.onChanged.addListener(this.storageListener);
-            this.connect(false);
+            if (!local) this.connect(false);
         }
 
         deliver(msg) {
@@ -71,6 +72,7 @@
             port.onDisconnect.addListener(() => {
                 if (this.port === port) this.port = null;
                 if (this.closed) return;
+                this.deliver({ type: 'ENGINE_DISCONNECTED' });
                 // Engine restarted (MV3 service workers are stopped by the browser): keep the
                 // in-flight requests and resend them once the session is back, instead of failing
                 // them (that surfaced as Shaka HTTP_ERROR 1002). Reconnect with the same session id
@@ -78,8 +80,8 @@
                 if (this.reconnects++ < 8) {
                     setTimeout(() => this.connect(true), Math.min(4000, 250 * Math.pow(2, this.reconnects)));
                 } else {
-                    this.failPending('Lost connection to the Velostream engine');
-                    this.deliver({ type: 'FATAL', error: 'Lost connection to the Velostream engine.' });
+                    this.failPending('Lost connection to the Aethvyr engine');
+                    this.deliver({ type: 'FATAL', error: 'Lost connection to the Aethvyr engine.' });
                 }
             });
             port.postMessage({ type: 'HELLO', sessionId, streamId, resumed: !!resumed });
@@ -109,13 +111,25 @@
                     return true;
                 case 'STORE_GET': {
                     if (typeof msg.key !== 'string' || !msg.key.startsWith('fs_bm_')) return true;
+                    if (this.privateBookmarks) {
+                        this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: this.privateBookmarks.get(msg.key) ?? null });
+                        return true;
+                    }
                     const res = await api.storage.local.get(msg.key);
                     this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: res[msg.key] ?? null });
                     return true;
                 }
                 case 'STORE_SET':
+                    if (this.privateBookmarks) {
+                        if (/^fs_bm_[\w-]{1,64}$/.test(msg.key) && Array.isArray(msg.value)) this.privateBookmarks.set(msg.key, msg.value);
+                        return true;
+                    }
                     return false;
                 case 'HISTORY_GET': {
+                    if (api.extension?.inIncognitoContext) {
+                        this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: null });
+                        return true;
+                    }
                     const all = (await api.storage.local.get(S.HISTORY_KEY))[S.HISTORY_KEY] || {};
                     this.deliver({ type: 'STORE_VALUE', reqId: msg.reqId, value: all[msg.key] || null });
                     return true;
@@ -170,8 +184,20 @@
         try { window.parent.postMessage({ __velostream: 'layout', session: sessionId, ...cmd }, '*'); } catch (_) { /* detached */ }
     }
 
+    if (params.get('mode') === 'offline') {
+        if (window.top === window) globalThis.VelostreamVaultExport(params.get('id'));
+        return;
+    }
+    if (params.get('local') === '1' || params.get('mode') === 'local') {
+        // eslint-disable-next-line no-new
+        new globalThis.VelostreamPlayer(new EnginePort(true), {
+            local: true, fileId: params.get('file'), layout, mountMode: 'page'
+        });
+        return;
+    }
+
     if (!sessionId || !streamId || !globalThis.VelostreamPlayer) {
-        document.body.textContent = 'Velostream: missing session.';
+        document.body.textContent = 'Aethvyr: missing session.';
         return;
     }
     const startTime = parseFloat(params.get('t'));

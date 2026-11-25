@@ -92,8 +92,8 @@
         smartSkip: false,            // fast-forward through black + silent stretches
         fileThumbnails: true,        // seek-bar previews generated from direct video files
         pipSubtitles: true,          // Picture-in-Picture shows the subtitles (drawn into the PiP frame)
-        quickLaunchBadge: true,      // on-page "Play in Velostream" pill
-        autoSites: [],               // hostnames where detected videos open in Velostream automatically
+        quickLaunchBadge: true,      // on-page "Play in Aethvyr" pill
+        autoSites: [],               // hostnames where detected videos open in Aethvyr automatically
         // Last-used player state, restored for every video (like a native app remembers it)
         memory: {
             volume: 1,
@@ -104,8 +104,11 @@
             qualityHeight: 0         // 0 = Auto (ABR)
         },
         // Engine: pre-buffer the whole video in the background (bounded by the cache size)
+        prefetchMbps: 0,              // Custom profile, averaged across speculative segment requests
+        resourceProfile: 'balanced', // eco | balanced | max | custom (device-specific)
         maxBufferSec: 86400,         // seconds ahead to pre-download; 86400 = whole video
-        cacheSizeMB: 2048,           // IndexedDB ring buffer per tab
+        pausedBufferMB: 256,         // IndexedDB prefetch limit while paused, 0 disables
+        cacheSizeMB: 2048,           // cache ceiling shared by active sessions
         maxWorkers: 6,               // parallel segment downloads (2-8)
         rangeAccel: true,            // split large downloads into parallel Range sub-requests
         dvrMinutes: 30,              // live rewind window kept in the ring buffer (0 = off)
@@ -227,6 +230,8 @@
             out.settingsVersion = 2;
         }
         out.settingsVersion = 3; // v3 only adds keys; defaults fill them in
+        if (!['eco', 'balanced', 'max', 'custom'].includes(out.resourceProfile)) out.resourceProfile = 'balanced';
+        out.prefetchMbps = Math.min(1000, Math.max(0, Math.round(out.prefetchMbps)));
         out.maxBufferSec = Math.min(86400, Math.max(10, out.maxBufferSec));
         out.mseBufferAhead = Math.min(300, Math.max(15, out.mseBufferAhead));
         out.mseBufferBehind = Math.min(300, Math.max(10, out.mseBufferBehind));
@@ -241,6 +246,7 @@
         // Any other value inside the 32-8192 clamp is kept as is (the UIs show it as a custom option).
         if (LEGACY_CACHE_MB[out.cacheSizeMB]) out.cacheSizeMB = LEGACY_CACHE_MB[out.cacheSizeMB];
         out.cacheSizeMB = Math.min(8192, Math.max(32, out.cacheSizeMB));
+        out.pausedBufferMB = Math.min(8192, Math.max(0, out.pausedBufferMB));
         out.memory.volume = Math.min(1, Math.max(0, out.memory.volume));
         out.autoSites = out.autoSites.filter(h => typeof h === 'string' && h.length < 256).slice(0, 500);
         out.audio.boost = Math.min(300, Math.max(100, out.audio.boost));
@@ -546,9 +552,9 @@
     /** Validate + clean a parsed backup. Throws with a readable message when it is not one. */
     function sanitizeBackup(data) {
         if (!isPlainObject(data) || data.app !== BACKUP_APP || !isPlainObject(data.settings)) {
-            throw new Error('This file is not a Velostream backup.');
+            throw new Error('This file is not an Aethvyr backup.');
         }
-        if (!(data.version >= 1 && data.version <= BACKUP_VERSION)) throw new Error('This backup was made by a newer Velostream. Update the extension first.');
+        if (!(data.version >= 1 && data.version <= BACKUP_VERSION)) throw new Error('This backup was made by a newer version of Aethvyr. Update the extension first.');
         const bookmarks = {};
         for (const [k, list] of Object.entries(isPlainObject(data.bookmarks) ? data.bookmarks : {})) {
             if (!BOOKMARK_KEY_RE.test(k) || !Array.isArray(list)) continue;
@@ -558,7 +564,7 @@
         }
         const history = {};
         const entries = Object.entries(isPlainObject(data.history) ? data.history : {})
-            .filter(([k, e]) => /^[\w-]{1,64}$/.test(k) && !['__proto__', 'constructor', 'prototype'].includes(k) && isPlainObject(e) && httpUrl(e.url))
+            .filter(([k, e]) => /^[\w-]{1,64}$/.test(k) && !['__proto__', 'constructor', 'prototype'].includes(k) && isPlainObject(e) && (httpUrl(e.url) || (e.url === '' && typeof e.title === 'string' && finiteNum(e.updatedAt) !== null)))
             .sort((a, b) => (finiteNum(b[1].updatedAt) || 0) - (finiteNum(a[1].updatedAt) || 0))
             .slice(0, 200);
         for (const [k, e] of entries) {
@@ -598,7 +604,7 @@
         return { bookmarks: Object.keys(clean.bookmarks).length, history: Object.keys(clean.history).length, profiles: clean.settings.siteProfiles.length, collections: clean.library.collections.length };
     }
 
-    const backupFilename = () => `velostream-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    const backupFilename = () => `aethvyr-backup-${new Date().toISOString().slice(0, 10)}.json`;
 
     /** Color Studio presets (values in settings units: gamma %, others -100..100). */
     const COLOR_PRESETS = Object.freeze({
@@ -632,7 +638,7 @@
         SETTINGS_KEY: 'fs_settings',
         HISTORY_KEY: 'fs_history',
         ACCENTS: Object.freeze({
-            blue: { label: 'System Blue', fill: '#0A84FF', strong: '#0058D0' },
+            blue: { label: 'Celestial Blue', fill: 'var(--accent-default)', strong: 'var(--accent-active)' },
             green: { label: 'Green', fill: '#30D158', strong: '#1E7A36' },
             indigo: { label: 'Indigo', fill: '#5E5CE6', strong: '#4643C9' },
             amber: { label: 'Amber', fill: '#FF9F0A', strong: '#9A5B00' },

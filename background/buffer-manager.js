@@ -178,6 +178,8 @@ export class BufferManager {
         this.keys = new Set();          // segmentIds known to be stored (fast "has")
         this.ready = null;
         this.lock = Promise.resolve();
+        this.writes = new Set();
+        this.clearing = Promise.resolve();
     }
 
     /** Run `fn` after every previously queued locked operation (failures do not break the chain). */
@@ -200,6 +202,7 @@ export class BufferManager {
             }
             // Assign (not accumulate) so a retried init after a failure cannot double count.
             this.currentSize = total;
+            if (total > this.capBytes) await this._evictLocked(() => this._shortfall(0), true);
         }).catch(err => {
             this.ready = null;
             throw err;
@@ -208,7 +211,10 @@ export class BufferManager {
     }
 
     setCapacity(mb) {
-        this.capBytes = Math.max(32, mb) * 1024 * 1024;
+        this.capBytes = Math.max(0, Math.floor(mb * 1024 * 1024));
+        if (this.currentSize > this.capBytes) {
+            this._serialize(() => this._evictLocked(() => this._shortfall(0), true)).catch(() => {});
+        }
     }
 
     has(segmentId) {
@@ -239,11 +245,14 @@ export class BufferManager {
      * Admit a write of `size` bytes: inside the lock, evict exactly the current shortfall
      * (taking writes still in flight into account), then reserve the bytes.
      */
-    _admit(segmentId, size) {
+    _admit(segmentId, size, limit) {
         return this._serialize(async () => {
+            if (limit != null && this.currentSize + this.reserved + size > limit) return false;
             if (this._shortfall(size) > 0) await this._evictLocked(() => this._shortfall(size));
+            if (this._shortfall(size) > 0) return false;
             this.reserved += size;
             this._pin(segmentId);
+            return true;
         });
     }
 
@@ -270,15 +279,22 @@ export class BufferManager {
      * Store a segment. Evicts first when the cap would be exceeded; retries once on
      * QuotaExceededError after an aggressive eviction.
      *
-     * The cap is soft in one case only: when every stored segment is protected and unserved
-     * (look-ahead window larger than the cap) the write still goes through, otherwise the
-     * downloader would re-fetch the same segment forever.
+     * If protected segments fill the cap, serve demand bytes directly. The downloader
+     * applies its existing per-segment cooldown to declined speculative writes.
      */
-    async storeSegment(segmentId, data, mime = '') {
+    storeSegment(segmentId, data, mime = '', limit) {
+        const write = this.clearing.then(() => this._storeSegment(segmentId, data, mime, limit));
+        this.writes.add(write);
+        const forget = () => { this.writes.delete(write); };
+        write.then(forget, forget);
+        return write;
+    }
+
+    async _storeSegment(segmentId, data, mime, limit) {
         await this.init();
         const size = data.byteLength;
         if (size > this.capBytes / 2) return false; // never let one blob evict the whole ring
-        await this._admit(segmentId, size);
+        if (!await this._admit(segmentId, size, limit)) return false;
         try {
             let prevSize;
             try {
@@ -296,6 +312,7 @@ export class BufferManager {
         } finally {
             this.reserved = Math.max(0, this.reserved - size);
             this._unpin(segmentId);
+            if (this.currentSize > this.capBytes) await this._serialize(() => this._evictLocked(() => this._shortfall(0), true));
         }
         return true;
     }
@@ -359,7 +376,7 @@ export class BufferManager {
      * that moment (after earlier evictions and commits), so concurrent stores never each
      * evict their own stale estimate.
      */
-    async _evictLocked(needFn) {
+    async _evictLocked(needFn, resize = false) {
         if (needFn() <= 0) return 0;
         const db = await openDB();
         const recs = await scanMeta(db, prefixRange(this.tabId));
@@ -404,6 +421,7 @@ export class BufferManager {
         if (freed < bytesNeeded) collect(rec => !own(rec) || !this._isProtected(rec.segmentId));
         // Pass 3: cap reached with everything protected - shrink the oldest played DVR history.
         if (freed < bytesNeeded) collect(rec => rec.served);
+        if (resize && freed < bytesNeeded) collect(() => true);
         if (!victims.length) return 0;
 
         const tx = db.transaction([META, DATA], 'readwrite');
@@ -423,20 +441,24 @@ export class BufferManager {
 
     /** Delete every record of this stream (stream switch / player close). */
     clearStream() {
-        return this._serialize(async () => {
-            const db = await openDB();
-            const deleted = await deleteRange(db, prefixRange(this.tabId, this.streamId));
-            this._forget(deleted);
-        });
+        return this._clear(prefixRange(this.tabId, this.streamId));
     }
 
     /** Delete every record of this tab (tab closed / navigated). */
     clearAll() {
-        return this._serialize(async () => {
+        return this._clear(prefixRange(this.tabId));
+    }
+
+    _clear(range) {
+        // Wait outside the admission lock so pre-existing writes can finish (including retries).
+        const writes = [...this.writes];
+        const cleared = this.clearing.then(() => Promise.allSettled(writes)).then(() => this._serialize(async () => {
             const db = await openDB();
-            const deleted = await deleteRange(db, prefixRange(this.tabId));
+            const deleted = await deleteRange(db, range);
             this._forget(deleted);
-        });
+        }));
+        this.clearing = cleared.catch(() => {});
+        return cleared;
     }
 
     /** Subtract exactly the deleted records (other streams of the tab keep their bytes). */

@@ -10,7 +10,7 @@
  * The result is a fragmented MP4: ftyp + moov (all tracks, mvex/trex) + moof/mdat fragments.
  * Track ids are rewritten so video and audio never collide, mfhd sequence numbers are made
  * increasing in file order, and sidx/styp/emsg/prft/free boxes (whose offsets would be wrong)
- * are dropped. Each moof is written immediately followed by its own mdat; trun data offsets and
+ * are dropped. Finalization writes the full movie duration and a random-access index. Each moof is written immediately followed by its own mdat; trun data offsets and
  * explicit tfhd base offsets are rewritten so they still point at the sample data. With several
  * sources the fragments are interleaved by decode time.
  *
@@ -189,7 +189,9 @@
         // next_track_ID is the last field of mvhd (v0 and v1).
         view(mvhd).setUint32(mvhd.byteLength - 4, maxId + 1);
         if (!ftyp) ftyp = box('ftyp', enc.encode('isom'), new Uint8Array([0, 0, 2, 0]), enc.encode('isomiso6mp41'));
-        return concat([ftyp, box('moov', mvhd, ...traks, box('mvex', ...trex))]);
+        const mehd = new Uint8Array(12);
+        mehd[0] = 1; // full fragment duration filled after the last fragment
+        return concat([ftyp, box('moov', mvhd, ...traks, box('mvex', box('mehd', mehd), ...trex))]);
     }
 
     /** trackId -> media timescale (mdhd) of an init segment. */
@@ -233,6 +235,152 @@
             }
         }
         return out;
+    }
+
+    /** Read fragment timing and the first random-access sample in each track fragment. */
+    function indexFragment(frag, defaults, trackEnds, moofOffset, indexes) {
+        const dv = view(frag);
+        for (const moof of boxes(frag).filter(b => b.type === 'moof')) {
+            const trafs = boxes(frag, moof.start + moof.hdr, moof.end).filter(b => b.type === 'traf');
+            trafs.forEach((traf, trafIndex) => {
+                const children = boxes(frag, traf.start + traf.hdr, traf.end);
+                const tfhd = children.find(b => b.type === 'tfhd');
+                if (!tfhd) return;
+                let p = tfhd.start + tfhd.hdr;
+                const flags = dv.getUint32(p) & 0xffffff;
+                const id = dv.getUint32(p + 4);
+                const track = trackEnds.get(id);
+                if (!track) return;
+                p += 8 + (flags & 1 ? 8 : 0) + (flags & 2 ? 4 : 0);
+                const defaultDuration = flags & 8 ? dv.getUint32(p) : defaults.get(id)?.duration || 0;
+                p += (flags & 8 ? 4 : 0) + (flags & 16 ? 4 : 0);
+                const defaultFlags = flags & 32 ? dv.getUint32(p) : defaults.get(id)?.flags || 0;
+                const tfdt = children.find(b => b.type === 'tfdt');
+                const timeOffset = tfdt ? tfdt.start + tfdt.hdr : 0;
+                let decode = tfdt ? Number(frag[timeOffset] === 1 ? dv.getBigUint64(timeOffset + 4) : dv.getUint32(timeOffset + 4)) : track.decodeEnd;
+                let indexed = false;
+                const runs = children.filter(b => b.type === 'trun');
+                runs.forEach((run, runIndex) => {
+                    const body = run.start + run.hdr;
+                    const mask = dv.getUint32(body) & 0xffffff;
+                    const count = dv.getUint32(body + 4);
+                    let at = body + 8 + (mask & 1 ? 4 : 0);
+                    const firstFlags = mask & 4 ? dv.getUint32(at) : defaultFlags;
+                    if (mask & 4) at += 4;
+                    const stride = [0x100, 0x200, 0x400, 0x800].reduce((n, flag) => n + (mask & flag ? 4 : 0), 0);
+                    if (at + count * stride > run.end || count > 1e6) throw new Error('Invalid MP4 sample table.');
+                    for (let i = 0; i < count; i++) {
+                        const duration = mask & 0x100 ? dv.getUint32(at) : defaultDuration;
+                        if (!(mask & 0x100) && !defaultDuration) throw new Error('MP4 sample duration is missing.');
+                        at += (mask & 0x100 ? 4 : 0) + (mask & 0x200 ? 4 : 0);
+                        const sampleFlags = mask & 0x400 ? dv.getUint32(at) : i === 0 ? firstFlags : defaultFlags;
+                        if (mask & 0x400) at += 4;
+                        const delta = mask & 0x800 ? (frag[body] === 1 ? dv.getInt32(at) : dv.getUint32(at)) : 0;
+                        if (mask & 0x800) at += 4;
+                        const time = decode + delta;
+                        if (!indexed && (sampleFlags & 0x10000) === 0 && (sampleFlags >>> 24 & 3) !== 1) {
+                            if (!indexes.has(id)) indexes.set(id, []);
+                            indexes.get(id).push({ time: Math.max(0, time), offset: moofOffset + moof.start, traf: trafIndex + 1, run: runIndex + 1, sample: i + 1 });
+                            indexed = true;
+                        }
+                        decode += duration;
+                        track.presentationEnd = Math.max(track.presentationEnd, time + duration);
+                    }
+                });
+                track.decodeEnd = Math.max(track.decodeEnd, decode);
+            });
+        }
+    }
+
+    function finalDurations(init, tracks) {
+        const dv = view(init);
+        const setDuration = (offset, v1, duration) => {
+            if (v1) dv.setBigUint64(offset, BigInt(Math.ceil(duration)));
+            else if (duration < 0xffffffff) dv.setUint32(offset, Math.ceil(duration));
+            else throw new Error('Export duration exceeds this MP4 header version.');
+        };
+        const children = b => boxes(init, b.start + b.hdr, b.end);
+        const movie = boxes(init).find(b => b.type === 'moov');
+        const mvhd = children(movie).find(b => b.type === 'mvhd');
+        const movieBody = mvhd.start + mvhd.hdr;
+        const movieV1 = init[movieBody] === 1;
+        const movieScale = dv.getUint32(movieBody + (movieV1 ? 20 : 12));
+        if (!movieScale) throw new Error('MP4 header has an invalid time scale.');
+        let movieDuration = 0;
+        for (const trak of children(movie).filter(b => b.type === 'trak')) {
+            const tkhd = children(trak).find(b => b.type === 'tkhd');
+            if (!tkhd) continue;
+            const track = tracks.get(dv.getUint32(trackIdOffset(tkhd, init)));
+            if (!track) continue;
+            let duration = track.presentationEnd * movieScale / track.scale;
+            const edts = children(trak).find(b => b.type === 'edts');
+            const elst = edts && children(edts).find(b => b.type === 'elst');
+            if (elst) {
+                // Preserve priming and leading delay. The last playable edit in a streaming
+                // init can describe only the first fragment, so extend it to the real end.
+                const body = elst.start + elst.hdr;
+                const v1 = init[body] === 1;
+                const width = v1 ? 8 : 4;
+                const stride = width * 2 + 4;
+                let editsDuration = 0;
+                let last = null;
+                for (let i = 0; i < dv.getUint32(body + 4); i++) {
+                    const off = body + 8 + i * stride;
+                    if (off + stride > elst.end) throw new Error('Invalid MP4 edit list.');
+                    const span = v1 ? Number(dv.getBigUint64(off)) : dv.getUint32(off);
+                    const mediaTime = v1 ? Number(dv.getBigInt64(off + width)) : dv.getInt32(off + width);
+                    if (mediaTime >= 0 && dv.getUint32(off + width * 2) === 0x10000) last = { off, span, mediaTime };
+                    editsDuration += span;
+                }
+                if (last) {
+                    const span = Math.max(0, (track.presentationEnd - last.mediaTime) * movieScale / track.scale);
+                    setDuration(last.off, v1, span);
+                    duration = editsDuration - last.span + span;
+                }
+            }
+            const tkhdBody = tkhd.start + tkhd.hdr;
+            const trackV1 = init[tkhdBody] === 1;
+            setDuration(tkhdBody + (trackV1 ? 28 : 20), trackV1, duration);
+            const mdia = children(trak).find(b => b.type === 'mdia');
+            const mdhd = mdia && children(mdia).find(b => b.type === 'mdhd');
+            if (mdhd) {
+                const body = mdhd.start + mdhd.hdr;
+                const v1 = init[body] === 1;
+                setDuration(body + (v1 ? 24 : 16), v1, track.decodeEnd);
+            }
+            movieDuration = Math.max(movieDuration, duration);
+        }
+        setDuration(movieBody + (movieV1 ? 24 : 16), movieV1, movieDuration);
+        const mvex = children(movie).find(b => b.type === 'mvex');
+        const mehd = mvex && children(mvex).find(b => b.type === 'mehd');
+        if (mehd) setDuration(mehd.start + mehd.hdr + 4, true, movieDuration);
+        return movieDuration;
+    }
+
+    function randomAccessIndex(indexes) {
+        const tables = [];
+        for (const [id, points] of indexes) {
+            points.sort((a, b) => a.time - b.time || a.offset - b.offset);
+            const data = new Uint8Array(16 + 28 * points.length);
+            const dv = view(data);
+            data[0] = 1;
+            dv.setUint32(4, id);
+            dv.setUint32(8, 0x3f); // four bytes each for traf, trun and sample number
+            dv.setUint32(12, points.length);
+            let off = 16;
+            for (const point of points) {
+                dv.setBigUint64(off, BigInt(point.time));
+                dv.setBigUint64(off + 8, BigInt(point.offset));
+                dv.setUint32(off + 16, point.traf);
+                dv.setUint32(off + 20, point.run);
+                dv.setUint32(off + 24, point.sample);
+                off += 28;
+            }
+            tables.push(box('tfra', data));
+        }
+        const mfro = new Uint8Array(8);
+        view(mfro).setUint32(4, 24 + tables.reduce((sum, table) => sum + table.byteLength, 0));
+        return box('mfra', ...tables, box('mfro', mfro));
     }
 
     /** Track id of the first traf of a fragment (-1 if none). */
@@ -364,6 +512,9 @@
             this.seq = 0;
             this.outPos = 0;        // bytes written to the sink so far
             this.wroteInit = false;
+            this.trackEnds = new Map();
+            this.indexes = new Map();
+            this.defaults = new Map();
             this.idMaps = [];
             this.failedSegments = 0;
             this.included = new Set();   // TsTracks whose init is in the written moov
@@ -374,7 +525,11 @@
         async addInit(srcIndex, data) {
             const s = this.source(srcIndex);
             s.kind = 'fmp4';
-            if (!s.init) s.init = u8(data).slice();
+            const next = u8(data);
+            if (!s.init) s.init = next.slice();
+            else if (s.init.length !== next.length || s.init.some((value, i) => value !== next[i])) {
+                throw new Error('This stream changes MP4 initialization data mid-export.');
+            }
         }
 
         source(i) {
@@ -460,13 +615,23 @@
             const inits = [];
             this.src.forEach((s, i) => { for (const init of this.initOf(s)) inits.push(remapTrackIds(init.slice(), this.idMaps[i])); });
             this.src.forEach(s => s && s.tracks.forEach(t => { if (t.init) this.included.add(t); }));
-            await this.out(mergeInits(inits));
+            this.header = mergeInits(inits);
+            for (const [id, scale] of timescales(this.header)) this.trackEnds.set(id, { scale, decodeEnd: 0, presentationEnd: 0 });
+            walk(this.header, b => {
+                if (b.type !== 'trex') return;
+                const off = b.start + b.hdr;
+                const dv = view(this.header);
+                this.defaults.set(dv.getUint32(off + 4), { duration: dv.getUint32(off + 12), flags: dv.getUint32(off + 20) });
+            });
+            await this.out(this.header);
             this.wroteInit = true;
         }
 
         /** Fix one stored fragment (timing, ids, sequence number, base offsets) and write it. */
         async writeFragment(srcIndex, frag) {
-            await this.out(this.fixFragment(srcIndex, frag));
+            const output = this.fixFragment(srcIndex, frag);
+            indexFragment(output, this.defaults, this.trackEnds, this.outPos, this.indexes);
+            await this.out(output);
         }
 
         async flushPending() {
@@ -541,6 +706,33 @@
             return frag;
         }
 
+        async openSpool(s) {
+            if (s.spool !== undefined) return s.spool;
+            s.spool = null;
+            const dir = await navigator.storage?.getDirectory?.().catch(() => null);
+            if (!dir) return null;
+            const name = 'export-mux-' + crypto.randomUUID();
+            try {
+                const handle = await dir.getFileHandle(name, { create: true });
+                if (!handle.createWritable) { await dir.removeEntry(name); return null; }
+                const writable = await handle.createWritable();
+                s.spool = { dir, name, handle, writable, size: 0 };
+            } catch (_) { await dir.removeEntry(name).catch(() => {}); }
+            return s.spool;
+        }
+
+        async discardFragments() {
+            for (const s of this.src) {
+                if (!s) continue;
+                s.frags = [];
+                const spool = s.spool;
+                if (!spool) continue;
+                s.spool = null;
+                if (spool.writable) await spool.writable.abort().catch(() => {});
+                await spool.dir.removeEntry(spool.name).catch(() => {});
+            }
+        }
+
         async emit(srcIndex, frags) {
             if (!frags.length) return;
             if (this.sourceCount === 1) {
@@ -556,15 +748,18 @@
                 for (const f of frags) await this.writeFragment(0, f);
                 return;
             }
-            // Several sources: keep fragments (Blobs may be disk-backed) until every init is known,
-            // with only small per-fragment metadata (byte range + raw decode times) in memory.
-            const blob = new Blob(frags);
-            let p = 0;
+            // Keep interleaving metadata in memory and spool media to disk where supported.
+            const source = this.src[srcIndex];
+            const spool = await this.openSpool(source);
+            const blob = spool ? null : new Blob(frags);
+            let p = spool?.size || 0;
             for (const f of frags) {
+                if (spool) await spool.writable.write(f);
                 const t = fragTimings(f).filter(x => x.off >= 0).map(x => [x.id, x.base]);
-                this.src[srcIndex].frags.push({ blob, start: p, end: p + f.byteLength, t });
+                source.frags.push({ blob, start: p, end: p + f.byteLength, t });
                 p += f.byteLength;
             }
+            if (spool) spool.size = p;
         }
 
         /** Decode time (seconds, before the shared offset) of a stored fragment, or NaN. */
@@ -580,15 +775,21 @@
 
         /** Write every source's fragments merged in ascending decode time (ties: lower source). */
         async writeInterleaved() {
-            const queues = this.src.map((s, i) => {
+            const queues = await Promise.all(this.src.map(async (s, i) => {
+                let file;
+                if (s.spool) {
+                    await s.spool.writable.close();
+                    s.spool.writable = null;
+                    file = await s.spool.handle.getFile();
+                }
                 let last = -Infinity; // untimed fragments follow the previous one of their source
                 const times = s.frags.map(item => {
                     const t = this.fragTime(i, item);
                     if (!Number.isNaN(t)) last = t;
                     return last;
                 });
-                return { items: s.frags, times, k: 0 };
-            });
+                return { items: s.frags, times, file, k: 0 };
+            }));
             for (;;) {
                 let best = -1;
                 for (let i = 0; i < queues.length; i++) {
@@ -600,7 +801,7 @@
                 const q = queues[best];
                 const item = q.items[q.k];
                 q.items[q.k++] = null; // let the Blob go once every fragment of it is written
-                const buf = new Uint8Array(await item.blob.slice(item.start, item.end).arrayBuffer());
+                const buf = new Uint8Array(await (item.blob || q.file).slice(item.start, item.end).arrayBuffer());
                 await this.writeFragment(best, buf);
             }
             for (const s of this.src) s.frags = [];
@@ -611,9 +812,12 @@
             if (this.sourceCount > 1) {
                 if (!this.src.length || this.src.some(s => !s || !this.initOf(s).length)) throw new Error('A track produced no media');
                 await this.writeInit();
-                await this.writeInterleaved();
+                try { await this.writeInterleaved(); }
+                finally { await this.discardFragments(); }
             }
-            if (!this.wroteInit) throw new Error('Nothing could be converted to MP4');
+            if (!this.wroteInit || !finalDurations(this.header, this.trackEnds)) throw new Error('Nothing could be converted to MP4');
+            if (this.indexes.size) await this.out(randomAccessIndex(this.indexes));
+            await this.sink.rewriteHeader(this.header);
             await this.sink.close();
         }
     }

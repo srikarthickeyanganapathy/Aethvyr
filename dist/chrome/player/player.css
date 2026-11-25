@@ -11,16 +11,16 @@ html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: h
   --fs-glass-border: 1px solid var(--glass-border);
   --fs-glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.22);
   --fs-shadow-floating: 0 8px 24px #0005;
-  --fs-accent: #0A84FF;
-  --fs-accent-strong: #0058D0;
+  --fs-accent: var(--accent-default);
+  --fs-accent-strong: var(--accent-active);
   --fs-spring: var(--ease-spring);
   --fs-text: var(--text-primary);
   --fs-text-2: var(--text-secondary);
   --fs-sep: rgba(255, 255, 255, 0.12);
   --fs-fill: rgba(255, 255, 255, 0.12);
   --fs-fill-hover: rgba(255, 255, 255, 0.2);
-  --fs-amber: #FF9F0A;
-  --fs-red: #FF453A;
+  --fs-amber: var(--warning);
+  --fs-red: var(--error);
   position: relative; inline-size: 100%; block-size: 100%; container-type: inline-size; background: #000; color: var(--fs-text); overflow: hidden; outline: none;
   font: 400 calc(var(--u) * 13)/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", Roboto, system-ui, sans-serif;
   letter-spacing: -0.01em; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none;
@@ -550,3 +550,85 @@ input[type="text"] { width: 100%; min-width: 0; }
 .root:is([data-skin="cinema"], [data-skin="theater"]) .t-left,
 .root:is([data-skin="cinema"], [data-skin="theater"]) .t-right { padding-inline: 6px; border-radius: 6px; background: #121214bf; }
 .tip { border-radius: 8px; background: #151518f0; box-shadow: none; }
+.mark.clip-mark { background: var(--fs-accent); width: 3px; }
+
+.local-player {
+    --player-accent: var(--accent-default);
+    --player-accent-strong: var(--accent-active);
+    --player-border: var(--glass-border);
+    height: 100dvh;
+    display: grid;
+    grid-template-rows: auto minmax(92px, 1fr) auto;
+    gap: var(--space-3);
+    padding: var(--space-3) clamp(12px, 3vw, 32px);
+    overflow: auto;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font: calc(14px * var(--player-ui-scale, 1))/1.5 system-ui, sans-serif;
+    accent-color: var(--player-accent);
+}
+.local-player.high-contrast { --player-border: currentColor; }
+.vault-panel { display: grid; gap: var(--space-2); }
+.local-heading, .local-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+}
+.local-heading { justify-content: space-between; }
+.local-heading h1 { font-size: 1.2em; margin: 0; }
+.local-control {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    max-width: 100%;
+    border: 1px solid var(--player-border);
+    border-radius: var(--radius-control);
+    padding: 0 var(--space-3);
+    background: var(--control-fill);
+    color: var(--text-primary);
+    font: inherit;
+    text-decoration: none;
+}
+button.local-control, summary.local-control, a.local-control, select.local-control { cursor: pointer; }
+.local-control[hidden] { display: none; }
+.local-control:hover { background: var(--control-hover); }
+.local-control.primary { background: var(--player-accent-strong); color: #fff; font-weight: 600; }
+.local-control.primary:hover { filter: brightness(1.12); }
+.local-control:disabled { cursor: default; opacity: .6; }
+.local-player :focus-visible { outline: 2px solid var(--player-accent); outline-offset: 3px; }
+.local-status { margin: 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+.vault-player { display: flex; align-items: center; justify-content: center; }
+.vault-panel {
+    width: min(100%, 560px);
+    padding: var(--space-4);
+    border: 1px solid var(--player-border);
+    border-radius: var(--radius-panel);
+    background: var(--glass-surface);
+}
+.vault-panel progress { width: 100%; }
+
+.local-intake {
+    position: absolute;
+    z-index: var(--z-overlay);
+    inset: 50% auto auto 50%;
+    transform: translate(-50%, -50%);
+    width: max-content;
+    max-width: calc(100% - 32px);
+    padding: 16px;
+    border-radius: var(--radius-panel);
+    text-align: center;
+}
+.local-intake[hidden] { display: none; }
+.local-intake p { margin: 0 0 10px; }
+.local-intake div { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.local-playlist { color: inherit; max-width: min(24vw, 240px); }
+.local-playlist[hidden] { display: none; }
+.root.is-dropping { outline: 2px dashed var(--fs-accent); outline-offset: -5px; }
+
+/* Keep playback actions in the dock. Secondary shortcuts remain in Studio → Tools. */
+.root:not([data-density="pro"]) .capsule-right :is(.btn-lock, .btn-info, .btn-audio-only, .btn-mini) { display: none; }
+.tip { z-index: 4; }
+.tip-thumb canvas { display: block; max-width: 100%; height: auto; }
+
+.pop-guide { margin-inline-start: auto; text-decoration: none; white-space: nowrap; font-size: 12px; }

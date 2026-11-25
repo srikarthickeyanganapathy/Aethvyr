@@ -836,6 +836,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             const dropped = q ? q.droppedVideoFrames - g.dropped0 : 0;
             const total = q ? Math.max(1, q.totalVideoFrames - g.total0) : 1;
             const frameMs = g.gpuN ? g.gpu / g.gpuN : g.cpu / Math.max(1, g.frames);
+            this.lastTiming = { cpuSubmitMs: g.cpu / Math.max(1, g.frames), gpuMs: g.gpuN ? frameMs : null };
             const dropRatio = dropped / total;
             const overloaded = frameMs > 14 || (dropped > 6 && dropRatio > 0.08);
             const strikes = overloaded ? (g.strikes || 0) + 1 : 0;

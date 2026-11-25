@@ -26,13 +26,7 @@
     const SEEK_STEPS = [5, 10, 15, 30];
     const SKIP_STEPS = [30, 60, 85, 90];
     const SLEEP_OPTIONS = [[0, 'Off'], [15, '15 minutes'], [30, '30 minutes'], [45, '45 minutes'], [60, '60 minutes'], ['eov', 'End of video']];
-    const ACCENTS = {
-        blue: { label: 'System Blue', fill: '#0A84FF', strong: '#0058D0' },
-        green: { label: 'Green', fill: '#30D158', strong: '#1E7A36' },
-        indigo: { label: 'Indigo', fill: '#5E5CE6', strong: '#4643C9' },
-        amber: { label: 'Amber', fill: '#FF9F0A', strong: '#9A5B00' },
-        rose: { label: 'Rose', fill: '#FF375F', strong: '#C21E45' }
-    };
+    const ACCENTS = window.VelostreamShared.ACCENTS;
     const UI_SCALES = [[0.85, '85%'], [1, '100%'], [1.25, '125%'], [1.5, '150%']];
     const AUTOHIDE = [[2000, '2 seconds'], [3000, '3 seconds'], [5000, '5 seconds'], [0, 'Never']];
     const EXTERNAL_APPS = [['potplayer', 'PotPlayer', 'Windows'], ['vlc', 'VLC', 'needs vlc:// handler on desktop'], ['mpv', 'mpv', 'needs mpv:// handler'], ['iina', 'IINA', 'macOS'], ['android', 'Android video app', 'MX Player, VLC…']];
@@ -357,26 +351,33 @@
             // An <a download> gives no completion signal: keep the URL alive long enough.
             setTimeout(() => URL.revokeObjectURL(url), 10 * 60000);
         };
-        if (!extApi || !extApi.downloads || !extApi.downloads.download) { viaAnchor(); return Promise.resolve(); }
-        return new Promise(resolve => {
+        if (!extApi || !extApi.downloads || !extApi.downloads.download) { viaAnchor(); return Promise.resolve(false); }
+        return new Promise((resolve, reject) => {
             let id = null;
-            const done = () => {
+            const done = (error) => {
                 try { extApi.downloads.onChanged.removeListener(onChanged); } catch (_) { /* ignore */ }
                 URL.revokeObjectURL(url);
-                resolve();
+                if (error) reject(new Error(error));
+                else resolve(true);
             };
             const onChanged = (delta) => {
                 if (delta.id !== id || !delta.state) return;
-                if (delta.state.current === 'complete' || delta.state.current === 'interrupted') done();
+                if (delta.state.current === 'complete') done();
+                if (delta.state.current === 'interrupted') done('Browser download interrupted.');
             };
             extApi.downloads.onChanged.addListener(onChanged);
             Promise.resolve(extApi.downloads.download({ url, filename: name, saveAs })).then((dlId) => {
                 id = dlId;
-                if (id == null) done(); // cancelled before it started
-            }, () => {
+                if (id == null) done('Browser download cancelled.');
+                else extApi.downloads.search({ id }).then(([item]) => {
+                    if (item?.state === 'complete') done();
+                    else if (!item || item.state === 'interrupted') done('Browser download interrupted.');
+                }).catch(() => { });
+            }, (error) => {
+                if (/cancel|abort|user.canceled/i.test(error?.message || '')) { done('Browser download cancelled.'); return; }
                 try { extApi.downloads.onChanged.removeListener(onChanged); } catch (_) { /* ignore */ }
                 viaAnchor();
-                resolve();
+                resolve(false);
             });
         });
     }
@@ -394,6 +395,7 @@
             this.mime = mime;
             this.parts = [];
             this.writable = null;
+            this.temp = null;
             this.bytes = 0;
         }
 
@@ -418,23 +420,68 @@
             return sink;
         }
 
+        async openTemporaryFile() {
+            const dir = await navigator.storage?.getDirectory?.().catch(() => null);
+            if (!dir) return;
+            const key = 'export-' + crypto.randomUUID();
+            try {
+                const handle = await dir.getFileHandle(key, { create: true });
+                if (!handle.createWritable) { await dir.removeEntry(key); return; }
+                this.writable = await handle.createWritable();
+                this.temp = { dir, key, handle };
+            } catch (_) { await dir.removeEntry(key).catch(() => {}); }
+        }
+
         async write(chunk) {
+            if (!this.writable && !this.bytes) await this.openTemporaryFile();
             this.bytes += chunk.byteLength || chunk.size || 0;
             if (!this.writable && this.bytes > 128 * 1024 * 1024) throw new Error('This browser can only save up to 128 MB per export without a file picker.');
             if (this.writable) await this.writable.write(chunk);
             else this.parts.push(chunk instanceof Blob ? chunk : new Blob([chunk]));
         }
 
+        async rewriteHeader(bytes) {
+            if (this.writable) await this.writable.write({ type: 'write', position: 0, data: bytes });
+            else this.parts[0] = new Blob([bytes]);
+        }
+
         async close() {
-            if (this.writable) { await this.writable.close(); this.writable = null; return; }
+            if (this.writable) {
+                await this.writable.close();
+                this.writable = null;
+                if (this.temp) {
+                    let finished = true;
+                    try {
+                        const file = await this.temp.handle.getFile();
+                        finished = await downloadBlob(this.container, new Blob([file], { type: this.mime }), this.filename);
+                    }
+                    finally {
+                        if (finished) await this.removeTemporaryFile();
+                        else {
+                            const { dir, key } = this.temp;
+                            this.temp = null;
+                            setTimeout(() => dir.removeEntry(key).catch(() => {}), 10 * 60000);
+                        }
+                    }
+                }
+                return;
+            }
             const blob = new Blob(this.parts, { type: this.mime });
             this.parts = [];
             await downloadBlob(this.container, blob, this.filename);
         }
 
+        async removeTemporaryFile() {
+            if (!this.temp) return;
+            const { dir, key } = this.temp;
+            this.temp = null;
+            await dir.removeEntry(key).catch(() => {});
+        }
+
         async abort() {
             this.parts = [];
             if (this.writable) { try { await this.writable.abort(); } catch (_) { /* ignore */ } this.writable = null; }
+            await this.removeTemporaryFile();
         }
     }
 
@@ -1022,6 +1069,7 @@
             this.variantsSig = '';
             this.lastVariantsSentAt = 0;
             this.loop = { a: null, b: null };
+            this.clip = { start: null, end: null };
             this.bookmarks = [];
             this.filters = { ...DEFAULT_FILTERS };
             this.xf = { zoom: 1, panX: 0, panY: 0, rotate: 0, flip: false };
@@ -1043,6 +1091,7 @@
             this.errorShown = false;
             this.secondTick = 0;
             this.lastQuality = { total: 0, at: 0 };
+            this.diagnostics = { history: [], errors: {} };
             this.statusPersistent = null;
             this.resolveInit = null;
             this.initPromise = new Promise(res => { this.resolveInit = res; });
@@ -1051,7 +1100,14 @@
             this.port = new PortClient(rawPort, msg => this.onMessage(msg));
             this.buildDom();
             this.bindUi();
-            this.start().catch(err => this.showError('Could not start the player', String((err && err.message) || err)));
+            this.localPlayback = !!host.local;
+            if (host.local) {
+                this.resolveInit({ stream: { id: 'local', type: 'progressive', title: 'Open Local File', url: '' } });
+                this.resolveInit = null;
+            }
+            this.ready = this.start();
+            this.ready.catch(err => this.showError('Could not start the player', String((err && err.message) || err)));
+            bindLocalFiles(this, host.fileId, !!host.local);
         }
 
         // -----------------------------------------------------------------
@@ -1079,8 +1135,14 @@
             let domain = '';
             try { domain = new URL(this.stream.url).hostname; } catch (_) { domain = location.hostname; }
             this.$('.domain').textContent = domain;
-            this.root.setAttribute('aria-label', `Velostream player: ${title}`);
+            this.root.setAttribute('aria-label', `Aethvyr player: ${title}`);
             this.applySettings();
+            if (this.hostApi.local) {
+                this.setStatus('paused');
+                this.showControls(true);
+                this.updateDownloadButton();
+                return;
+            }
             await this.loadBookmarks();
             // Continue from where the site's own player was (handed over by the content script).
             this.setCaptured(init.subtitles);
@@ -1265,7 +1327,7 @@
         async importBackup(file) {
             const S = window.VelostreamShared;
             if (!extApi || !S || !S.restoreBackup) { this.announce('Restore is not available here', 'warn'); return; }
-            if (file.size > 5 * 1024 * 1024) { this.announce('That file is too large to be a Velostream backup', 'warn'); return; }
+            if (file.size > 5 * 1024 * 1024) { this.announce('That file is too large to be an Aethvyr backup', 'warn'); return; }
             try {
                 // Drop unsent edits: the backup replaces the settings they were made against.
                 clearTimeout(this.saveTimer);
@@ -1368,6 +1430,7 @@
             const v = this.video;
             const type = this.stream.type;
             const gen = ++this.loadGen;
+            this.diagnostics = { started: performance.now(), history: [], errors: {}, waitingMs: 0, waitingEvents: 0 };
             this.hideError();
             if (type === 'progressive') {
                 this.mode = 'native';
@@ -1379,10 +1442,10 @@
                 this.audio.corsOk = false;
                 this.nativeMetaOk = false;
                 this.nativeStart = startTime || 0;
-                if (this.corsUnavailable) v.removeAttribute('crossorigin');
+                if (this.localPlayback || this.corsUnavailable) v.removeAttribute('crossorigin');
                 else v.crossOrigin = 'anonymous';
                 v.src = this.stream.url;
-                if (startTime) v.currentTime = startTime;
+                if (startTime && !this.localPlayback) v.currentTime = startTime;
             } else {
                 this.mode = 'mse';
                 if (!shaka || !shaka.Player.isBrowserSupported()) throw new Error('This browser does not support Media Source Extensions.');
@@ -1637,6 +1700,11 @@
             this.resetFileThumbs();
             this.clearThumbCache();
             this.stopSubsPip();
+            const exportState = this.exportState;
+            if (exportState?.running) {
+                this.port.send({ type: 'EXPORT_CANCEL' });
+                this.onExportMessage({ type: 'EXPORT_ERROR', error: 'Export paused.' });
+            }
             try { if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => { }); } catch (_) { /* ignore */ }
             try { if (document.fullscreenElement) document.exitFullscreen().catch(() => { }); } catch (_) { /* ignore */ }
             try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (_) { /* ignore */ }
@@ -1686,6 +1754,7 @@
 
         onMessage(msg) {
             if (this.closed) return;
+            if (this.localPlayback && !['RESPONSE', 'SETTINGS_CHANGED', 'COMMAND'].includes(msg.type)) return;
             switch (msg.type) {
                 case 'RESPONSE':
                 case 'FRESH': {
@@ -1693,6 +1762,9 @@
                     if (e) { this.net.delete(msg.reqId); e.resolve(msg); }
                     break;
                 }
+                case 'ENGINE_DISCONNECTED':
+                    if (this.exportState?.running) this.onExportMessage({ type: 'EXPORT_ERROR', error: 'Export paused. Resume it from the library.' });
+                    break;
                 case 'INIT':
                     if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
                     if (this.resolveInit) { this.resolveInit(msg); this.resolveInit = null; }
@@ -1797,7 +1869,7 @@
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <filter id="fs-sharpen"><feConvolveMatrix id="fs-kernel" order="3" kernelMatrix="0 0 0 0 1 0 0 0 0" preserveAlpha="true"/></filter>
 </svg>
-<div class="root" role="dialog" aria-modal="true" aria-label="Velostream player" tabindex="-1" data-rm="system">
+<div class="root" role="dialog" aria-modal="true" aria-label="Aethvyr player" tabindex="-1" data-rm="system">
   <div class="stage">
     <canvas class="ambient-canvas" width="32" height="18" aria-hidden="true"></canvas>
     <div class="vbox"><video playsinline webkit-playsinline preload="auto" aria-label="Video"></video><canvas class="gl-canvas" hidden aria-hidden="true"></canvas></div>
@@ -1834,7 +1906,7 @@
       <div class="pill-left glass">
         <button type="button" class="ib btn-close" aria-label="Close player">${icon('close', 18)}</button>
         <span class="vdiv" aria-hidden="true"></span>
-        <div class="titles"><span class="title">Velostream</span><span class="domain"></span></div>
+        <div class="titles"><span class="title">Aethvyr</span><span class="domain"></span></div>
         <span class="chip abr num" aria-hidden="true" hidden></span>
         <span class="chip sleep-chip num" hidden>${icon('moon')}<span></span></span>
       </div>
@@ -1842,7 +1914,7 @@
       <div class="capsule-right glass" role="toolbar" aria-label="Player tools">
         <button type="button" class="ib btn-lock" data-look="lock" aria-label="Lock touch controls">${icon('lock')}</button>
         <button type="button" class="ib btn-info adv narrow-hide" data-look="info" aria-pressed="false" aria-label="Stream statistics">${icon('info')}</button>
-        <button type="button" class="ib ring-host btn-dl adv" data-look="dl" aria-label="Download stream">${icon('download')}<svg class="ring" viewBox="0 0 44 44" aria-hidden="true" hidden><circle class="track" cx="22" cy="22" r="19"/><circle class="prog" cx="22" cy="22" r="19" stroke-dasharray="119.38" stroke-dashoffset="119.38"/></svg></button>
+        <button type="button" class="ib ring-host btn-dl" data-look="dl" aria-label="Download stream">${icon('download')}<svg class="ring" viewBox="0 0 44 44" aria-hidden="true" hidden><circle class="track" cx="22" cy="22" r="19"/><circle class="prog" cx="22" cy="22" r="19" stroke-dasharray="119.38" stroke-dashoffset="119.38"/></svg></button>
         <button type="button" class="ib btn-audio-only adv narrow-hide" data-look="audioOnly" aria-pressed="false" aria-label="Audio-only battery saver">${icon('headphones')}</button>
         <button type="button" class="ib btn-mini" data-look="mini" aria-label="Collapse to mini player">${icon('mini')}</button>
       </div>
@@ -1915,7 +1987,7 @@
   <div class="card error glass elevated" role="alertdialog" aria-modal="true" aria-labelledby="fs-err-title" aria-describedby="fs-err-msg">
     <h2 id="fs-err-title">${icon('warn')}<span>Playback error</span></h2>
     <p id="fs-err-msg"></p>
-    <div class="btns"><button type="button" class="pillbtn primary btn-retry">Retry</button><button type="button" class="pillbtn btn-err-close">Close player</button></div>
+    <div class="btns"><button type="button" class="pillbtn primary btn-retry">Retry</button><button type="button" class="pillbtn btn-report">Save diagnostics</button><button type="button" class="pillbtn btn-err-close">Close player</button></div>
   </div>
 </div>`);
             document.body.appendChild(host);
@@ -2136,14 +2208,15 @@
             const span = r.end - r.start;
             if (!(span > 1)) return;
             const N = 120;
-            if (!this.heat || this.heat.span !== Math.round(span)) this.heat = { span: Math.round(span), lv: new Float32Array(N) };
+            if (!this.heat || this.heat.gen !== this.loadGen || this.heat.span !== Math.round(span)) this.heat = { gen: this.loadGen, span: Math.round(span), lv: new Float32Array(N) };
             const lv = this.heat.lv;
             if (!v.paused && this.audio.active) {
                 const i = clamp(Math.floor((v.currentTime - r.start) / span * N), 0, N - 1);
                 const level = Math.min(1, Math.sqrt(this.audio.rms()) * 1.6);
                 lv[i] = lv[i] ? lv[i] * 0.6 + level * 0.4 : Math.max(level, 0.05);
             }
-            if (!force && (this.tickCount || 0) % 2) return; // draw at 2 Hz
+            if (!force && performance.now() - (this.lastHeatDraw || 0) < 500) return;
+            this.lastHeatDraw = performance.now();
             const dpr = Math.min(2, window.devicePixelRatio || 1);
             const W = Math.round(c.clientWidth * dpr);
             const H = Math.round(18 * dpr);
@@ -2274,6 +2347,7 @@
             on('.mini-close', 'click', () => this.destroy());
             on('.btn-err-close', 'click', () => this.destroy());
             on('.btn-retry', 'click', () => this.retry());
+            on('.btn-report', 'click', () => this.saveDiagnostics());
             on('.btn-play', 'click', () => this.togglePlay());
             on('.mini-play', 'click', () => this.togglePlay());
             on('.mini-expand', 'click', () => this.setMini(false));
@@ -2326,13 +2400,28 @@
             media('play', () => {
                 this.updatePlayButtons();
                 if (this.audio.active) this.audio.ensure();
-                if (this.sleepPausedPrefetch) { this.sleepPausedPrefetch = false; this.port.send({ type: 'PREFETCH', enabled: true }); }
+                if (this.sleepPausedPrefetch && !this.localPlayback) { this.sleepPausedPrefetch = false; this.port.send({ type: 'PREFETCH', enabled: true }); }
             });
             media('playing', () => { if (this.gpu && this.gpu.active && !this.audioOnly) this.gpu.start(); });
             media('pause', () => { if (this.gpu) { this.gpu.stop(); this.gpu.renderOnce(); } });
-            media('playing', () => { this.setBuffering(false); this.setStatus('playing'); this.scheduleHide(); });
+            media('playing', () => {
+                const d = this.diagnostics;
+                if (d.started !== undefined && d.startupMs === undefined) d.startupMs = performance.now() - d.started;
+                this.finishDiagnosticWait();
+                this.setBuffering(false);
+                this.setStatus('playing');
+                this.scheduleHide();
+            });
             media('pause', () => { this.updatePlayButtons(); if (!v.ended) this.setStatus('paused'); this.showControls(true); this.saveHistory(true); });
-            media('waiting', () => this.setBuffering(true));
+            media('waiting', () => {
+                const d = this.diagnostics;
+                if (d.startupMs !== undefined && d.waitSince === undefined && !v.paused && !v.seeking) {
+                    d.waitSince = performance.now();
+                    d.waitingEvents++;
+                }
+                this.setBuffering(true);
+            });
+            media('pause', () => this.finishDiagnosticWait());
             media('canplay', () => this.setBuffering(false));
             media('ended', () => {
                 this.setStatus('ended');
@@ -2349,6 +2438,10 @@
             });
             media('loadedmetadata', () => {
                 if (this.mode === 'native') {
+                    if (this.localPlayback && this.nativeStart) {
+                        v.currentTime = Math.min(this.nativeStart, v.duration);
+                        this.nativeStart = 0;
+                    }
                     this.nativeMetaOk = true;
                     // Metadata arrived through a CORS request: the element is untainted.
                     this.audio.corsOk = v.getAttribute('crossorigin') !== null;
@@ -2367,6 +2460,11 @@
             media('leavepictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'false'));
             media('error', () => {
                 if (this.mode !== 'native' || !v.error || this.closed) return;
+                this.diagnostics.errors.mediaCode = v.error.code;
+                if (this.localPlayback) {
+                    this.showError('Cannot play this file', 'This browser could not read the file or its codec.');
+                    return;
+                }
                 // The CORS request failed before any metadata (no Access-Control-Allow-Origin,
                 // or the server needs the cookies an anonymous CORS request does not send):
                 // reload once without crossorigin from the same position. Web Audio / WebGL
@@ -2380,8 +2478,10 @@
                 // <video> only reports "format error"; ask the engine what the server really said.
                 this.probeStatus(this.stream.url).then(status => {
                     if (status === 401 || status === 403) {
-                        this.showError('Access denied', `The server refused the file (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Velostream again.`);
+                        this.diagnostics.errors.httpStatus = status;
+                        this.showError('Access denied', `The server refused the file (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Aethvyr again.`);
                     } else if (status >= 400) {
+                        this.diagnostics.errors.httpStatus = status;
                         this.showError('Cannot load this file', `The server returned HTTP ${status}.`);
                     } else if (!status) {
                         this.showError('Cannot load this file', 'The file could not be downloaded. Check your connection and retry.');
@@ -2967,10 +3067,12 @@
             if (!err) return;
             const code = err.code;
             const data = Array.isArray(err.data) ? err.data : [];
+            this.diagnostics.errors.shakaCode = code;
+            if (code === 1001 && Number.isInteger(data[1])) this.diagnostics.errors.httpStatus = data[1];
             const netUrl = code >= 1000 && code < 2000 && typeof data[0] === 'string' ? data[0] : '';
             const reason = code === 1002 && data[1] ? String(data[1].message || data[1]) : '';
             const httpStatus = code === 1001 && typeof data[1] === 'number' ? ` HTTP ${data[1]}` : '';
-            console.warn(`[Velostream] Shaka error ${code}${httpStatus} (severity ${err.severity})${netUrl ? ` ${netUrl.slice(0, 300)}` : ''}${reason ? ` - ${reason}` : ''}`);
+            console.warn(`[Velostream] Shaka error ${code}${httpStatus} (severity ${err.severity})`);
             if (code === 3017) {
                 // QUOTA_EXCEEDED_ERROR: mobile SourceBuffer limits. Shrink buffers and keep going.
                 this.player.configure({ streaming: { bufferBehind: 8, bufferingGoal: 15 } });
@@ -3015,13 +3117,13 @@
             let msg = `Error code ${code}.`;
             if (code === 1001) {
                 msg = status === 403 || status === 401 || status === 410
-                    ? `The server${from} refused access (HTTP ${status}). Sites like this sign their video links and the signature expires after a while. Reload the page and open Velostream again to get a fresh link.`
+                    ? `The server${from} refused access (HTTP ${status}). Sites like this sign their video links and the signature expires after a while. Reload the page and open Aethvyr again to get a fresh link.`
                     : `The server${from} returned HTTP ${status}.`;
             } else if (code === 1002 || code === 1003) {
                 msg = `${code === 1003 ? 'Timed out' : 'Network error'} while loading the stream${from}${reason ? ` (${reason})` : ''}. Check your connection, or that an ad or content blocker is not blocking ${host || 'the video server'}, then retry.`;
             } else if (code >= 6000 && code < 7000 || (this.drmInfo && (code === 3016 || code === 4032))) {
                 const ks = this.drmInfo && this.drmInfo.keySystem ? ` (${this.drmInfo.keySystem.replace(/^com\./, '')})` : '';
-                msg = `This stream is protected by DRM${ks} and can only be decrypted by the website's own player. Close Velostream to keep watching there, or use Studio › Tools › Open in external player for non-DRM copies.`;
+                msg = `This stream is protected by DRM${ks} and can only be decrypted by the website's own player. Close Aethvyr to keep watching there, or use Studio › Tools › Open in external player for non-DRM copies.`;
             } else if (code === 4032 || code === 4012 || code === 3016 || code === 4001) {
                 msg = 'This browser cannot decode the stream\'s format or codecs.';
             } else if (code === 4000 || code === 4030) {
@@ -3242,8 +3344,10 @@
                 ta.style.cssText = 'position:fixed;opacity:0;left:-9999px';
                 this.shadow.appendChild(ta);
                 ta.select();
-                try { document.execCommand('copy'); } catch (__) { /* ignore */ }
+                let copied = false;
+                try { copied = document.execCommand('copy'); } catch (_) { /* clipboard unavailable */ }
                 ta.remove();
+                if (!copied) { this.announce('Clipboard access was blocked.', 'warn'); return; }
             }
             this.island('check', done);
         }
@@ -3401,6 +3505,7 @@
             const chosen = this.gpuOverride || this.settings.shader || 'off';
             const mobile = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 700;
             if (chosen === 'auto') {
+                if (this.settings.resourceProfile === 'eco') return { preset: 'off', strength: 0 };
                 const hardware = this.graphicsHardware ||= this.detectHardwareTier();
                 if (!hardware.webgl || /SwiftShader|llvmpipe|Microsoft Basic Render/i.test(hardware.renderer)) return { preset: 'off', strength: 0 };
                 const budget = window.VelostreamShared.graphicsBudget(hardware.tier, mobile, this.video.videoHeight);
@@ -3501,6 +3606,7 @@
         }
 
         mediaKey() {
+            if (this.localPlayback) return 'local-' + hashKey(this.stream.id);
             const page = window.VelostreamShared.withoutResumeTime(this.playbackPageUrl);
             const value = JSON.stringify([page, this.stream.url.split('#')[0]]);
             let hash = 0xcbf29ce484222325n;
@@ -3590,6 +3696,7 @@
         }
 
         saveHistory(force, confirm = false) {
+            if (this.localPlayback) return this.saveLocalPosition?.();
             if (!this.stream || !this.settings || this.closed || this.changingMedia || this.isLive()) return;
             const v = this.video;
             const d = Number.isFinite(v.duration) ? v.duration : 0;
@@ -3614,7 +3721,7 @@
         }
 
         async checkResume() {
-            if (!this.settings || this.isLive() || this.closed) return;
+            if (!this.settings || this.isLive() || this.closed || this.localPlayback) return;
             let entry = null;
             try { entry = (await this.port.request('HISTORY_GET', { key: this.mediaKey() })).value; } catch (_) { return; }
             if (!entry) entry = await this.legacyHistory();
@@ -3814,7 +3921,7 @@
                 ctx.getImageData(0, 0, 1, 1); // throws now (not inside toBlob) on a tainted canvas
                 c.toBlob(blob => {
                     if (!blob) { this.announce('Screenshot failed', 'warn'); return; }
-                    downloadBlob(this.shadow, blob, `velostream-${fmtTime(v.currentTime).replace(/:/g, '-')}${withSubs ? '-subs' : ''}.png`, false);
+                    downloadBlob(this.shadow, blob, `aethvyr-${fmtTime(v.currentTime).replace(/:/g, '-')}${withSubs ? '-subs' : ''}.png`, false);
                     this.announce(withSubs ? 'Screenshot with subtitles saved' : 'Screenshot saved', 'camera');
                 }, 'image/png');
             } catch (e) {
@@ -3915,7 +4022,7 @@
                 }
                 const blob = await new Promise(res => c.toBlob(res, 'image/png'));
                 if (!blob) throw new Error('encode failed');
-                downloadBlob(this.shadow, blob, `velostream-burst-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`, false);
+                downloadBlob(this.shadow, blob, `aethvyr-burst-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`, false);
                 this.announce('Burst contact sheet saved', 'burst');
             } catch (e) {
                 this.announce('Burst blocked: cross-origin video without CORS', 'warn');
@@ -3926,6 +4033,7 @@
 
         /** Top-right download button: export VOD, start/stop live recording, or cancel. */
         onDownloadButton() {
+            if (this.localPlayback) { this.openLocalPicker(); return; }
             // A save picker is open (or being opened): ignore repeat presses / remote commands.
             if (this.pickingSink) return;
             if (this.exportState && this.exportState.running) {
@@ -3971,16 +4079,36 @@
             }
             this.recordingSince = 0;
             this.exportState = { running: true, files: {}, status: 'Saving recording…', pct: 0, toMp4, sink, outName: sink ? sink.filename : name, chain: Promise.resolve() };
-            this.port.send({ type: 'RECORD_STOP' });
+            this.port.send({ type: 'RECORD_STOP', format: toMp4 ? 'mp4' : 'original', title: this.$('.title').textContent });
             this.updateDownloadButton();
             this.refreshPopover();
         }
 
-        /** A–B loop range as a clip (player time), or null when it can't be saved as one. */
+        supportsClip() {
+            return this.stream && !this.isLive() && ['hls', 'dash'].includes(this.stream.type);
+        }
+
         clipRange() {
-            const { a, b } = this.loop;
-            if (a == null || b == null || b - a < 0.5 || this.isLive() || !this.stream || !['hls', 'dash'].includes(this.stream.type)) return null;
-            return { start: a, end: b };
+            const { start, end } = this.clip;
+            return this.supportsClip() && start != null && end != null ? { start, end } : null;
+        }
+
+        setClipPoint(point) {
+            const time = this.video.currentTime;
+            if (!this.supportsClip() || !Number.isFinite(time)) return;
+            if (point === 'start') {
+                this.clip.start = time;
+                if (this.clip.end != null && this.clip.end - time < 0.5) this.clip.end = null;
+            } else {
+                if (this.clip.start == null || time - this.clip.start < 0.5) {
+                    this.announce('Set In at least half a second before Out.', 'warn');
+                    return;
+                }
+                this.clip.end = time;
+            }
+            this.announce(`Clip ${point === 'start' ? 'In' : 'Out'} set at ${fmtTime(time)}`, 'check');
+            this.renderMarks();
+            this.refreshPopover();
         }
 
         /**
@@ -4003,13 +4131,17 @@
             // stream played as VP9/WebM has only WebM left: those are saved as the original files.
             cands = cands.filter(v => v.video || v.audio);
             const mp4Only = cands.filter(v => (!v.video || isMp4(v.video)) && (!v.audio || isMp4(v.audio)));
-            const mp4 = mp4Only.length > 0;
-            if (mp4) cands = mp4Only;
+            const active = (p.getVariantTracks() || []).find(t => t.active);
+            const playing = active && cands.find(v => v.id === active.id);
+            if (clip) {
+                if (!playing) throw new Error('The active DASH quality is unavailable.');
+                cands = [playing];
+            }
+            const mp4 = clip ? (!playing.video || isMp4(playing.video)) && (!playing.audio || isMp4(playing.audio)) : mp4Only.length > 0;
+            if (mp4 && !clip) cands = mp4Only;
             const cap = this.qualityCap || Infinity;
             const capped = cands.filter(v => !v.video || (v.video.height || 0) <= cap);
             if (capped.length) cands = capped;
-            const active = (p.getVariantTracks() || []).find(t => t.active);
-            const playing = active && (m.variants || []).find(v => v.id === active.id);
             const lang = playing && playing.audio ? playing.audio.language : null;
             const sameLang = cands.filter(v => !lang || !v.audio || v.audio.language === lang);
             if (sameLang.length) cands = sameLang;
@@ -4066,6 +4198,7 @@
 
         /** @param {{clip?: {start:number,end:number}}} [opts] save only the A–B range (HLS / DASH). */
         async startExport(opts = {}) {
+            if (this.localPlayback) return;
             if (this.pickingSink || (this.exportState && this.exportState.running)) return;
             const clip = opts.clip || null;
             const hls = this.stream.type === 'hls';
@@ -4084,8 +4217,11 @@
                 }
                 if (this.closed) return;
             }
-            const toMp4 = dash ? dashPlan.mp4 && !!window.VelostreamMux
-                : hls && (this.settings.exportFormat || 'mp4') === 'mp4' && !!window.VelostreamMux && !!(window.shaka && shaka.transmuxer && shaka.transmuxer.TsTransmuxer);
+            const toMp4 = this.settings.exportFormat !== 'original' && (hls || !!dashPlan?.mp4);
+            if (toMp4 && (!window.VelostreamMux || (hls && !window.shaka?.transmuxer?.TsTransmuxer))) {
+                this.announce('MP4 conversion is unavailable. Choose Original files in Studio → Tools.', 'warn');
+                return;
+            }
             let title = safeFilename(this.$('.title').textContent || 'video').replace(/\.(m3u8|mpd|mp4|ts)$/i, '');
             if (clip) {
                 const r0 = this.seekRange().start;
@@ -4095,8 +4231,8 @@
             const st = { running: true, files: {}, status: 'Starting…', pct: 0, toMp4, sink: null, muxer: null, chain: Promise.resolve() };
             this.exportState = st;
             // Ask for the destination while the click's user activation is still valid.
-            if (toMp4 || (!hls && !dash) || (dash && dashPlan.parts.length === 1)) {
-                const ext = toMp4 ? 'mp4' : dash ? dashPlan.parts[0].ext : ((/\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(this.stream.url) || ['', 'mp4'])[1]);
+            if (toMp4) {
+                const ext = 'mp4';
                 this.pickingSink = true;
                 try {
                     st.sink = await ExportSink.pick(this.shadow, `${title}.${ext}`, toMp4 ? 'video/mp4' : '');
@@ -4107,11 +4243,12 @@
                 if (!st.sink) { this.exportState = null; this.announce('Download cancelled', 'download'); this.refreshPopover(); return; }
                 st.outName = st.sink.filename;
             }
+            st.isClip = !!clip;
             if (dash) {
-                if (!toMp4 && dashPlan.parts.length > 1) this.announce('WebM stream: saving the original video and audio files', 'download');
-                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts } });
+                if (!toMp4 && dashPlan.parts.length > 1) this.announce('Saving separate original video and audio files', 'download');
+                this.port.send({ type: 'EXPORT_START', dash: { parts: dashPlan.parts }, clip: !!clip, format: toMp4 ? 'mp4' : 'original', title: this.$('.title').textContent });
             } else {
-                this.port.send(clip ? { type: 'EXPORT_START', clip } : { type: 'EXPORT_START' });
+                this.port.send({ type: 'EXPORT_START', clip, format: toMp4 ? 'mp4' : 'original', title: this.$('.title').textContent });
             }
             this.announce(clip ? `Saving A–B clip (${fmtTime(clip.end - clip.start)})` : this.isLive() ? 'Saving live DVR buffer' : 'Download started', 'download');
             this.updateDownloadButton();
@@ -4121,6 +4258,12 @@
         updateDownloadButton() {
             const b = this.$('.btn-dl');
             const ring = b.querySelector('.ring');
+            if (this.localPlayback) {
+                window.VelostreamShared.replaceWithHTML(b.firstElementChild, icon('upload', 20));
+                ring.hidden = true;
+                b.setAttribute('aria-label', 'Open Local File');
+                return;
+            }
             const st = this.exportState;
             const live = this.isLive();
             b.classList.toggle('recording', !!this.recordingSince);
@@ -4140,25 +4283,15 @@
         onExportMessage(msg) {
             const st = this.exportState || (this.exportState = { running: true, files: {}, status: '', pct: 0 });
             if (!st.chain) st.chain = Promise.resolve();
-            st.chain = st.chain.then(() => this.handleExportMessage(st, msg)).catch((err) => {
+            st.chain = st.chain.then(async () => {
+                if (!st.running && msg.type !== 'EXPORT_ERROR') return;
+                await this.handleExportMessage(st, msg);
+                if (msg.sequence != null) this.port.send({ type: 'EXPORT_ACK', jobId: msg.jobId, sequence: msg.sequence });
+            }).catch((err) => {
                 console.warn('[Velostream] Export failed', err);
-                this.handleExportMessage(st, { type: 'EXPORT_ERROR', error: `Saving failed: ${(err && err.message) || err}` });
                 this.port.send({ type: 'EXPORT_CANCEL' });
+                return this.handleExportMessage(st, { type: 'EXPORT_ERROR', error: `Saving failed: ${(err && err.message) || err}` });
             });
-        }
-
-        /** MP4 conversion failed on the first segment: save the original segments instead. */
-        async exportFallbackToRaw(st, err) {
-            console.warn('[Velostream] MP4 remux unavailable, saving original format', err);
-            st.toMp4 = false;
-            st.muxer = null;
-            if (st.sink) { await st.sink.abort(); st.sink = null; }
-            for (const f of Object.values(st.files)) {
-                f.sink = new ExportSink(this.shadow, f.filename, f.mime);
-                for (const chunk of f.raw || []) await f.sink.write(chunk);
-                f.raw = null;
-            }
-            this.announce('MP4 conversion is not possible for this stream; saving the original format', 'warn');
         }
 
         async handleExportMessage(st, msg) {
@@ -4166,7 +4299,7 @@
             switch (msg.type) {
                 case 'EXPORT_BEGIN': {
                     st.running = true;
-                    const f = { filename: msg.filename, mime: msg.mime, raw: [], muxOk: false, sink: null };
+                    const f = { filename: msg.filename, mime: msg.mime, sink: null };
                     st.files[msg.fileIndex] = f;
                     if (st.toMp4) {
                         if (!st.muxer) st.muxer = new window.VelostreamMux.ExportMuxer(st.sink, msg.fileCount || 1);
@@ -4175,26 +4308,20 @@
                     } else {
                         f.sink = new ExportSink(this.shadow, msg.filename, msg.mime);
                     }
+                    if (f.sink && msg.container === 'fmp4') {
+                        f.muxer = new window.VelostreamMux.ExportMuxer(f.sink, 1);
+                    }
                     st.status = `Saving ${st.toMp4 ? st.outName : msg.filename}`;
                     break;
                 }
                 case 'EXPORT_CHUNK': {
                     const f = st.files[msg.fileIndex];
                     if (!f || !msg.data) return;
-                    if (st.toMp4 && st.muxer) {
-                        // Keep the raw bytes until this file's first segment converted, for the fallback.
-                        if (!f.muxOk) f.raw.push(new Uint8Array(msg.data).slice());
-                        try {
-                            if (msg.kind === 'init') await st.muxer.addInit(msg.fileIndex, msg.data);
-                            else {
-                                await st.muxer.addSegment(msg.fileIndex, msg.data, { start: msg.start, end: msg.end, url: msg.url });
-                                f.muxOk = true;
-                                f.raw = null;
-                            }
-                        } catch (err) {
-                            if (f.muxOk) throw err;
-                            await this.exportFallbackToRaw(st, err);
-                        }
+                    const mux = st.muxer || f.muxer;
+                    if (mux) {
+                        const source = f.muxer ? 0 : msg.fileIndex;
+                        if (msg.kind === 'init') await mux.addInit(source, msg.data);
+                        else await mux.addSegment(source, msg.data, { start: msg.start, end: msg.end, url: msg.url });
                         return;
                     }
                     if (f.sink) await f.sink.write(new Uint8Array(msg.data));
@@ -4212,7 +4339,8 @@
                     if (f && f.sink) {
                         st.status = `Finishing ${f.filename}…`;
                         this.updateDownloadButton();
-                        await f.sink.close();
+                        if (f.muxer) await f.muxer.finish();
+                        else await f.sink.close();
                         f.sink = null;
                         this.announce(`Saved ${f.filename}`, 'check');
                     }
@@ -4236,6 +4364,7 @@
                     for (const f of Object.values(st.files)) { if (f.sink && f.sink !== st.sink) await f.sink.abort(); }
                     if (st.sink) await st.sink.abort();
                     st.files = {};
+                    await st.muxer?.discardFragments();
                     st.muxer = null;
                     this.announce(msg.error, 'warn');
                     break;
@@ -4521,6 +4650,15 @@
 
         onSecond() {
             this.secondTick++;
+            const diagnostic = this.diagnostics;
+            if (diagnostic.started !== undefined) {
+                diagnostic.history.push({
+                    elapsedSeconds: (performance.now() - diagnostic.started) / 1000,
+                    bufferSeconds: this.bufferAhead(),
+                    cachedSeconds: this.localPlayback ? null : this.engineStats?.cachedAhead
+                });
+                if (diagnostic.history.length > 60) diagnostic.history.shift();
+            }
             this.sendTelemetry(Date.now() - this.lastVariantsSentAt > 10000);
             this.renderStats();
             this.checkSleep();
@@ -4577,8 +4715,9 @@
         }
 
         sendTelemetry(withVariants) {
+            if (this.localPlayback) return;
             const v = this.video;
-            const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
+            const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, hidden: document.hidden && !document.pictureInPictureElement, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
             if (this.player && this.mode === 'mse') {
                 const tracks = this.currentVariants();
                 const active = tracks.find(t => t.active);
@@ -4668,6 +4807,8 @@
         }
 
         async loadChapters() {
+            const gen = this.loadGen;
+            const apply = chapters => { if (!this.closed && this.loadGen === gen) this.addChapters(chapters); };
             // Shaka chapter tracks (DASH/HLS manifests that declare them).
             if (this.player && this.mode === 'mse' && this.player.getChaptersTracks) {
                 try {
@@ -4675,7 +4816,7 @@
                     if (tracks.length) {
                         const lang = (tracks.find(t => t.language) || tracks[0]).language;
                         const chs = await this.player.getChaptersAsync(lang);
-                        this.addChapters(chs.map(c => ({ start: c.startTime, title: c.title })));
+                        apply(chs.map(c => ({ start: c.startTime, title: c.title })));
                     }
                 } catch (_) { /* no chapters */ }
             }
@@ -4683,12 +4824,13 @@
             for (const t of this.capturedChapters || []) {
                 const text = t.vtt || (t.url ? await this.fetchText(t.url) : '');
                 const cues = text ? parseSubtitleFile(text) : [];
-                this.addChapters(cues.map(c => ({ start: c.start, title: c.text.replace(/\n/g, ' ') })));
+                apply(cues.map(c => ({ start: c.start, title: c.text.replace(/\n/g, ' ') })));
             }
         }
 
         /** Thumbnail preview from an image track (EXT-X-IMAGE-STREAM-INF / DASH thumbnails). */
         updateTipThumb(t) {
+            if (!this.settings) return;
             const box = this.$('.tip-thumb');
             if (this.mode === 'native') { this.fileThumb(t, box); return; }
             if (!this.player || this.mode !== 'mse' || !this.player.getImageTracks) { box.hidden = true; return; }
@@ -4703,13 +4845,15 @@
             const key = Math.floor(t);
             if (this.thumbKey === key) return;
             this.thumbKey = key;
+            box.hidden = true;
+            const generation = this.loadGen;
             clearTimeout(this.thumbTimer);
             this.thumbTimer = setTimeout(async () => {
                 try {
                     const th = await this.player.getThumbnails(this.imageTrackId, t);
-                    if (!th || !th.uris || !th.uris.length || this.thumbKey !== key) return;
+                    if (!th || !th.uris || !th.uris.length || this.thumbKey !== key || this.loadGen !== generation) return;
                     const url = await this.thumbImage(th.uris[0], th.startByte, th.endByte);
-                    if (!url || this.thumbKey !== key) return;
+                    if (!url || this.thumbKey !== key || this.loadGen !== generation) return;
                     const w = Math.min(160, th.width || 160);
                     const scale = w / (th.width || w);
                     box.style.width = `${w}px`;
@@ -4736,54 +4880,73 @@
             const v = this.video;
             const dur = v.duration;
             if (this.settings.fileThumbnails === false || !Number.isFinite(dur) || dur <= 0 || !this.stream) { box.hidden = true; return; }
-            const T = this.thumbGen || (this.thumbGen = { cache: new Map(), want: null, busy: false, el: null, failed: false, step: 1, box: null });
+            const T = this.thumbGen || (this.thumbGen = { cache: new Map(), missed: new Set(), want: null, busy: false, el: null, failed: false, step: 1, box: null });
             if (T.failed) { box.hidden = true; return; }
             T.step = Math.max(1, dur / 200);
             T.box = box;
             const key = clamp(Math.round(t / T.step), 0, Math.floor(dur / T.step));
             T.want = key;
-            let near = T.cache.get(key);
-            for (let d = 1; !near && d <= 4; d++) near = T.cache.get(key - d) || T.cache.get(key + d);
+            const near = T.cache.get(key);
             if (near) this.drawFileThumb(box, near); else box.hidden = true;
             this.pumpFileThumbs();
         }
 
         pumpFileThumbs() {
             const T = this.thumbGen;
-            if (!T || T.busy || T.failed || this.closed || T.want == null || T.cache.has(T.want)) return;
+            if (!T || T.busy || T.failed || this.closed || T.want == null ||
+                T.cache.has(T.want) || T.missed.has(T.want)) return;
             if (!T.el) {
                 const el = document.createElement('video');
                 el.muted = true;
                 el.playsInline = true;
                 el.preload = 'auto';
-                el.addEventListener('error', () => { T.failed = true; });
+                el.hidden = true;
+                this.shadow.appendChild(el);
                 el.src = this.stream.url;
                 T.el = el;
             }
             const el = T.el;
             const key = T.want;
             T.busy = true;
-            const done = () => {
-                el.removeEventListener('seeked', done);
-                clearTimeout(T.timer);
+            const target = Math.min(key * T.step, Math.max(0, this.video.duration - 0.05));
+            const finish = draw => {
+                T.cancel();
                 if (this.thumbGen !== T) return;
-                try {
-                    if (el.videoWidth) {
-                        const c = document.createElement('canvas');
-                        c.width = 160;
-                        c.height = Math.max(1, Math.round(160 * el.videoHeight / el.videoWidth));
+                if (draw && el.videoWidth) {
+                    const c = document.createElement('canvas');
+                    c.width = 160;
+                    c.height = Math.max(1, Math.round(160 * el.videoHeight / el.videoWidth));
+                    try {
                         c.getContext('2d').drawImage(el, 0, 0, c.width, c.height);
                         T.cache.set(key, c);
-                        if (T.cache.size > 240) T.cache.delete(T.cache.keys().next().value);
                         if (T.want === key && T.box) this.drawFileThumb(T.box, c);
-                    }
-                } catch (_) { /* frame not decodable: leave this one out */ }
+                    } catch (_) { T.missed.add(key); }
+                } else T.missed.add(key);
                 T.busy = false;
                 this.pumpFileThumbs();
             };
-            el.addEventListener('seeked', done);
-            T.timer = setTimeout(done, 4000);
-            el.currentTime = Math.max(0, key * T.step);
+            const draw = () => finish(true);
+            const fail = () => { T.failed = true; finish(false); };
+            const seek = () => {
+                if (Math.abs(el.currentTime - target) < 0.01) {
+                    if (el.readyState >= 2) draw();
+                    else el.addEventListener('loadeddata', draw, { once: true });
+                } else {
+                    el.addEventListener('seeked', draw, { once: true });
+                    try { el.currentTime = target; } catch (_) { finish(false); }
+                }
+            };
+            T.cancel = () => {
+                clearTimeout(T.timer);
+                el.removeEventListener('loadedmetadata', seek);
+                el.removeEventListener('loadeddata', draw);
+                el.removeEventListener('seeked', draw);
+                el.removeEventListener('error', fail);
+            };
+            el.addEventListener('error', fail, { once: true });
+            T.timer = setTimeout(() => finish(false), 4000);
+            if (el.readyState >= 1) seek();
+            else el.addEventListener('loadedmetadata', seek, { once: true });
         }
 
         drawFileThumb(box, src) {
@@ -4807,13 +4970,17 @@
             const T = this.thumbGen;
             this.thumbGen = null;
             if (!T) return;
-            clearTimeout(T.timer);
-            if (T.el) { T.el.removeAttribute('src'); try { T.el.load(); } catch (_) { /* ignore */ } }
+            T.cancel?.();
+            if (T.el) { T.el.removeAttribute('src'); T.el.load(); T.el.remove(); }
             T.cache.clear();
         }
 
         /** Thumbnail sprites are fetched through the engine (site Referer) and cached as blob URLs. */
         clearThumbCache() {
+            clearTimeout(this.thumbTimer);
+            this.thumbKey = null;
+            const tip = this.$('.tip-thumb');
+            if (tip) tip.hidden = true;
             if (!this.thumbCache) return;
             for (const url of this.thumbCache.values()) url.then(u => { if (u) URL.revokeObjectURL(u); });
             this.thumbCache.clear();
@@ -4846,15 +5013,18 @@
             const span = Math.max(0.001, r.end - r.start);
             const pos = t => clamp((t - r.start) / span * 100, 0, 100);
             let html = '';
-            for (const c of this.chapters || []) if (c.start > r.start + 0.5) html += `<div class="mark chapter" style="left:${pos(c.start)}%"></div>`;
+            for (const c of this.chapters || []) if (c.start > r.start && c.start < r.end) html += `<div class="mark chapter" style="left:${pos(c.start)}%"></div>`;
             for (const b of this.bookmarks) html += `<div class="mark" style="left:${pos(b.t)}%"></div>`;
             if (this.loop.a != null) html += `<div class="mark" style="left:${pos(this.loop.a)}%"></div>`;
             if (this.loop.b != null) html += `<div class="mark" style="left:${pos(this.loop.b)}%"></div>`;
+            for (const t of [this.clip.start, this.clip.end]) {
+                if (t != null) html += `<div class="mark clip-mark" style="left:${pos(t)}%"></div>`;
+            }
             setHTML(this.$('.marks'), html);
             // Chapters scrubber: cut a 3 px gap into the bar at every chapter start.
             const track = this.$('.track');
             const cuts = this.settings && this.settings.look.scrubber === 'chapters'
-                ? (this.chapters || []).filter(c => c.start > r.start + 0.5 && c.start < r.end - 0.5).map(c => pos(c.start).toFixed(3)) : [];
+                ? (this.chapters || []).filter(c => pos(c.start) > 0.5 && pos(c.start) < 99.5).map(c => pos(c.start).toFixed(3)) : [];
             const mask = cuts.length
                 ? `linear-gradient(to right, #000 0, ${cuts.map(p => `#000 calc(${p}% - 1.5px), transparent calc(${p}% - 1.5px), transparent calc(${p}% + 1.5px), #000 calc(${p}% + 1.5px)`).join(', ')}, #000 100%)`
                 : '';
@@ -4888,6 +5058,42 @@
                 if (this.decoderKey !== key) return;
                 this.decoderInfo = !r.supported ? 'Not supported' : `${r.smooth ? 'Smooth' : 'May stutter'} · ${r.powerEfficient ? 'hardware (power efficient)' : 'software'}`;
             }, () => { if (this.decoderKey === key) this.decoderInfo = 'Unknown'; });
+        }
+
+        finishDiagnosticWait() {
+            const d = this.diagnostics;
+            if (d.waitSince === undefined) return;
+            d.waitingMs += performance.now() - d.waitSince;
+            delete d.waitSince;
+        }
+
+        async saveDiagnostics() {
+            const v = this.video;
+            const d = this.diagnostics;
+            const quality = v.getVideoPlaybackQuality?.() || {};
+            let shakaStats;
+            try { shakaStats = this.player?.getStats(); } catch (_) { /* detached player */ }
+            const report = window.VelostreamDiagnostics.build({
+                version: extApi.runtime.getManifest().version,
+                userAgent: navigator.userAgent,
+                transport: this.localPlayback ? 'local' : this.stream?.type,
+                modes: { gpu: this.gpu?.active, normalization: this.audio.active && this.settings?.audio.loudnessNorm,
+                    resourceProfile: this.settings?.resourceProfile },
+                media: { width: v.videoWidth, height: v.videoHeight, totalFrames: quality.totalVideoFrames,
+                    droppedFrames: quality.droppedVideoFrames, codecs: shakaStats?.currentCodecs, videoBitrate: shakaStats?.streamBandwidth },
+                playback: { startupMs: d.startupMs, positionSeconds: v.currentTime, bufferSeconds: this.bufferAhead(),
+                    waitingEvents: d.waitingEvents, waitingMs: (d.waitingMs || 0) + (d.waitSince === undefined ? 0 : performance.now() - d.waitSince) },
+                network: this.localPlayback ? null : this.engineStats,
+                render: this.gpu?.active ? { width: this.glCanvas.width, height: this.glCanvas.height, ...this.gpu.lastTiming } : null,
+                history: d.history,
+                errors: d.errors
+            });
+            try {
+                const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+                await downloadBlob(this.shadow, blob, 'aethvyr-playback-diagnostics.json');
+            } catch (error) {
+                this.announce(error.message, 'warn');
+            }
         }
 
         renderStats() {
@@ -5020,14 +5226,19 @@
                 this.scheduleHide();
             };
             this.listen(tl, 'pointerup', end);
-            this.listen(tl, 'pointercancel', end);
+            this.listen(tl, 'pointercancel', () => {
+                if (!this.dragging) return;
+                this.dragging = false;
+                tl.classList.remove('dragging');
+                this.renderTimeline();
+            });
             this.listen(tl, 'keydown', (e) => {
                 const r = this.seekRange();
                 const span = r.end - r.start;
                 let handled = true;
                 switch (e.key) {
-                    case 'ArrowLeft': case 'ArrowDown': this.seekBy(-5, false); break;
-                    case 'ArrowRight': case 'ArrowUp': this.seekBy(5, false); break;
+                    case 'ArrowLeft': case 'ArrowDown': this.seekBy(-(this.settings?.seekStep || 5), false); break;
+                    case 'ArrowRight': case 'ArrowUp': this.seekBy(this.settings?.seekStep || 5, false); break;
                     case 'PageDown': this.seekBy(-Math.max(30, span / 10), false); break;
                     case 'PageUp': this.seekBy(Math.max(30, span / 10), false); break;
                     case 'Home': this.seekTo(r.start, false); break;
@@ -5534,7 +5745,9 @@
             const role = kind === 'speed' ? 'menu' : 'dialog';
             this.pop.setAttribute('role', role);
             this.pop.setAttribute('aria-labelledby', 'fs-pop-title');
-            setHTML(this.pop, `<div class="pop-head"><h2 id="fs-pop-title">${titles[kind]}</h2><button type="button" class="ib pop-close" aria-label="Close ${titles[kind]}">${icon('close', 18)}</button></div><div class="pop-body">${body}</div>`);
+            const guide = ['studio', 'help'].includes(kind) ?
+                '<a class="pillbtn pop-guide" href="../popup/guide.html" target="_blank" rel="noopener">Feature guide</a>' : '';
+            setHTML(this.pop, `<div class="pop-head"><h2 id="fs-pop-title">${titles[kind]}</h2>${guide}<button type="button" class="ib pop-close" aria-label="Close ${titles[kind]}">${icon('close', 18)}</button></div><div class="pop-body">${body}</div>`);
             this.pop.querySelector('.pop-close').addEventListener('click', () => this.closePopover(true));
             this.bindPopover(kind);
             for (const section of this.pop.querySelectorAll('[data-display-section]')) {
@@ -5610,6 +5823,7 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
         }
 
         tabQuality() {
+            if (this.localPlayback) return `<div role="menu" aria-label="Local files">${this.row({ id: 'local-open', label: 'Open Local File', role: 'menuitem', lead: 'upload' })}${this.row({ id: 'local-folder', label: 'Open Folder', role: 'menuitem', lead: 'upload' })}</div>`;
             const streams = this.streamsSection();
             if (this.mode !== 'mse') return `${streams}<p class="hint">Quality selection is available for HLS and DASH streams. This is a direct media file.</p>${this.bufferSection()}`;
             return streams + this.qualitySection() + this.bufferSection();
@@ -5642,8 +5856,8 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
         }
 
         async finishStreamSwitch(msg) {
-            if (!msg.stream) return;
-            this.saveHistory(true);
+            if (!msg.stream || (this.localPlayback && !msg.local)) return;
+            if (!msg.local) this.saveHistory(true);
             this.changingMedia = true;
             this.switching = false;
             if (msg.pageUrl !== undefined) this.updatePageMeta(msg);
@@ -5661,6 +5875,7 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             if (Array.isArray(msg.streams)) this.tabStreams = msg.streams;
             // Per-stream state starts over.
             this.loop = { a: null, b: null };
+            this.clip = { start: null, end: null };
             this.chapters = [];
             this.imageTrackId = undefined;
             this.thumbKey = null;
@@ -5688,26 +5903,28 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
                 try { await this.player.unload(); } catch (_) { /* ignore */ }
             }
             if (prevType === 'progressive') { v.removeAttribute('src'); v.removeAttribute('crossorigin'); v.load(); }
-            let domain = '';
-            try { domain = new URL(this.stream.url).hostname; } catch (_) { /* opaque */ }
+            let domain = msg.local ? 'Local file' : '';
+            if (!msg.local) try { domain = new URL(this.stream.url).hostname; } catch (_) { /* opaque */ }
             this.$('.domain').textContent = domain;
             const title = this.stream.title || this.playbackPageMeta?.showTitle || this.titleFromUrl(this.stream.url);
             this.$('.title').textContent = this.$('.title').title = title;
-            this.root.setAttribute('aria-label', `Velostream player: ${title}`);
+            this.root.setAttribute('aria-label', `Aethvyr player: ${title}`);
             await this.loadBookmarks();
             this.renderMarks();
             this.hideIsland();
             try {
-                await this.load(undefined);
+                await this.load(msg.startTime);
             } catch (e) {
                 this.showError('Cannot play this stream', String((e && e.message) || e));
                 return;
             } finally {
                 this.changingMedia = false;
             }
-            this.checkResume();
-            this.loadChapters();
-            this.autoSelectCaptured();
+            if (!msg.local) {
+                this.checkResume();
+                this.loadChapters();
+                this.autoSelectCaptured();
+            }
             this.updateDownloadButton();
             this.announce(`Now playing ${this.stream.title || (this.stream.type === 'progressive' ? 'the file' : `the ${this.stream.type.toUpperCase()} stream`)}`, 'play');
             this.refreshPopover();
@@ -5719,15 +5936,18 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             const ahead = st.cachedAhead != null ? fmtTime(st.cachedAhead) : '—';
             const workers = clamp(Math.round(Number(s.maxWorkers) || 4), 2, 8);
             return `<div class="section-label">Buffer &amp; network</div>
-${this.selectField('bf-window', 'Pre-buffer window', withCurrentOption(PREBUFFER_WINDOWS, s.maxBufferSec, v => `${v >= 60 && v % 60 === 0 ? `${v / 60} min` : `${v} s`} (custom)`), s.maxBufferSec ?? 86400)}
+${this.selectField('bf-paused-limit', 'Prefetch while paused', withCurrentOption([[0, 'Off'], [128, '128 MB'], [256, '256 MB'], [512, '512 MB'], [1024, '1 GB']], s.pausedBufferMB, v => `${v} MB`), s.pausedBufferMB)}
+${this.selectField('bf-profile', 'Streaming profile', [['eco', 'Eco'], ['balanced', 'Balanced'], ['max', 'Performance'], ['custom', 'Custom']], s.resourceProfile)}
+${this.selectField('bf-window', 'Pre-buffer ceiling', withCurrentOption(PREBUFFER_WINDOWS, s.maxBufferSec, v => `${v >= 60 && v % 60 === 0 ? `${v / 60} min` : `${v} s`} (custom)`), s.maxBufferSec ?? 86400)}
 ${this.rangeField('bf-ahead', 'RAM buffer ahead', 15, 180, 5, s.mseBufferAhead, `${s.mseBufferAhead} s`)}
 ${this.rangeField('bf-behind', 'Back-buffer kept', 10, 180, 5, s.mseBufferBehind, `${s.mseBufferBehind} s`)}
 ${this.rangeField('bf-workers', 'Parallel workers', 2, 8, 1, workers, `${workers}`)}
+${this.selectField('bf-bandwidth', 'Custom prefetch budget', withCurrentOption([[0, 'Unlimited'], [1, '1 Mbit/s'], [5, '5 Mbit/s'], [10, '10 Mbit/s'], [25, '25 Mbit/s']], s.prefetchMbps, v => v + ' Mbit/s'), s.prefetchMbps)}
 ${this.selectField('bf-cache', 'Disk cache cap', withCurrentOption(CACHE_CAPS, s.cacheSizeMB, v => `${v >= 1024 && v % 1024 === 0 ? `${v / 1024} GB` : `${v} MB`} (custom)`), s.cacheSizeMB ?? 2048)}
 ${this.switchField('bf-range', 'Range accelerator (parallel chunks)', s.rangeAccel !== false)}
 ${this.switchField('bf-pause', 'Pause background prefetch', !!this.prefetchPaused)}
 <div role="menu" aria-label="Buffer actions">${this.row({ id: 'bf-purge', label: 'Purge & rebuild buffer', meta: `${ahead} ahead`, role: 'menuitem', lead: 'rotate' })}</div>
-<p class="hint">The pre-buffer lives on disk (IndexedDB); RAM ahead/behind is what the video element keeps decoded.</p>`;
+<p class="hint">Profiles cap background prefetch at 1, 3, or 15 minutes. Custom uses your chosen ceiling. The disk cache and playback RAM have separate limits.</p>`;
         }
 
         qualitySection() {
@@ -5826,7 +6046,16 @@ ${this.rangeField('dp-c-highlights', 'Highlights', -100, 100, 5, cs.highlights |
         tabTools() {
             const r = this.seekRange();
             const loopMeta = this.loop.a == null ? 'Not set' : this.loop.b == null ? `A ${fmtTime(this.loop.a - r.start)}` : `${fmtTime(this.loop.a - r.start)}–${fmtTime(this.loop.b - r.start)}`;
-            let html = `<div class="section-label">A–B loop &amp; bookmarks</div><div role="menu" aria-label="Loop and bookmarks">
+            let html = '';
+            if (this.localPlayback && this.saveLocalCopy) {
+                html += `<div role="menu" aria-label="Local file">${this.row({ id: 'tl-save-local', label: 'Save a copy of this file', role: 'menuitem', lead: 'download' })}</div>`;
+            }
+            const chapters = this.chapters || [];
+            html += `<div class="section-label">Chapters</div><div role="menu" aria-label="Chapters">
+${chapters.map((chapter, i) => this.row({ id: `chapter-${i}`, label: chapter.title, meta: fmtTime(chapter.start - r.start), role: 'menuitem', data: `data-chapter="${i}"` })).join('')}
+${this.row({ id: 'tl-chapters', label: 'Load chapter file (.vtt)', role: 'menuitem', lead: 'upload' })}
+</div><input type="file" id="tl-chapter-file" accept=".vtt,text/vtt" hidden>`;
+            html += `<div class="section-label">A–B loop &amp; bookmarks</div><div role="menu" aria-label="Loop and bookmarks">
 ${this.row({ id: 'tl-a', label: 'Set point A', meta: loopMeta, role: 'menuitem', lead: 'loop' })}
 ${this.row({ id: 'tl-b', label: 'Set point B', role: 'menuitem', lead: 'loop' })}
 ${this.row({ id: 'tl-clear', label: 'Clear loop', role: 'menuitem', lead: 'close' })}
@@ -5842,46 +6071,60 @@ ${this.row({ id: 'tl-fb', label: 'Previous frame', meta: ',', role: 'menuitem', 
 ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead: 'frameFwd' })}</div>`;
             const st = this.exportState;
             const live = this.isLive();
-            html += `<div class="section-label">${live ? 'Record &amp; DVR' : 'Download'}</div>`;
-            if (st && (st.running || st.status)) {
-                html += `<div class="progress" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct || 0}"><i style="width:${st.pct || 0}%"></i></div><p class="hint num">${esc(st.status || '')}</p>`;
+            let dashWebm = false;
+            if (!this.localPlayback) {
+                html += `<div class="section-label">${live ? 'Record &amp; DVR' : 'Download'}</div>`;
+                if (st && (st.running || st.status)) {
+                    html += `<div class="progress" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${st.pct || 0}"><i style="width:${st.pct || 0}%"></i></div><p class="hint num">${esc(st.status || '')}</p>`;
+                }
+                html += '<div role="menu" aria-label="Download">';
+                if (st && st.running) {
+                    html += this.row({ id: 'tl-cancel', label: st.isClip ? 'Cancel clip export' : 'Pause download', role: 'menuitem', lead: 'stop' });
+                } else if (live) {
+                    html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
+                    html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
+                } else {
+                    const dash = this.stream.type === 'dash';
+                    if (dash) { try { const a = this.player.getVariantTracks().find(t => t.active); dashWebm = !!a && /webm/i.test(a.mimeType || ''); } catch (_) { /* not loaded */ } }
+                    html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original files') : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
+                }
+                html += '</div>';
+                if (this.supportsClip()) {
+                    const { start, end } = this.clip;
+                    html += `<div class="section-label">Clip from buffer</div><div role="menu" aria-label="Clip from buffer">
+${this.row({ id: 'tl-clip-in', label: 'Set In at playhead', meta: start == null ? '' : fmtTime(start), role: 'menuitem', lead: 'frameBack' })}
+${this.row({ id: 'tl-clip-out', label: 'Set Out at playhead', meta: end == null ? '' : fmtTime(end), role: 'menuitem', lead: 'frameFwd' })}`;
+                    if (start != null) html += this.row({ id: 'tl-clip-clear', label: 'Clear clip marks', role: 'menuitem', lead: 'close' });
+                    const clip = this.clipRange();
+                    if (clip && !st?.running) html += this.row({ id: 'tl-export-clip', label: 'Export cached clip', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
+                    html += '</div><p class="hint">Play through the range to cache it. Cuts follow segment boundaries.</p>';
+                }
+                if (this.stream.type === 'dash' && !live) html += '<p class="hint">DASH saves the best quality within your quality cap, with the audio language you are listening to: MP4 streams as one .mp4, WebM (VP9) streams as the original video and audio files. DRM-protected streams cannot be saved.</p>';
+                if (['hls', 'dash'].includes(this.stream.type) && !dashWebm) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             }
-            html += '<div role="menu" aria-label="Download">';
-            if (st && st.running) {
-                html += this.row({ id: 'tl-cancel', label: 'Cancel', role: 'menuitem', lead: 'stop' });
-            } else if (live) {
-                html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
-                html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
-            } else {
-                const dash = this.stream.type === 'dash';
-                let dashWebm = false;
-                if (dash) { try { const a = this.player.getVariantTracks().find(t => t.active); dashWebm = !!a && /webm/i.test(a.mimeType || ''); } catch (_) { /* not loaded */ } }
-                const clip = this.clipRange();
-                if (clip) html += this.row({ id: 'tl-export-clip', label: dashWebm ? 'Save A–B clip (WebM originals)' : dash || (this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save A–B clip (.mp4)' : 'Save A–B clip segments', meta: fmtTime(clip.end - clip.start), role: 'menuitem', lead: 'download' });
-                html += this.row({ id: 'tl-export', label: dashWebm ? 'Save original files (WebM video + audio)' : dash ? 'Save as .mp4' : this.stream.type === 'hls' ? ((this.settings.exportFormat || 'mp4') === 'mp4' ? 'Save as .mp4' : 'Save original segments') : 'Save file', role: 'menuitem', lead: 'download' });
-            }
-            html += '</div>';
-            if (this.stream.type === 'dash' && !live) html += '<p class="hint">DASH saves the best quality within your quality cap, with the audio language you are listening to: MP4 streams as one .mp4, WebM (VP9) streams as the original video and audio files. DRM-protected streams cannot be saved.</p>';
-            if (this.stream.type === 'hls' || live) html += this.selectField('tl-format', 'Save format', [['mp4', 'MP4 (video + audio in one file)'], ['original', 'Original (.ts / .m4s as served)']], this.settings.exportFormat || 'mp4');
             const sleepMode = this.sleep ? this.sleep.mode : 0;
             html += `<div class="section-label" id="lbl-sleep">Sleep timer</div><div role="menu" aria-labelledby="lbl-sleep">${SLEEP_OPTIONS.map(([m, l]) => this.row({ id: `sl-${m}`, label: l, meta: m && sleepMode === m && this.sleep.endsAt ? `${Math.max(0, Math.ceil((this.sleep.endsAt - Date.now()) / 60000))}m left` : '', checked: sleepMode === m, data: `data-sleep="${m}"` })).join('')}</div>`;
-            const android = /Android/i.test(navigator.userAgent);
-            const mac = /Mac OS X/i.test(navigator.userAgent) && !/Mobile/i.test(navigator.userAgent);
-            html += '<div class="section-label" id="lbl-ext">Open in external player</div><div role="menu" aria-labelledby="lbl-ext">';
-            for (const [k, l, m] of EXTERNAL_APPS) {
-                if ((k === 'android' && !android) || (k === 'iina' && !mac) || ((k === 'potplayer') && (android || mac))) continue;
-                html += this.row({ id: `ex-${k}`, label: l, meta: m, role: 'menuitem', lead: 'external', data: `data-ext="${k}"` });
+            if (!this.localPlayback) {
+                const android = /Android/i.test(navigator.userAgent);
+                const mac = /Mac OS X/i.test(navigator.userAgent) && !/Mobile/i.test(navigator.userAgent);
+                html += '<div class="section-label" id="lbl-ext">Open in external player</div><div role="menu" aria-labelledby="lbl-ext">';
+                for (const [k, l, m] of EXTERNAL_APPS) {
+                    if ((k === 'android' && !android) || (k === 'iina' && !mac) || ((k === 'potplayer') && (android || mac))) continue;
+                    html += this.row({ id: `ex-${k}`, label: l, meta: m, role: 'menuitem', lead: 'external', data: `data-ext="${k}"` });
+                }
+                html += this.row({ id: 'ex-ytdlp', label: 'Copy yt-dlp command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
+                html += this.row({ id: 'ex-ffmpeg', label: 'Copy ffmpeg command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
+                html += this.row({ id: 'ex-link', label: 'Copy stream link', role: 'menuitem', lead: 'copy' });
+                html += '</div>';
             }
-            html += this.row({ id: 'ex-ytdlp', label: 'Copy yt-dlp command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
-            html += this.row({ id: 'ex-ffmpeg', label: 'Copy ffmpeg command', meta: 'with Referer / UA', role: 'menuitem', lead: 'copy' });
-            html += this.row({ id: 'ex-link', label: 'Copy stream link', role: 'menuitem', lead: 'copy' });
-            html += '</div>';
             html += `<div class="section-label">Skip</div>${this.selectField('tl-skip', 'Skip intro button', SKIP_STEPS.map(s => [s, `+${s} s`]), this.settings.skipSeconds)}${this.switchField('tl-smart', 'Smart skip black & silence', this.settings.smartSkip)}`;
             html += `<div class="section-label">Modes</div><div role="menu" aria-label="Modes">
 ${this.row({ id: 'tl-mini', label: 'Mini player', role: 'menuitem', lead: 'mini' })}
 ${this.row({ id: 'tl-audio', label: 'Audio-only battery saver', meta: this.audioOnly ? 'On' : 'Off', role: 'menuitem', lead: 'headphones' })}
 ${document.pictureInPictureEnabled ? this.row({ id: 'tl-pip', label: 'Picture in Picture', role: 'menuitem', lead: 'pip' }) : ''}
-${this.row({ id: 'tl-lock', label: 'Lock touch controls', role: 'menuitem', lead: 'lock' })}</div>`;
+${this.row({ id: 'tl-lock', label: 'Lock touch controls', role: 'menuitem', lead: 'lock' })}
+${this.row({ id: 'tl-diagnostics', label: 'Save playback diagnostics', role: 'menuitem', lead: 'download' })}
+${this.row({ id: 'tl-stats', label: this.settings.showStats ? 'Hide playback statistics' : 'Show playback statistics', role: 'menuitem', lead: 'info' })}</div>`;
             return html;
         }
 
@@ -5910,7 +6153,7 @@ ${this.selectField('pf-defcap', 'Default resolution cap', QUALITY_CAPS, s.qualit
 ${this.switchField('pf-autofs', 'Full screen on first tap', s.autoFullscreen)}
 ${this.switchField('pf-filethumbs', 'Seek previews for video files', s.fileThumbnails)}
 ${this.switchField('pf-pipsubs', 'Subtitles in Picture-in-Picture', s.pipSubtitles)}
-${this.switchField('pf-badge', 'On-page Play in Velostream button', s.quickLaunchBadge)}
+${this.switchField('pf-badge', 'On-page Play in Aethvyr button', s.quickLaunchBadge)}
 <div class="section-label">Gestures</div>
 ${this.switchField('pf-g-enabled', 'Touch gestures', g.enabled)}
 ${this.switchField('pf-g-doubleTapSeek', 'Double-tap to seek', g.doubleTapSeek)}
@@ -5976,7 +6219,12 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             // Remember which collapsible sections are open, so re-renders of the panel keep them open.
             this.pop.querySelectorAll('details.look-more').forEach(d => d.addEventListener('toggle', () => { this.lookOpen[d.dataset.sec] = d.open; }));
             select('pf-density', v => set({ density: v }, `Controls: ${v}`));
-            select('pf-scrubber', v => set({ scrubber: v }));
+            select('pf-scrubber', v => {
+                if (v === 'heatmap' && this.audio.allowed() && this.audio.ensure()) this.audio.apply(this.settings.audio);
+                set({ scrubber: v });
+                if (v === 'chapters' && !this.chapters?.length) this.announce('No chapters in this video. Add a chapter file in Studio → Tools.', 'info');
+                if (v === 'heatmap' && !this.audio.active) this.announce('Showing buffer activity. Loudness needs playable audio and a tap in the player.', 'info');
+            });
             range('pf-scrubh', v => set({ scrubHeight: v }), v => `${v} px`);
             range('pf-scrim', v => set({ scrim: v < 0 ? -1 : v }), v => (v < 0 ? 'Skin default' : `${v}%`));
             for (const id of LOOK_BUTTONS) {
@@ -6116,10 +6364,13 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         bindStudioTab(byId, click, each, range, select, sw) {
             const tab = this.studioTab;
             if (tab === 'quality') {
+                click('local-open', () => this.openLocalPicker());
+                click('local-folder', () => this.openLocalFolder());
                 each('[data-stream]', el => this.switchToStream(el.dataset.stream));
                 each('[data-q]', el => this.selectQuality(el.dataset.q === 'auto' ? 'auto' : +el.dataset.q));
                 select('q-cap', v => { this.setQualityCap(+v); this.announce(`Resolution cap ${+v ? `${v}p` : 'off'}`, 'studio'); });
                 const shakaBuf = () => { if (this.player) { try { this.configureShaka(); } catch (_) { /* player gone */ } } };
+                select('bf-profile', v => this.saveSettings({ resourceProfile: v }));
                 select('bf-window', v => {
                     this.saveSettings({ maxBufferSec: +v });
                     const w = PREBUFFER_WINDOWS.find(x => x[0] === +v);
@@ -6128,6 +6379,8 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 range('bf-ahead', v => { this.saveSettings({ mseBufferAhead: v }); this.settings.mseBufferAhead = v; shakaBuf(); }, v => `${v} s`);
                 range('bf-behind', v => { this.saveSettings({ mseBufferBehind: v }); this.settings.mseBufferBehind = v; shakaBuf(); }, v => `${v} s`);
                 range('bf-workers', v => this.saveSettings({ maxWorkers: v }), v => `${v}`);
+                select('bf-paused-limit', v => this.saveSettings({ pausedBufferMB: +v }));
+                select('bf-bandwidth', v => this.saveSettings({ prefetchMbps: +v }));
                 select('bf-cache', v => this.saveSettings({ cacheSizeMB: +v }));
                 sw('bf-range', v => this.saveSettings({ rangeAccel: v }));
                 sw('bf-pause', v => {
@@ -6223,6 +6476,33 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 click('dp-flip', () => { this.xf.flip = !this.xf.flip; this.layoutVideo(); this.announce(this.xf.flip ? 'Mirrored' : 'Mirror off', 'flip'); this.refreshPopover(); });
                 click('dp-xreset', () => { this.xf = { zoom: 1, panX: 0, panY: 0, rotate: 0, flip: false }; this.fit = 'contain'; this.layoutVideo(); this.announce('Transform reset', 'expand'); this.refreshPopover(); });
             } else if (tab === 'tools') {
+                each('[data-chapter]', el => {
+                    const chapter = this.chapters?.[+el.dataset.chapter];
+                    if (chapter) this.seekTo(chapter.start, true);
+                });
+                const chapterFile = byId('tl-chapter-file');
+                click('tl-chapters', () => chapterFile.click());
+                chapterFile?.addEventListener('change', async () => {
+                    const file = chapterFile.files[0];
+                    chapterFile.value = '';
+                    if (!file) return;
+                    const gen = this.loadGen;
+                    try {
+                        if (file.size > 1024 * 1024) throw new Error('Chapter files must be 1 MB or smaller.');
+                        const cues = parseSubtitleFile(await file.text());
+                        if (gen !== this.loadGen || this.closed) return;
+                        if (!cues.length) throw new Error('No chapter timestamps found.');
+                        this.addChapters(cues.map(c => ({ start: c.start, title: c.text.replace(/\s+/g, ' ') })));
+                        this.refreshPopover();
+                        this.announce(`Loaded ${cues.length} chapters`, 'check');
+                    } catch (error) { this.announce(error.message, 'warn'); }
+                });
+                click('tl-diagnostics', () => this.saveDiagnostics());
+                click('tl-stats', () => {
+                    this.saveSettings({ showStats: !this.settings.showStats });
+                    this.closePopover(true);
+                });
+                click('tl-save-local', () => this.saveLocalCopy?.());
                 click('tl-a', () => this.setLoopPoint('a'));
                 click('tl-b', () => this.setLoopPoint('b'));
                 click('tl-clear', () => this.clearLoop());
@@ -6237,6 +6517,14 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 click('tl-cancel', () => this.port.send({ type: 'EXPORT_CANCEL' }));
                 click('tl-rec', () => this.onDownloadButton());
                 click('tl-export', () => this.startExport());
+                click('tl-clip-in', () => this.setClipPoint('start'));
+                click('tl-clip-out', () => this.setClipPoint('end'));
+                click('tl-clip-clear', () => {
+                    this.clip = { start: null, end: null };
+                    this.renderMarks();
+                    this.refreshPopover();
+                    this.announce('Clip marks cleared', 'check');
+                });
                 click('tl-export-clip', () => { const clip = this.clipRange(); if (clip) this.startExport({ clip }); });
                 select('tl-format', v => { this.saveSettings({ exportFormat: v }); this.refreshPopover(); });
                 each('[data-sleep]', el => { const m = el.dataset.sleep; this.setSleep(m === 'eov' ? 'eov' : +m); });
@@ -6308,7 +6596,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         setupMediaSession() {
             if (!('mediaSession' in navigator)) return;
             try {
-                navigator.mediaSession.metadata = new MediaMetadata({ title: this.$('.title').textContent, artist: 'Velostream' });
+                navigator.mediaSession.metadata = new MediaMetadata({ title: this.$('.title').textContent, artist: 'Aethvyr' });
                 const ms = navigator.mediaSession;
                 ms.setActionHandler('play', () => this.video.play());
                 ms.setActionHandler('pause', () => this.video.pause());
@@ -6318,6 +6606,352 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             } catch (_) { /* partial support */ }
         }
     }
+
+    async function localFilesFromHandle(handle) {
+        if (handle.kind === 'file') return [{ file: await handle.getFile(), handle }];
+        const files = [];
+        for await (const child of handle.values()) files.push(...await localFilesFromHandle(child));
+        return files;
+    }
+
+    async function filesFromDrop(transfer) {
+        const readEntry = async entry => {
+            if (entry.isFile) return [{ file: await new Promise((ok, fail) => entry.file(ok, fail)) }];
+            const reader = entry.createReader();
+            const files = [];
+            for (;;) {
+                const entries = await new Promise((ok, fail) => reader.readEntries(ok, fail));
+                if (!entries.length) return files;
+                for (const child of entries) files.push(...await readEntry(child));
+            }
+        };
+        const items = [...transfer.items].filter(item => item.kind === 'file');
+        if (!items.length) return [...transfer.files].map(file => ({ file }));
+        return (await Promise.all(items.map(async item => {
+            const entry = item.webkitGetAsEntry?.();
+            const file = item.getAsFile();
+            const handle = await item.getAsFileSystemHandle?.().catch(() => null);
+            if (handle) return localFilesFromHandle(handle);
+            if (entry) return readEntry(entry);
+            return file ? [{ file }] : [];
+        }))).flat();
+    }
+
+    function applyStandaloneAppearance(root) {
+        const S = globalThis.VelostreamShared;
+        extApi.storage.local.get(S.SETTINGS_KEY).then(result => {
+            const settings = S.mergeSettings(result[S.SETTINGS_KEY]);
+            const accent = S.ACCENTS[settings.theme];
+            root.style.setProperty('--player-accent', accent.fill);
+            root.style.setProperty('--player-accent-strong', accent.strong);
+            root.style.setProperty('--player-ui-scale', settings.uiScale);
+            root.classList.toggle('high-contrast', settings.highContrast);
+        }).catch(() => {});
+    }
+
+    function bindLocalFiles(player, resumeId, initiallyLocal) {
+        const store = globalThis.VelostreamLocal;
+        const subtitle = /\.(srt|vtt|ass|ssa)$/i;
+        const media = /\.(mp4|m4v|mkv|webm|mov|ogv|avi|mpg|mpeg|ts|m2ts)$/i;
+        const sort = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+        const root = player.root;
+        const video = player.video;
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.multiple = true;
+        input.accept = 'video/*,.mkv,.srt,.vtt,.ass,.ssa';
+        input.hidden = true;
+        const prompt = document.createElement('div');
+        prompt.className = 'local-intake glass';
+        prompt.hidden = !initiallyLocal;
+        setHTML(prompt, '<p>Drop videos, folders, or subtitles here</p><div><button type="button" class="pillbtn primary" data-open>Open Local File</button><button type="button" class="pillbtn" data-folder>Open Folder</button></div>');
+        const playlist = document.createElement('select');
+        playlist.className = 'pillbtn local-playlist';
+        playlist.setAttribute('aria-label', 'Local playlist');
+        playlist.hidden = true;
+        root.append(input, prompt);
+        root.querySelector('.titles').after(playlist);
+        let queue = [];
+        let sidecars = [];
+        let index = -1;
+        let source;
+        let localTracks = [];
+        let revision = 0;
+        let lastSave = 0;
+        let active;
+
+        function save() {
+            if (!active || !Number.isFinite(video.currentTime) || video.readyState < 1) return;
+            active.time = video.ended ? 0 : video.currentTime;
+            if (active.id) store.save({ id: active.id, name: active.file.name, handle: active.handle, time: active.time }).catch(() => {});
+        }
+        function release() {
+            if (!source) return;
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            if (source) URL.revokeObjectURL(source);
+            source = null;
+            localTracks = [];
+        }
+        async function addSubtitles(files, token) {
+            const tracks = [];
+            for (const { file } of files) {
+                if (file.size > 5 * 1024 * 1024) continue;
+                const vtt = await file.text();
+                if (token !== revision) return;
+                if (parseSubtitleFile(vtt).length) tracks.push({ kind: 'subtitles', label: file.name, vtt });
+            }
+            if (!tracks.length || token !== revision) return;
+            localTracks = localTracks.concat(tracks);
+            player.setCaptured(localTracks);
+            await player.loadCapturedTrack(localTracks.length - tracks.length, false);
+            player.refreshPopover();
+        }
+        const stem = name => name.replace(/\.[^.]+$/, '').toLowerCase();
+        let switching = Promise.resolve();
+        function play(i) {
+            if (!queue[i]) return;
+            const entry = queue[i];
+            const token = ++revision;
+            switching = switching.catch(() => {}).then(async () => {
+                await player.ready;
+                if (token !== revision || player.closed) return;
+                if (!player.localPlayback) {
+                    player.saveHistory(true);
+                    player.port.send({ type: 'PREFETCH', enabled: false });
+                    if (player.exportState?.running) {
+                        player.port.send({ type: 'EXPORT_CANCEL' });
+                        const state = player.exportState;
+                        await state.chain;
+                        await player.handleExportMessage(state, { type: 'EXPORT_ERROR', error: 'Download paused.' });
+                    }
+                } else save();
+                player.localPlayback = true;
+                active = null;
+                release();
+                active = entry;
+                player.saveLocalCopy = () => downloadBlob(player.shadow, entry.file, entry.file.name).catch(showError);
+                index = i;
+                playlist.selectedIndex = i;
+                prompt.hidden = true;
+                source = URL.createObjectURL(entry.file);
+                await player.finishStreamSwitch({
+                    local: true, drm: null, subtitles: [], startTime: entry.time || undefined,
+                    stream: { id: entry.id || source, type: 'progressive', title: entry.file.name, url: source }
+                });
+                const base = stem(entry.file.name);
+                const matching = sidecars.filter(({ file }) => stem(file.name) === base || stem(file.name).startsWith(base + '.'));
+                await addSubtitles(queue.length === 1 ? sidecars : matching, token);
+            }).catch(showError);
+        }
+        function showError(error) { player.announce(error.message || String(error), 'warn'); }
+        player.saveLocalPosition = save;
+        let selection = 0;
+        async function accept(entries, current) {
+            if (current !== selection) return;
+            const videos = entries.filter(({ file }) => file.type.startsWith('video/') || media.test(file.name));
+            const subs = entries.filter(({ file }) => subtitle.test(file.name));
+            if (!videos.length) {
+                if (active && subs.length) addSubtitles(subs, revision).catch(showError);
+                else if (subs.length && player.stream?.url) await player.loadSubtitleFile(subs[0].file);
+                else showError(new Error('Choose a video file first.'));
+                return;
+            }
+            const handles = videos.filter(entry => entry.handle && !entry.id);
+            if (handles.length) {
+                const known = await store.list().catch(() => []);
+                for (const entry of handles) {
+                    const sameName = known.filter(prior => prior.name === entry.file.name);
+                    for (const prior of sameName) {
+                        if (!await entry.handle.isSameEntry(prior.handle).catch(() => false)) continue;
+                        entry.id = prior.id;
+                        entry.time = prior.time;
+                        break;
+                    }
+                    if (!entry.id) {
+                        entry.id = crypto.randomUUID();
+                        store.save({ id: entry.id, name: entry.file.name, handle: entry.handle, time: 0 }).catch(() => {});
+                    }
+                }
+            }
+            if (current !== selection) return;
+            queue = videos.sort((a, b) => sort.compare(a.file.name, b.file.name));
+            sidecars = subs;
+            playlist.replaceChildren(...queue.map(({ file }) => new Option(file.name)));
+            playlist.hidden = queue.length < 2;
+            play(0);
+        }
+        input.onchange = () => {
+            accept([...input.files].map(file => ({ file })), ++selection).catch(showError);
+            input.value = '';
+        };
+        player.openLocalPicker = async () => {
+            const current = ++selection;
+            if (!window.showOpenFilePicker) { input.click(); return; }
+            try {
+                const handles = await window.showOpenFilePicker({ multiple: true });
+                await accept(await Promise.all(handles.map(async handle => ({ handle, file: await handle.getFile() }))), current);
+            } catch (error) {
+                if (error.name === 'SecurityError') input.click();
+                else if (error.name !== 'AbortError') showError(error);
+            }
+        };
+        prompt.querySelector('[data-open]').onclick = player.openLocalPicker;
+        const folder = document.createElement('input');
+        folder.type = 'file';
+        folder.webkitdirectory = true;
+        folder.multiple = true;
+        folder.hidden = true;
+        root.append(folder);
+        folder.onchange = () => { accept([...folder.files].map(file => ({ file })), ++selection).catch(showError); folder.value = ''; };
+        player.openLocalFolder = async () => {
+            const current = ++selection;
+            if (!window.showDirectoryPicker) { folder.click(); return; }
+            try {
+                const directory = await window.showDirectoryPicker();
+                await accept(await localFilesFromHandle(directory), current);
+            } catch (error) {
+                if (error.name === 'SecurityError') folder.click();
+                else if (error.name !== 'AbortError') showError(error);
+            }
+        };
+        prompt.querySelector('[data-folder]').onclick = player.openLocalFolder;
+        playlist.onchange = () => play(playlist.selectedIndex);
+        player.listen(video, 'ended', () => play(index + 1));
+        player.listen(video, 'timeupdate', () => {
+            if (Date.now() - lastSave >= 3000) { lastSave = Date.now(); save(); }
+        });
+        player.disposers.push(() => { selection++; revision++; release(); });
+        player.listen(window, 'dragover', event => {
+            if (!event.dataTransfer.types.includes('Files')) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'copy';
+            root.classList.add('is-dropping');
+        });
+        player.listen(window, 'dragleave', event => {
+            if (!event.relatedTarget) root.classList.remove('is-dropping');
+        });
+        player.listen(window, 'drop', event => {
+            if (!event.dataTransfer.types.includes('Files')) return;
+            event.preventDefault();
+            root.classList.remove('is-dropping');
+            const current = ++selection;
+            filesFromDrop(event.dataTransfer).then(entries => accept(entries, current)).catch(error => {
+                if (current === selection) showError(error);
+            });
+        });
+        player.listen(window, 'pagehide', event => {
+            save();
+            if (!event.persisted) { selection++; revision++; release(); }
+        });
+        if (initiallyLocal && window.top !== window) {
+            player.listen(window, 'message', event => {
+                const message = event.data;
+                if (event.source !== window.parent || message?.type !== 'VELOSTREAM_LOCAL_FILES' ||
+                    !Array.isArray(message.files) || !message.files.every(file => file instanceof File)) return;
+                accept(message.files.map(file => ({ file })), ++selection).catch(showError);
+            });
+        }
+        if (resumeId) {
+            const savedEntry = store.get(resumeId).catch(() => null);
+            const resume = document.createElement('button');
+            resume.type = 'button';
+            resume.className = 'pillbtn primary';
+            resume.textContent = 'Resume Local File';
+            prompt.querySelector('div').prepend(resume);
+            resume.onclick = async () => {
+                const current = ++selection;
+                try {
+                    const entry = await savedEntry;
+                    if (!entry) throw new Error('This local file is no longer in the library.');
+                    if (await entry.handle.requestPermission({ mode: 'read' }) !== 'granted') {
+                        throw new Error('Read access is required to resume the file.');
+                    }
+                    await accept([{ ...entry, file: await entry.handle.getFile() }], current);
+                    resume.remove();
+                } catch (error) { showError(error); }
+            };
+        }
+    }
+
+    function mountVaultExport(id) {
+        const root = document.createElement('main');
+        root.className = 'local-player vault-player';
+        setHTML(root, `<section class="vault-panel" aria-labelledby="vault-title">
+          <header class="local-heading"><h1 id="vault-title">Offline download</h1><a class="local-control" href="../popup/library.html#offline">Offline / Cached</a></header>
+          <p class="local-status" role="status">Ready to open the cached download.</p>
+          <progress aria-label="Download progress" max="100" hidden></progress>
+          <div class="local-actions">
+            <button class="local-control primary" type="button" data-resume>Resume / Export</button>
+            <button class="local-control" type="button" data-pause disabled>Pause</button>
+          </div>
+        </section>`);
+        document.body.append(root);
+        applyStandaloneAppearance(root);
+        const start = root.querySelector('[data-resume]');
+        const pause = root.querySelector('[data-pause]');
+        const status = root.querySelector('[role="status"]');
+        const progress = root.querySelector('progress');
+        let port;
+        const exportUi = Object.create(VelostreamPlayer.prototype);
+        Object.assign(exportUi, {
+            shadow: root,
+            port: { send: msg => { try { port?.postMessage(msg); } catch (_) {} } },
+            announce: message => { status.textContent = message; },
+            announceOnly() {},
+            updateDownloadButton() {
+                const state = this.exportState;
+                status.textContent = state.pausing && state.running ? 'Pausing…' : state.status || 'Preparing download…';
+                start.disabled = state.running;
+                pause.disabled = !state.running || !!state.pausing;
+                progress.hidden = !state.running && state.status !== 'Saved';
+                if (state.pct || !state.running) progress.value = state.pct;
+                else progress.removeAttribute('value');
+                if (!state.running) { port?.disconnect(); port = null; }
+            }
+        });
+        start.onclick = async () => {
+            start.disabled = true;
+            try {
+                port = extApi.runtime.connect({ name: 'velostream-vault' });
+                const st = exportUi.exportState = { running: true, files: {}, status: '', pct: 0 };
+                exportUi.updateDownloadButton();
+                port.onMessage.addListener(msg => {
+                    if (exportUi.exportState !== st) return;
+                    if (msg.type === 'EXPORT_BEGIN' && msg.fileIndex === 0 && msg.format !== 'original' &&
+                        ['ts', 'aac', 'fmp4'].includes(msg.container) && window.VelostreamMux) {
+                        st.toMp4 = true;
+                        st.outName = msg.filename.replace(/\.[^.]+$/, '.mp4');
+                        st.sink = new ExportSink(root, st.outName, 'video/mp4');
+                    }
+                    exportUi.onExportMessage(msg.data ? { ...msg, data: window.VelostreamShared.unpackBinary(msg.data) } : msg);
+                });
+                port.onDisconnect.addListener(() => {
+                    if (exportUi.exportState === st && st.running) {
+                        exportUi.onExportMessage({ type: 'EXPORT_ERROR', error: 'Export paused. Resume to continue.' });
+                    }
+                });
+                port.postMessage({ type: 'EXPORT_RESUME', id });
+            } catch (error) {
+                if (exportUi.exportState) exportUi.exportState.running = false;
+                port?.disconnect();
+                port = null;
+                status.textContent = error.message;
+                start.disabled = false;
+                pause.disabled = true;
+            }
+        };
+        pause.onclick = () => {
+            exportUi.port.send({ type: 'EXPORT_CANCEL' });
+            exportUi.exportState.pausing = true;
+            pause.disabled = true;
+            status.textContent = 'Pausing…';
+        };
+        window.addEventListener('pagehide', () => port?.disconnect());
+    }
+
+    window.VelostreamVaultExport = mountVaultExport;
 
     // Started by player.js with an EnginePort and the host layout bridge.
     window.VelostreamPlayer = VelostreamPlayer;

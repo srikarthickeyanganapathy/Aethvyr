@@ -1,11 +1,12 @@
 <div align="center">
 
-<img src="icons/icon-128.png" width="96" height="96" alt="Velostream logo">
+<img src="icons/icon-128.png" width="96" height="96" alt="">
 
-# Velostream
+# Aethvyr
 
-**A fast, accessible video player for the web: plays a site's HLS, DASH or MP4 stream in its own
-player, pre-buffers it in the background, enhances it on the GPU and saves it as a single MP4.**
+*Experience the unseen.*
+
+**A privacy-first video player for the web with adaptive buffering, optional GPU enhancement, and a personal library.**
 
 ![Manifest V3](https://img.shields.io/badge/manifest-v3-4c8bf5)
 ![Chrome 111+](https://img.shields.io/badge/Chrome%20%2F%20Edge%20%2F%20Kiwi-111%2B-34a853)
@@ -13,48 +14,72 @@ player, pre-buffers it in the background, enhances it on the GPU and saves it as
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
 [Features](#features) · [Install](#install) · [Usage](#usage) · [Docs](#documentation) ·
-[Build from source](#build-from-source) · [Privacy](PRIVACY.md) · [Contributing](CONTRIBUTING.md)
+[Build from source](#build-from-source) · [Foundation audit](docs/FOUNDATION.md) · [Roadmap](docs/ROADMAP.md) · [Privacy](PRIVACY.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
 ---
 
+[Watch the desktop playback demo](docs/media/playback-demo.webm)
+
 ## What it does
 
-Most sites play video through their own players, often with ads, small buffers and few controls.
-Velostream detects the stream the site is playing and opens it in its own player, **mounted exactly
-over the site's video** (or full-page). From there:
+Open a detected web stream or drop a local video into the same Aethvyr player. Your usual
+controls stay close, with advanced tools in Studio.
 
-- the **whole video is pre-downloaded in the background** with parallel connections, so seeking
-  is instant and a flaky connection does not stall playback;
-- you get a **premium player**: gestures, keyboard shortcuts, subtitles styling and dual subtitles,
-  audio boost / EQ, speed with pitch correction, chapters, A-B loop, mini player, sleep timer;
-- an optional **WebGL2 GPU pipeline** sharpens, upscales (FSR-style, Anime4K-style) or debands the
-  picture in real time;
-- the **downloader** saves on-demand video as one MP4 (TS segments are remuxed, separate audio
-  is merged), records live streams and keeps a rewindable live DVR buffer.
+- **Adaptive buffering** adjusts prefetch workers to the stream and shares a background connection budget across tabs.
+- **Optional GPU enhancement** offers device-aware Auto, Detail sharpening, Compression cleanup, Anime4K, and Anime4K High.
+- **Personal library** brings together Continue Watching, collections, bookmarks, and categories for anime, donghua, cartoons, movies, and series.
+- **Offline / Cached** keeps export progress so interrupted downloads can resume from committed chunks.
 
-Everything runs locally in your browser. Velostream has no servers, no accounts, no analytics and
+Everything runs locally in your browser. Aethvyr has no servers, no accounts, no analytics and
 no remote code. See [PRIVACY.md](PRIVACY.md).
+
+![Aethvyr in Edge playing a local test pattern with Studio open on Save playback diagnostics](docs/media/playback-diagnostics.png)
+
+*Edge screenshot captured with a generated local test clip.*
+
+## Try it in a minute
+
+| What you want to do | Where to find it |
+| --- | --- |
+| Watch a website video | Start the site video and choose **Play in Aethvyr** or select the stream in the popup. |
+| Watch a local file | Choose **Open Local File** in the popup on a website tab, or drop the file into the overlay. |
+| Improve picture or audio | Open **Studio → Display → Graphics** or **Studio → Audio**. |
+| Find captions, a transcript, or a chapter | Open the captions button for tracks and transcripts. Open **Studio → Tools** for chapters. |
+| Download or save a clip | Open **Studio → Tools** for format and clip controls. Find paused and completed exports in **Library → Offline / Cached**. |
+| Learn the controls | Open **Feature guide** from the popup or Studio. Press `?` in the player for keyboard shortcuts. |
+
+<details>
+<summary>See the in-extension Feature Guide</summary>
+
+![Aethvyr Feature Guide in Microsoft Edge](docs/media/feature-guide.png)
+
+</details>
 
 ## Features
 
 | Area | Highlights |
 |------|-----------|
 | **Detection** | HLS (`.m3u8`), DASH (`.mpd`) and direct files (MP4/WebM/…) found via network sniffing, `fetch`/XHR hooks, Web Workers (including `blob:` workers), `<video>`/`<source>` scanning and MSE detection, in every frame including cross-origin embeds. Ads and segment playlists are filtered out. |
-| **Playback** | Shaka Player 5 (bundled, never loaded from a CDN). Starts after 0.5 s of media, muted-autoplay fallback with one-tap unmute, auto-resume per video, remembered volume/speed/quality/audio and subtitle language, per-site profiles, auto-replace on chosen sites. |
+| **Playback** | Shaka Player 5 (bundled, never loaded from a CDN). muted-autoplay fallback with one-tap unmute, auto-resume per video, remembered volume/speed/quality/audio and subtitle language, per-site profiles, auto-replace on chosen sites. |
 | **Pre-buffer engine** | Background service worker downloads ahead with 2–8 adaptive workers, a byte-range accelerator, retries with backoff, an IndexedDB cache read zero-copy by the player, its own ABR, and a live DVR (default 30 min). |
-| **GPU enhancement** | WebGL2 presets: **Fast Sharpen** (CAS), **FSR-style upscale** (Lanczos-2 + RCAS), real **Anime4K** neural upscaling (fast and HQ), **De-block**, **Denoise**, **Deband**, plus **Color Studio** grading (looks, gamma, vibrance, temperature, tint, shadows, highlights). Strength and render-resolution cap, and a thermal guard that steps down when the GPU cannot keep up. |
+| **GPU enhancement** | Device-aware Auto, Detail sharpening, Compression cleanup, two Anime4K presets, Color Studio, and an original-versus-enhanced comparison. |
 | **Controls** | Configurable double-tap zones (left/centre/right), swipe for volume, brightness and scrubbing, long-press 2×, pinch zoom, mouse wheel and middle click, remappable keyboard shortcuts, frame stepping, A-B loop, zoom/pan/rotate/mirror, aspect presets, seek previews generated for plain video files, Picture-in-Picture with subtitles. |
-| **Subtitles** | Site subtitles captured automatically (network, `<track>`, in-memory text tracks), SRT/VTT/ASS files, dual subtitles, sync to the next spoken line, timing speed, pause on hover, click to copy, full styling including dyslexia-friendly fonts. |
-| **Audio** | Boost up to 300 %, presets (voice, bass, night) and 5-band EQ, A/V delay, pitch-preserving speed, mono/left/right channel routing, audio-only battery saver. |
+| **Subtitles** | Site subtitles captured automatically (network, `<track>`, in-memory text tracks), SRT/VTT/ASS files, dual subtitles, sync to the next spoken line, timing speed, pause on hover, click to copy, searchable transcripts, and styling including dyslexia-friendly fonts. |
+| **Audio** | Smart loudness normalization, boost up to 300%, presets (voice, bass, night) and 5-band EQ, A/V delay, pitch-preserving speed, mono/left/right channel routing, audio-only battery saver. |
 | **Downloads** | HLS and DASH VOD to a single **MP4** (TS→fMP4 remux, audio merged) or the original format, A–B clips, live recording, DVR save, PNG snapshots and frame-burst contact sheets. External handoff to PotPlayer, VLC, mpv, IINA or an Android app, or copy a ready `yt-dlp`/`ffmpeg` command with the right headers. |
 | **Player look** | Five skins (Glass, Cinema, Theater, draggable Floating pill, Compact), Minimal / Standard / Pro controls (frame step, A–B loop, snapshot, one-click EQ and GPU), chapter-segment or loudness-heatmap seek bar, bar thickness, background darkness, and per-button show / hide and order. |
+| **Local files** | Drag-and-drop, video and folder selection, naturally sorted playlists, sidecar subtitles, and file-handle resume on compatible Chromium browsers. |
+| **Library and sync** | Continue Watching, artwork, collections, favorites, and opt-in browser-account sync for settings, watch positions and bookmarks. |
+| **Diagnostics** | Export a local playback report with startup time, buffer history, frame counts and error codes. |
 | **Accessibility** | Full keyboard operation, screen-reader announcements, focus management, high-contrast mode, reduced motion, interface scaling (85–150 %), simple mode. |
 
 The full tour is in **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)**.
 
 ## Install
+
+The versions below are manifest targets. Desktop verification covers playback and in-place upgrades on Edge 158 and upgrade and private-history checks on Firefox 160. Android and the minimum-version targets still need device testing.
 
 | Browser | How |
 |---------|-----|
@@ -66,17 +91,17 @@ choose `dist/chrome`.
 
 **Temporary add-on (Firefox):** `about:debugging#/runtime/this-firefox` → *Load Temporary Add-on…*
 → choose `dist/firefox/manifest.json`. Firefox asks you to grant site access for MV3 add-ons: use
-**Allow access to websites** in the Velostream popup.
+**Allow access to websites** in the Aethvyr popup.
 
 ## Usage
 
 1. Open a page with a video and start it once if it does not autoplay.
-2. Click the **"Play in Velostream"** pill on the video, or open the toolbar popup and pick a stream.
+2. Click the **"Play in Aethvyr"** pill on the video, or open the toolbar popup and pick a stream.
 3. The player opens over the site's video. Press <kbd>?</kbd> for all shortcuts and open
    **Studio** (the sliders button) for quality, audio, display, tools and preferences.
 4. **Close** restores the site's own player.
 
-Want a site to always open in Velostream? Turn on **Always play in Velostream** for that site in the popup.
+Want a site to always open in Aethvyr? Turn on **Always play in Aethvyr** for that site in the popup.
 
 ## Documentation
 
@@ -96,10 +121,11 @@ Want a site to always open in Velostream? Turn on **Always play in Velostream** 
 Requirements: **Node.js 18+**.
 
 ```bash
-npm install          # dev tools + shaka-player (copied into the build, never fetched at runtime)
+npm ci               # install the locked dependencies
 npm run build        # dist/chrome and dist/firefox
 npm run lint         # ESLint
-npm run package      # store zips: dist/velostream-<browser>-<version>.zip
+npm test             # regression suite
+npm run package      # store zips: dist/aethvyr-<browser>-<version>.zip
 ```
 
 Other scripts: `npm run build:chrome`, `npm run build:firefox`, `npm run watch` (rebuild on save).
@@ -109,7 +135,7 @@ browser-specific manifest. Details in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 ## Project layout
 
 ```
-Velostream/   (repository root)
+./   (repository root)
 ├── manifest.json            MV3 manifest (the build derives the Chrome and Firefox variants)
 ├── background/              Service worker / event page: the engine
 │   ├── engine.js            detection, sessions, launch, transport, export, message router
@@ -133,20 +159,20 @@ Velostream/   (repository root)
 
 ## Limitations
 
-- **DRM** (Widevine, PlayReady, FairPlay) cannot be played or saved. Velostream detects it and says
+- **DRM** (Widevine, PlayReady, FairPlay) cannot be played or saved. Aethvyr detects it and says
   so instead of failing silently. YouTube and most paid services fall in this group.
-- **Signed links expire.** Many sites sign stream URLs for minutes. Velostream switches to a newer
+- **Signed links expire.** Many sites sign stream URLs for minutes. Aethvyr switches to a newer
   link when the page requests one; otherwise reload the page and open the player again.
 - **DASH download** covers on-demand streams: MP4 DASH becomes one `.mp4`; WebM (VP9) DASH is saved
   as the original video and audio files. Live DASH cannot be saved.
-- A site's **Content Security Policy** or a sandboxed embed can forbid full screen; Velostream then
+- A site's **Content Security Policy** or a sandboxed embed can forbid full screen; Aethvyr then
   fills the browser window instead.
 - **GPU enhancement** needs WebGL2 and cannot read cross-origin direct files served without CORS.
 
 ## Responsible use
 
-Velostream is a player and a personal download tool. Only download content you have the right to
-keep, and respect each site's terms of service and your local copyright law. Velostream does not
+Aethvyr is a player and a personal download tool. Only download content you have the right to
+keep, and respect each site's terms of service and your local copyright law. Aethvyr does not
 circumvent DRM and never will.
 
 ## License

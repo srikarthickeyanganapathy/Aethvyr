@@ -915,7 +915,7 @@
 
         const frame = document.createElement('iframe');
         frame.src = url.href;
-        frame.title = 'Velostream player';
+        frame.title = 'Aethvyr player';
         // `allow` covers fullscreen; adding `allowfullscreen` too only triggers a console warning.
         frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write');
         mount.frame = frame;
@@ -953,6 +953,40 @@
             if (mount.mode === 'inline') syncInline(); // layout changes no event reported
         }, MOUNT_POLL_MS);
         return { ok: true, mode: video ? 'inline' : 'page' };
+    }
+
+    function mountLocalOverlay(files) {
+        const sessionId = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('');
+        const url = api.runtime.getURL(`player/player.html?local=1&session=${sessionId}`);
+        const result = mountPlayer({ sessionId, url, forcePage: true });
+        if (result.ok && files?.length) {
+            const frame = mount.frame;
+            frame.addEventListener('load', () => {
+                if (mount.frame !== frame) return;
+                const target = new URL(url);
+                frame.contentWindow.postMessage({ type: 'VELOSTREAM_LOCAL_FILES', files }, target.protocol + '//' + target.host);
+            }, { once: true });
+        }
+        return result;
+    }
+
+    if (IS_TOP) {
+        const videoFile = file => file.type.startsWith('video/') || /\.(mp4|m4v|mkv|webm|mov|ogv|avi|mpg|mpeg|ts|m2ts)$/i.test(file.name);
+        const uploadTarget = event => event.target.closest?.('input, textarea, [contenteditable], [dropzone]');
+        window.addEventListener('dragover', event => {
+            if (event.isTrusted && !uploadTarget(event) &&
+                Array.from(event.dataTransfer?.items || []).some(item => item.kind === 'file' && item.type.startsWith('video/'))) {
+                event.preventDefault();
+            }
+        }, true);
+        window.addEventListener('drop', event => {
+            if (!event.isTrusted || uploadTarget(event) || event.defaultPrevented) return;
+            const files = Array.from(event.dataTransfer?.files || []);
+            if (!files.some(videoFile)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            mountLocalOverlay(files);
+        }, true);
     }
 
     // ------------------------------------------------------------------
@@ -1018,13 +1052,13 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         host.style.cssText = 'all: initial; position: fixed; top: 0; left: 0; width: 0; height: 0; z-index: 2147483646;';
         const shadow = host.attachShadow({ mode: 'closed' });
         S.setHTML(shadow, `
-<div class="pill" role="group" aria-label="Velostream" hidden>
-  <button type="button" class="play" aria-label="Play this video in Velostream">
-    <svg class="bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4.5 13.2a.6.6 0 0 0 .5 1H11l-1 7.8 8.5-11.2a.6.6 0 0 0-.5-1H12z"/></svg>
-    <span class="label">Velostream</span><span class="meta" aria-hidden="true"></span>
+<div class="pill" role="group" aria-label="Aethvyr" hidden>
+  <button type="button" class="play" aria-label="Play this video in Aethvyr">
+    <svg class="bolt" viewBox="0 0 128 128" aria-hidden="true"><path d="M64 17 113 104 78 94 69 78 84 83 64 47 32 103 15 109Z"/><circle cx="59" cy="89" r="8"/></svg>
+    <span class="label">Aethvyr</span><span class="meta" aria-hidden="true"></span>
   </button>
   <span class="divider" aria-hidden="true"></span>
-  <button type="button" class="close" aria-label="Hide the Velostream button on this page">
+  <button type="button" class="close" aria-label="Hide the Aethvyr button on this page">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
   </button>
 </div>`);
@@ -1121,7 +1155,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         if (!badge.host.isConnected && document.documentElement) document.documentElement.appendChild(badge.host);
         const pill = badge.shadow.querySelector('.pill');
         badge.shadow.querySelector('.meta').textContent = s.label ? `• ${s.label}` : '';
-        badge.shadow.querySelector('.play').setAttribute('aria-label', `Play this video in Velostream${s.label ? `, ${s.label}` : ''}`);
+        badge.shadow.querySelector('.play').setAttribute('aria-label', `Play this video in Aethvyr${s.label ? `, ${s.label}` : ''}`);
         pill.hidden = false;
         positionBadge();
     }
@@ -1134,11 +1168,11 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         try {
             const res = await api.runtime.sendMessage({ action: 'LAUNCH_FROM_PAGE' });
             if (!res || !res.ok) throw new Error((res && res.error) || 'Could not open the player');
-            label.textContent = 'Velostream';
+            label.textContent = 'Aethvyr';
         } catch (err) {
             label.textContent = 'Can\'t play here';
             badge.shadow.querySelector('.play').title = String(err && err.message || err);
-            setTimeout(() => { label.textContent = 'Velostream'; }, 3000);
+            setTimeout(() => { label.textContent = 'Aethvyr'; }, 3000);
         } finally {
             badge.busy = false;
         }
@@ -1191,6 +1225,9 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
             case 'RESCAN':
                 resetDetection(true);
                 sendResponse({ ok: true });
+                return false;
+            case 'MOUNT_LOCAL_PLAYER':
+                if (IS_TOP) sendResponse(mountLocalOverlay());
                 return false;
             case 'MOUNT_PLAYER':
                 sendResponse(mountPlayer(message));

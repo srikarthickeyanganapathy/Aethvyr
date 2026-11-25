@@ -26,14 +26,16 @@
     const classifications = new Map();
     let sourceSite = '';
     const VIEWS = {
-        anime: { title: 'Anime', empty: 'Anime appears here after you play it in Velostream.' },
-        donghua: { title: 'Donghua', empty: 'Chinese animation appears here after you play it in Velostream.' },
-        cartoon: { title: 'Cartoons', empty: 'Cartoons appear here after you play them in Velostream.' },
+        local: { title: 'Local files', empty: 'No saved local files.' },
+        offline: { title: 'Offline / Cached', empty: 'No cached downloads.' },
+        anime: { title: 'Anime', empty: 'Anime appears here after you play it in Aethvyr.' },
+        donghua: { title: 'Donghua', empty: 'Chinese animation appears here after you play it in Aethvyr.' },
+        cartoon: { title: 'Cartoons', empty: 'Cartoons appear here after you play them in Aethvyr.' },
         video: { title: 'Other videos', empty: 'Clips and unclassified titles appear here.' },
         series: { title: 'Series', empty: 'Series appear here as you watch episodes.' },
         movies: { title: 'Movies', empty: 'Movies appear here as you watch them.' },
         continue: { title: 'Continue watching', empty: 'Nothing in progress. Videos you stop partway through show up here so you can pick up where you left off.' },
-        recent: { title: 'Recently watched', empty: 'No watch history yet. Play a video in Velostream and it appears here with its position.' },
+        recent: { title: 'Recently watched', empty: 'No watch history yet. Play a video in Aethvyr and it appears here with its position.' },
         favorites: { title: 'Favorites', empty: 'No favorites yet. Select the star on any video to keep it here.' },
         collections: { title: 'Collections', empty: 'No collections yet. Create one above, then use “Collections” on any video to add it.' },
         bookmarked: { title: 'Bookmarked', empty: 'No bookmarks yet. While watching, add bookmarks from the player’s menu and they are listed here.' }
@@ -49,6 +51,9 @@
     let sort = 'recent';
     const openPanels = new Set(); // `${scope}|${key}|cols` / `${scope}|${key}|bms`
     let lastMarkup = '';
+    let deviceEntries = [];
+    let deviceStatus = '';
+    let deviceRequest = 0;
     let renderTimer = 0;
     let uid = 0;
 
@@ -371,7 +376,7 @@
                     ? `<li><a class="bm-link" href="${esc(timedLink(item.target, b.t, !item.page))}" target="_blank" rel="noopener noreferrer" ${ctl('bm-open', scope, item.key, { i })} aria-label="${esc(fmtTime(b.t))}, ${label}: open ${item.page ? 'website' : 'direct stream'} at this time"><span class="num bm-t">${fmtTime(b.t)}</span><span class="bm-label">${label}</span></a></li>`
                     : `<li><span class="bm-link is-static"><span class="num bm-t">${fmtTime(b.t)}</span><span class="bm-label">${label}</span></span></li>`;
             }).join('');
-            bmsPanel = `<div class="vc-panel" id="p${n}b"><p class="muted vc-note">Bookmarks open the website and start Velostream at the saved time.</p><ol class="bm-list" aria-label="Bookmarks in ${t}">${rows}</ol></div>`;
+            bmsPanel = `<div class="vc-panel" id="p${n}b"><p class="muted vc-note">Bookmarks open the website and start Aethvyr at the saved time.</p><ol class="bm-list" aria-label="Bookmarks in ${t}">${rows}</ol></div>`;
         }
 
         const colNote = memberOf.length ? ` · <span class="vc-cols">${esc(memberOf.map(c => c.name).join(', '))}</span>` : '';
@@ -420,6 +425,8 @@
     function render() {
         clearTimeout(renderTimer);
         uid = 0;
+        const deviceView = view === 'local' || view === 'offline';
+        document.querySelector('.lib-toolbar').hidden = deviceView;
         const allItems = buildItems();
         const sources = [...new Set(allItems.map(i => i.host).filter(Boolean))].sort(collator.compare);
         if (sourceSite && !sources.includes(sourceSite)) sourceSite = '';
@@ -455,6 +462,11 @@
             ? `${plural(items.length, 'video')} · ${counts.continue} in progress · ${plural(counts.favorites, 'favorite')} · ${plural(counts.collections, 'collection')} · ${counts.bookmarked} with bookmarks`
             : 'Your library is empty.';
         if ($('summary').textContent !== summary) $('summary').textContent = summary;
+        if (deviceView) {
+            $('new-collection').hidden = true;
+            renderDeviceItems();
+            return;
+        }
 
         let markup;
         let countText;
@@ -803,14 +815,111 @@
     // -------------------------------------------------------------------
     // Views, settings, export
     // -------------------------------------------------------------------
+    function renderDeviceItems() {
+        const local = view === 'local';
+        $('view-title').textContent = VIEWS[view].title;
+        $('result-count').textContent = deviceStatus ? '' : plural(deviceEntries.length, local ? 'file' : 'download');
+        const openFile = local ? '<a class="btn btn-primary small" href="../player/player.html?mode=local">Open Local File</a>' : '';
+        const rows = deviceEntries.map(item => {
+            const running = item.status === 'running';
+            const segmentCount = item.total ? ` · ${item.completed}/${item.total} segments` : '';
+            const size = `${((item.bytes || 0) / (1024 * 1024)).toFixed(1)} MB`;
+            const status = local ? (item.time > 0 ? `Resume at ${fmtTime(item.time)}` : 'Ready to play')
+                : `${running ? 'In progress' : item.status === 'cached' ? 'Ready to export' : 'Paused'} · ${size}${segmentCount}`;
+            const expected = item.total || item.totalBytes;
+            const received = item.total ? item.completed : item.bytes;
+            const percent = expected ? Math.min(100, Math.round(100 * (received || 0) / expected)) : null;
+            const progress = local || percent == null ? '' : `<progress max="100" value="${percent}" aria-label="Cached progress for ${esc(item.name)}"></progress>`;
+            const target = local ? 'mode=local&amp;file=' : 'mode=offline&amp;id=';
+            const label = local ? (item.time > 0 ? 'Resume' : 'Play') : item.status === 'cached' ? 'Export' : 'Resume';
+            return `<li class="card lib-device-row">
+                <div class="lib-device-details"><h3 class="vc-title">${esc(item.name)}</h3><p class="muted num">${esc(status)}${percent == null || local ? '' : ` · ${percent}%`}</p>${progress}</div>
+                ${running ? '' : `<div class="lib-device-actions">
+                    <a class="btn btn-primary small" data-device-open="${esc(item.id)}" aria-label="${label} ${esc(item.name)}" href="../player/player.html?${target}${encodeURIComponent(item.id)}">${label}</a>
+                    <button type="button" class="btn btn-quiet small lib-danger-text" data-device-remove="${esc(item.id)}" aria-label="${local ? 'Remove' : 'Delete'} ${esc(item.name)}">${local ? 'Remove' : 'Delete'}</button>
+                </div>`}
+            </li>`;
+        }).join('');
+        const content = openFile + (rows ? `<ul class="lib-device-list">${rows}</ul>` : emptyMarkup(deviceStatus || VIEWS[view].empty));
+        if (lastMarkup === content) return;
+        lastMarkup = content;
+        const active = document.activeElement;
+        const restore = $('view').contains(active);
+        const open = active?.dataset.deviceOpen;
+        const remove = active?.dataset.deviceRemove;
+        S.setHTML($('view'), content);
+        if (restore) {
+            const keep = Array.from($('view').querySelectorAll('[data-device-open], [data-device-remove]'))
+                .find(el => (open && el.dataset.deviceOpen === open) || (remove && el.dataset.deviceRemove === remove));
+            (keep || $('main')).focus({ preventScroll: true });
+        }
+    }
+
+    async function reloadDeviceItems() {
+        if (!['local', 'offline'].includes(view)) return;
+        const current = view;
+        const request = ++deviceRequest;
+        try {
+            let items;
+            if (current === 'local') items = await globalThis.VelostreamLocal.list();
+            else {
+                const result = await api.runtime.sendMessage({ action: 'VAULT_LIST' });
+                if (!result?.ok) throw new Error(result?.error || 'Could not load cached downloads.');
+                items = result.jobs;
+            }
+            if (view !== current || request !== deviceRequest) return;
+            deviceEntries = items.sort((a, b) => collator.compare(a.name, b.name));
+            deviceStatus = '';
+        } catch (error) {
+            if (view !== current || request !== deviceRequest) return;
+            deviceEntries = [];
+            deviceStatus = error.message;
+        }
+        render();
+    }
+
+    async function removeDeviceItem(event) {
+        const button = event.target.closest('[data-device-remove]');
+        if (!button || !['local', 'offline'].includes(view)) return;
+        const item = deviceEntries.find(entry => entry.id === button.dataset.deviceRemove);
+        if (!item) return;
+        const local = view === 'local';
+        const label = local ? 'Remove' : 'Delete';
+        const confirm = await ask({
+            title: `${label} ${item.name}?`, okLabel: label, danger: true,
+            text: local ? 'The original file stays on your device.' : 'Aethvyr will delete the cached bytes and saved download progress.'
+        });
+        if (!confirm.ok) return;
+        button.disabled = true;
+        try {
+            if (local) await globalThis.VelostreamLocal.remove(item.id);
+            else {
+                const result = await api.runtime.sendMessage({ action: 'VAULT_DELETE', id: item.id });
+                if (!result?.ok) throw new Error(result?.error || 'Could not delete cached download.');
+            }
+            await reloadDeviceItems();
+            showMessage(local ? 'Removed from Local files.' : 'Cached download deleted.', true);
+        } catch (error) {
+            showMessage(error.message);
+        } finally {
+            button.disabled = false;
+        }
+    }
+
     function setView(next, fromUser) {
+        const previous = view;
         view = Object.hasOwn(VIEWS, next) ? next : 'recent';
+        if (view !== previous && ['local', 'offline'].includes(view)) {
+            deviceEntries = [];
+            deviceStatus = 'Loading…';
+        }
         document.querySelectorAll('.lib-tabs a').forEach(a => {
             if (a.dataset.view === view) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
         });
-        document.title = `${VIEWS[view].title} · Velostream Library`;
+        document.title = `${VIEWS[view].title} · Aethvyr Library`;
         render();
-        if (fromUser) announce(`${VIEWS[view].title}: ${$('result-count').textContent || 'empty'}`);
+        reloadDeviceItems();
+        if (fromUser) announce(VIEWS[view].title);
     }
 
     function applyTheme() {
@@ -860,7 +969,7 @@
     // Init
     // -------------------------------------------------------------------
     document.addEventListener('DOMContentLoaded', async () => {
-        try { $('version').textContent = `Velostream v${api.runtime.getManifest().version}`; } catch (_) { /* no manifest */ }
+        try { $('version').textContent = `Aethvyr v${api.runtime.getManifest().version}`; } catch (_) { /* no manifest */ }
 
         const res = await api.storage.local.get(null);
         for (const [k, v] of Object.entries(res)) if (k.startsWith(SERIES_PREFIX) && SERIES_STATUS.includes(v)) seriesStatuses.set(k, v);
@@ -881,6 +990,29 @@
             button.setAttribute('aria-expanded', String(!expanded));
         });
         window.addEventListener('hashchange', () => setView(location.hash.slice(1), true));
+        window.addEventListener('focus', reloadDeviceItems);
+        $('view').addEventListener('click', event => {
+            const link = event.target.closest('a[href*="mode=local"]');
+            if (!link || view !== 'local' || event.ctrlKey || event.metaKey || event.shiftKey) return;
+            event.preventDefault();
+            const overlay = $('local-overlay');
+            const frame = overlay.querySelector('iframe');
+            const url = new URL(link.href);
+            url.searchParams.set('session', crypto.randomUUID());
+            frame.src = url.href;
+            overlay.showModal();
+            const onMessage = message => {
+                if (message.source === frame.contentWindow && message.data?.__velostream === 'layout' &&
+                    message.data.session === url.searchParams.get('session') && message.data.cmd === 'close') overlay.close();
+            };
+            window.addEventListener('message', onMessage);
+            overlay.addEventListener('close', () => {
+                window.removeEventListener('message', onMessage);
+                frame.removeAttribute('src');
+                if (link.isConnected) link.focus();
+            }, { once: true });
+        });
+        $('view').addEventListener('click', removeDeviceItem);
         $('view').addEventListener('click', onViewClick);
         $('view').addEventListener('change', onViewChange);
         $('view').addEventListener('toggle', e => {
@@ -957,5 +1089,8 @@
         });
         // "Watched x ago" labels; the markup comparison makes this a no-op when nothing changed.
         setInterval(() => { if (!document.hidden) render(); }, 60000);
+        setInterval(() => {
+            if (!document.hidden && view === 'offline' && !$('dialog').open) reloadDeviceItems();
+        }, 5000);
     });
 })();

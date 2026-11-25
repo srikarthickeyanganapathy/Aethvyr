@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Velostream Library</title>
+    <title>Aethvyr Library</title>
     <link rel="stylesheet" href="../common/tokens.css">
     <link rel="stylesheet" href="css/style.css">
     <link rel="stylesheet" href="css/library.css">
@@ -16,9 +16,10 @@
         <header class="app-header lib-header">
             <img class="app-icon" src="../icons/icon-48.png" alt="" width="28" height="28">
             <div class="lib-heading">
-                <h1>Velostream Library</h1>
+                <h1>Aethvyr Library</h1>
                 <p id="summary" class="muted num lib-summary">Loading your library…</p>
             </div>
+            <a class="btn small" href="guide.html">Feature guide</a>
             <button type="button" id="export-backup" class="btn small">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 19h14"/></svg>Export backup
             </button>
@@ -42,6 +43,8 @@
                     <li><a href="#favorites" data-view="favorites"><span>Favorites</span><span class="count num" data-count="favorites">0</span></a></li>
                     <li><a href="#collections" data-view="collections"><span>Collections</span><span class="count num" data-count="collections">0</span></a></li>
                     <li><a href="#bookmarked" data-view="bookmarked"><span>Bookmarked</span><span class="count num" data-count="bookmarked">0</span></a></li>
+                    <li><a href="#local" data-view="local">Local files</a></li>
+                    <li><a href="#offline" data-view="offline">Offline / Cached</a></li>
                 </ul>
             </nav>
 
@@ -82,6 +85,8 @@
         <footer class="foot muted"><span id="version" class="num"></span> · <span id="sync-footer">Your library is stored on this device.</span></footer>
     </div>
 
+    <dialog id="local-overlay" aria-label="Aethvyr player"><iframe title="Aethvyr player" allow="autoplay; fullscreen; picture-in-picture"></iframe></dialog>
+
     <dialog id="dialog" class="lib-dialog" aria-labelledby="dialog-title" aria-describedby="dialog-text">
         <form method="dialog" id="dialog-form" novalidate>
             <h2 id="dialog-title" class="card-title"></h2>
@@ -103,6 +108,7 @@
     </dialog>
 
     <script src="../common/shared.js"></script>
+    <script src="../common/local-files.js"></script>
     <script src="js/library.js"></script>
 </body>
 

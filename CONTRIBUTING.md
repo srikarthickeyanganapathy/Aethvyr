@@ -1,20 +1,20 @@
 # Contributing
 
-Thanks for helping improve Velostream. Bug reports, site compatibility reports, translations,
+Thanks for helping improve Aethvyr. Bug reports, site compatibility reports, translations,
 tests and code are all welcome.
 
 ## Reporting a bug
 
 Open an issue with:
 
-1. browser and version (Chrome, Edge, Kiwi, Firefox, Firefox for Android), and the Velostream
+1. browser and version (Chrome, Edge, Kiwi, Firefox, Firefox for Android), and the Aethvyr
    version;
 2. the page where it happens (or a description if it is private);
 3. what you expected and what happened;
 4. the console line starting with `[Velostream]` (DevTools → page → `player.html` frame), and for
    detection problems the popup's stream list.
 
-**Do not ask for, or submit, support for DRM-protected services.** Velostream will not circumvent
+**Do not ask for, or submit, support for DRM-protected services.** Aethvyr will not circumvent
 DRM.
 
 ## Development

@@ -1,0 +1,44 @@
+name: Build and verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - run: npm run package
+      - name: Verify version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          test "$GITHUB_REF_NAME" = "$expected" || { echo "Expected tag $expected"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aethvyr-browser-packages
+          path: dist/aethvyr-*.zip
+          if-no-files-found: error
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm audit --omit=dev --audit-level=high

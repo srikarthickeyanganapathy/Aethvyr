@@ -1,7 +1,9 @@
 # Store listing
 
-Copy-ready text for the Firefox Add-ons (AMO) and Chrome Web Store submission forms. Upload
-`dist/velostream-firefox-<version>.zip` / `dist/velostream-chrome-<version>.zip` from
+The repository includes the [440 × 280 promotional design](../assets/brand/promo.svg), [desktop player screenshot](media/playback-diagnostics.png), [feature guide screenshot](media/feature-guide.png), and [playback demo](media/playback-demo.webm). The desktop media were captured from the Edge extension using the generated test fixture.
+
+Draft listing text for the Firefox Add-ons (AMO) and Chrome Web Store submission forms. Upload
+`dist/aethvyr-firefox-<version>.zip` / `dist/aethvyr-chrome-<version>.zip` from
 `npm run build && npm run package`.
 
 ---
@@ -10,18 +12,14 @@ Copy-ready text for the Firefox Add-ons (AMO) and Chrome Web Store submission fo
 
 ### 1. Upload version
 
-- **Validation:** expect *0 errors, 10 warnings*: the 2 data_collection_permissions version notes and 8 `UNSUPPORTED_API` in
-  `lib/shaka-player.compiled.js` (see reviewer notes below). Warnings do not block submission;
-  click **Continue**.
-- **Compatible applications:** *Firefox* is ticked. *Firefox for Android* is ticked **and greyed
-  out**: AMO locks it on because the manifest declares `browser_specific_settings.gecko_android`.
-  That is correct; Velostream supports Android 128+. Expect 2 extra validation warnings saying data_collection_permissions needs Firefox 140 / Android 142: older versions simply ignore the key, so they are harmless.
+- Validate the exact release archive in AMO and record the result before submission.
+- The build declares Firefox desktop and Android targets. Record browser and device smoke-test results for the release.
 
 ### 2. Source code
 
 **Do you need to submit source code?** → **No.**
 
-Velostream's own code is not minified, transpiled or bundled. The only minified file is the
+Aethvyr's own code is not minified, transpiled or bundled. The only minified file is the
 unmodified third-party library Shaka Player, which reviewers verify against its official release
 (link in the reviewer notes).
 
@@ -29,7 +27,7 @@ unmodified third-party library Shaka Player, which reviewers verify against its 
 
 | Field | Value |
 |-------|-------|
-| **Name** | Velostream |
+| **Name** | Aethvyr — Universal Video Player |
 | **Add-on URL** | `velostream` |
 | **Summary** (max 250 characters) | Plays web videos (HLS, DASH, MP4) in a fast, accessible player over the site's own: background pre-buffering, GPU sharpening and upscaling, captured subtitles, gestures, and one-click download as a single MP4. No tracking, no servers. |
 | **Categories (Firefox)** | Photos, Music & Videos; Download Management |
@@ -45,7 +43,7 @@ unmodified third-party library Shaka Player, which reviewers verify against its 
 **Description:**
 
 ```
-Velostream finds the video a page is playing and opens it in its own player, placed exactly over the site's video.
+Aethvyr finds the video a page is playing and opens it in its own player, placed exactly over the site's video.
 
 FAST
 • Pre-downloads the whole video in the background with parallel connections, so seeking is instant and a weak connection does not stall playback
@@ -64,7 +62,7 @@ CONTROLS
 • Double-tap zones, swipe for volume and brightness, long-press 2×, pinch zoom
 • Customizable keyboard shortcuts, mouse wheel and middle-click actions
 • Mini player, Picture-in-Picture, sleep timer, A-B loop, bookmarks, resume where you left off
-• Per-site profiles and "always play in Velostream" for chosen sites
+• Per-site profiles and "always play in Aethvyr" for chosen sites
 • Make it yours: five skins (glass, cinema, theater, floating pill, compact), minimal / standard / pro controls, seek bar styles, and show, hide or reorder buttons
 
 SAVE
@@ -76,7 +74,7 @@ ACCESSIBLE
 • Fully usable with keyboard and screen readers; high contrast, reduced motion, interface scaling, dyslexia-friendly subtitle fonts
 
 PRIVATE
-• No accounts, servers, analytics or remote code. Velostream only talks to the sites you watch.
+• No accounts, servers, analytics or remote code. Aethvyr only talks to the sites you watch.
 
 Not supported: DRM-protected video (Netflix, Prime Video, Disney+, YouTube's protected streams and similar). Please only download content you have the right to keep.
 ```
@@ -84,7 +82,7 @@ Not supported: DRM-protected video (Netflix, Prime Video, Disney+, YouTube's pro
 ### 4. Notes to reviewer
 
 ```
-Velostream is a video player. It detects HLS/DASH/MP4 streams on pages and plays them in an extension page (player/player.html) mounted as an iframe over the site's video.
+Aethvyr is a video player. It detects HLS/DASH/MP4 streams on pages and plays them in an extension page (player/player.html) mounted as an iframe over the site's video.
 
 Third-party library:
 lib/shaka-player.compiled.js is the unmodified Shaka Player 5.3.3 file dist/shaka-player.compiled-es2021.js from npm:
@@ -105,7 +103,7 @@ No remote code, no eval, no analytics; data_collection_permissions is "none".
 
 How to test:
 1. Open https://shaka-player-demo.appspot.com/ or any page with an HLS stream, start the video.
-2. Click the "Play in Velostream" pill over the video, or the toolbar button and pick the stream.
+2. Click the "Play in Aethvyr" pill over the video, or the toolbar button and pick the stream.
 3. The player opens over the video. Press "?" for shortcuts; the download button saves an MP4.
 Source and documentation: https://github.com/srikarthickeyanganapathy/Velostream
 ```
@@ -122,7 +120,7 @@ Source and documentation: https://github.com/srikarthickeyanganapathy/Velostream
 
 | Field | Value |
 |-------|-------|
-| **Name** | Velostream (from the manifest) |
+| **Name** | Aethvyr — Universal Video Player |
 | **Summary** (max 132 characters) | Fast, accessible player for web video: pre-buffering, GPU sharpening, captured subtitles and one-click MP4 download. |
 | **Description** | Same as the AMO description above |
 | **Category** | Productivity → Tools (or Entertainment) |
@@ -133,7 +131,7 @@ Source and documentation: https://github.com/srikarthickeyanganapathy/Velostream
 
 **Privacy practices tab:**
 
-- **Single purpose:** *Velostream plays video streams found on web pages in an enhanced,
+- **Single purpose:** *Aethvyr plays video streams found on web pages in an enhanced,
   accessible player that pre-buffers, enhances and optionally saves them.*
 - **Permission justifications:** copy each one from [PERMISSIONS.md](PERMISSIONS.md#store-justification-text).
 - **Remote code:** *No, I am not using remote code.*

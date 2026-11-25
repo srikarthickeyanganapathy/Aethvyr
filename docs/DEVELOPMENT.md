@@ -17,7 +17,7 @@ npm run build
 | `npm run build:chrome` / `build:firefox` | One target |
 | `npm run watch` | Rebuilds on every source change |
 | `npm run lint` | ESLint over all sources (must pass with zero warnings before a PR) |
-| `npm run package` | Zips each built target into `dist/velostream-<browser>-<version>.zip` |
+| `npm run package` | Zips each built target into `dist/aethvyr-<browser>-<version>.zip` |
 | `npm test` | Placeholder: there is no automated test suite in the repository yet (see [Testing](#testing)) |
 
 ### What the build does
@@ -51,7 +51,7 @@ Always load the **built** folder; the source folder has no `lib/`.
 | Context | Where to look |
 |---------|---------------|
 | Engine | `chrome://extensions` → *Inspect views: service worker* (Firefox: *Inspect* in about:debugging). The global `VelostreamEngine` exposes `tabs`, `sessions` and `launchPlayer(tabId, streamId)`. |
-| Player | DevTools on the page → frame selector → `player.html`. Errors are logged as `[Velostream] Shaka error <code> [HTTP status] <url> - <reason>`. |
+| Player | DevTools on the page → frame selector → `player.html`. Errors are logged as `[Velostream] Shaka error <code> (severity <level>)`. |
 | Content scripts | Page DevTools; the interceptor runs in the page's world, the sniffer under the extension's content-script context. |
 | Popup | Right-click the popup → *Inspect*. |
 
@@ -120,6 +120,20 @@ re-check before a release.
 
 ## Release checklist
 
+### Edge foundation test
+
+Run `node scripts/chromium-foundation.mjs "<path to msedge>" dist/velostream-chrome-2.7.1.zip` after building. This Windows desktop check needs Node 22+, Python 3 and an Edge build that supports unpacked extensions. It uses a temporary profile, a generated video from a loopback server, and Edge’s extension settings to enable InPrivate access only in the test profile. Add `--capture` to update the README screenshots and demo. Add `--icons` to rasterize the SVG toolbar marks, then rebuild to package them.
+
+### Firefox upgrade and private watch-history test
+
+With Python 3.9+ and Firefox installed, pass a Velostream Firefox ZIP and the freshly built Aethvyr Firefox ZIP to the runner. Add `--firefox <path-to-executable>` if Firefox is outside PATH.
+
+```sh
+python scripts/firefox-upgrade.py dist/velostream-firefox-2.7.1.zip dist/aethvyr-firefox-2.7.1.zip
+```
+
+The runner creates fresh profiles and adds fixed test probes to temporary package copies. It compares stored values and download bytes across two installs, writes a regular and a private watch position, closes the private window, then inspects regular history. Results return over loopback. The production packages exclude the probes.
+
 ### Before the first public release
 
 - [x] **Gecko add-on ID.** `scripts/build.js` uses `velostream@srikarthickeyanganapathy.github.io`.
@@ -128,8 +142,7 @@ re-check before a release.
       The first ID, `velostream@antigravity.dev`, was lost that way. To change visibility, use
       *Manage Status & Versions* instead of deleting: switch between listed and unlisted, or
       disable the add-on.
-- [ ] **Name.** `manifest.json` says `Velostream 2.0`. Store listings usually use the bare name;
-      the version is shown separately.
+- [x] The manifest uses the Aethvyr display name.
 - [ ] Fill `author` and `homepage_url` (in `manifest.json` and `package.json`).
 - [ ] Publish [PRIVACY.md](../PRIVACY.md) at a public URL; both stores ask for one.
 - [ ] Screenshots (1280×800 or 640×400) and a 440×280 promo tile for the Chrome Web Store.
@@ -144,19 +157,19 @@ re-check before a release.
 
 ### Chrome Web Store
 
-- Upload `dist/velostream-chrome-<version>.zip` in the developer dashboard.
+- Upload `dist/aethvyr-chrome-<version>.zip` in the developer dashboard.
 - **Single purpose:** "Play web video streams in an enhanced, accessible player."
 - **Permission justifications:** copy them from [PERMISSIONS.md](PERMISSIONS.md). Broad host
   access plus `webRequest` triggers an in-depth review, so expect a few extra days.
 - **Data usage:** no data collected; certify the limited-use policy.
 - Policy notes:
-  - The store does not allow extensions that download from YouTube. Velostream cannot (YouTube
+  - The store does not allow extensions that download from YouTube. Aethvyr cannot (YouTube
     uses its own MSE pipeline and DRM) and should not be marketed for it.
   - Describe downloads as saving video "you have the right to save".
 
 ### Firefox Add-ons (AMO)
 
-- Upload `dist/velostream-firefox-<version>.zip`; mark it compatible with Firefox for Android.
+- Upload `dist/aethvyr-firefox-<version>.zip`; mark it compatible with Firefox for Android.
 - **Data collection:** the build writes
   `browser_specific_settings.gecko.data_collection_permissions = { "required": ["none"] }`
   (Firefox's built-in data consent; AMO rejects new add-ons without it). Keep it at `none` unless

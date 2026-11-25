@@ -15,7 +15,10 @@
 
 import '../common/shared.js';
 import { BufferManager, sweepOrphans } from './buffer-manager.js';
-import { SegmentDownloader, sniffMedia } from './downloader.js';
+import { PrivateBuffer } from './private-buffer.js';
+import { SegmentDownloader, exportMediaType } from './downloader.js';
+import { checkpoint, downloadStore, validateExportRange } from './download-store.js';
+import { cacheShareMB, NetworkBudget, PrefetchBudget } from './resource-policy.js';
 import { ABRController } from './abr-controller.js';
 import { parsePlaylist, ivForSegment, decryptAes128 } from './hls-parser.js';
 import { initSync } from './sync.js';
@@ -52,8 +55,8 @@ const settingsReady = api.storage.local.get(S.SETTINGS_KEY).then(res => {
 api.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !changes[S.SETTINGS_KEY]) return;
     settings = S.mergeSettings(changes[S.SETTINGS_KEY].newValue);
+    distributeCache();
     for (const session of sessions.values()) {
-        session.buffer.setCapacity(settings.cacheSizeMB);
         session.abr.setMaxHeight(session.qualityCap ?? settings.qualityCap);
         session.downloader.schedulePump();
     }
@@ -65,7 +68,28 @@ api.storage.onChanged.addListener((changes, area) => {
 /** @type {Map<number, {tabId:number, streams:Map<string,object>, byUrl:Map<string,string>, children:Set<string>, mseFrames:Map<number,number>, videoFrames:Set<number>, playerSessionId:string|null, probing:number}>} */
 const tabs = new Map();
 const closedTabs = new Set();
+const activeExports = new Set();
 const sessions = new Map(); // sessionId -> Session
+const networkBudget = new NetworkBudget();
+let diskBudgetMB = Infinity;
+let lastEstimate = -Infinity;
+function distributeCache() {
+    const share = cacheShareMB(settings, sessions.size, diskBudgetMB);
+    for (const session of sessions.values()) session.buffer.setCapacity(share);
+}
+function checkStorage() {
+    if (Date.now() - lastEstimate < 60000 || !globalThis.navigator?.storage?.estimate) return;
+    lastEstimate = Date.now();
+    navigator.storage.estimate().then(({ usage, quota }) => {
+        if (!Number.isFinite(usage) || !Number.isFinite(quota) || quota <= 0) return;
+        const used = [...sessions.values()].reduce((sum, s) => sum + (s.privateTab ? 0 : s.buffer.currentSize), 0);
+        diskBudgetMB = Math.max(0, (quota - usage + used) / 1048576 - 32);
+        distributeCache();
+    }).catch(() => {});
+}
+const prefetchBudget = new PrefetchBudget(8, () => {
+    for (const session of sessions.values()) session.downloader.schedulePump();
+});
 const persistTimers = new Map();
 const tabClears = new Map();
 const resumeRequests = new Map();
@@ -510,6 +534,14 @@ const captureReady = api.storage.session.get(CAPTURE_KEY).then(res => {
     }
 }).catch(() => { });
 let captureTimer;
+const tabPrivacy = new Map();
+function isPrivateTab(tabId) {
+    if (!tabPrivacy.has(tabId)) {
+        // A closing or inaccessible tab must never contribute to the regular capture cache.
+        tabPrivacy.set(tabId, api.tabs.get(tabId).then(tab => !!tab.incognito, () => true));
+    }
+    return tabPrivacy.get(tabId);
+}
 
 function pickFrameId(tab, stream) {
     if (stream && stream.frameId >= 0) return stream.frameId;
@@ -843,6 +875,7 @@ async function directFetch(url, { method = 'GET', headers = {}, signal }, frameU
     try {
         res = await fetch(url, { method, headers: h, credentials: 'include', signal: ctl.signal, cache: 'no-store' });
     } catch (err) {
+        signal?.removeEventListener('abort', onAbort);
         if (timedOut && !(signal && signal.aborted)) throw new Error(`Direct fetch timeout (${PROXY_TIMEOUT_MS}ms)`);
         throw err;
     } finally {
@@ -870,12 +903,13 @@ const pageOnlyHosts = new Map();
  *     (page cookies / session) and remember that this host needs it.
  */
 function makeTransport(tabId, getStream) {
-    return async (url, opts) => {
+    return (url, opts) => networkBudget.run(url, opts.signal, async () => {
         // No create: a late request for a closed tab must not resurrect its state.
         const tab = await getTab(tabId, { create: false });
         const stream = getStream();
         const frameId = pickFrameId(tab, stream);
         const frameUrl = (stream && stream.frameUrl) || '';
+        if (await isPrivateTab(tabId)) return proxyViaFrame(tabId, frameId, url, opts);
         await captureReady;
         // Replay auth/token headers the site's player used for this host (Range stays ours).
         // Only headers captured from the same site as the stream's frame (never another site's).
@@ -927,7 +961,7 @@ function makeTransport(tabId, getStream) {
             if (err.name === 'AbortError' || !err.proxyUnavailable) throw err;
             return directFetch(url, opts, frameUrl); // frame gone: last resort
         }
-    };
+    });
 }
 
 // ============================================================================
@@ -994,12 +1028,13 @@ async function probeStream(tab, stream) {
 // ============================================================================
 // WEBREQUEST: header capture + network-level detection (sees worker/native requests too)
 // ============================================================================
-function rememberReferer(details) {
+async function rememberReferer(details) {
     // Our own player iframe's requests come from the extension origin: never learn from those.
     if (details.tabId < 0) return;
     if (EXT_HOST && ((details.initiator && details.initiator.includes(EXT_HOST)) || (details.originUrl && details.originUrl.includes(EXT_HOST)))) return;
     // Any data request may be an extension-less manifest; the capture map is capped (LRU).
     if (!S.classifyStream(details.url) && !['xmlhttprequest', 'media', 'other'].includes(details.type)) return;
+    if (await isPrivateTab(details.tabId)) return;
     let host;
     try { host = new URL(details.url).hostname; } catch (_) { return; }
     const info = { headers: {}, at: Date.now() };
@@ -1129,7 +1164,8 @@ async function restoreSessionState(session) {
 }
 
 class Session {
-    constructor({ id, tabId, stream }) {
+    constructor({ id, tabId, stream, privateTab }) {
+        this.privateTab = privateTab;
         this.id = id;
         this.tabId = tabId;
         this.stream = stream;
@@ -1143,7 +1179,7 @@ class Session {
         this.closing = false;
         this.disconnectTimer = null;
 
-        this.buffer = new BufferManager(tabId, id, {
+        this.buffer = privateTab ? new PrivateBuffer(settings.cacheSizeMB) : new BufferManager(tabId, id, {
             capBytes: settings.cacheSizeMB * 1024 * 1024,
             isProtected: key => this.downloader.isProtected(key)
         });
@@ -1164,7 +1200,10 @@ class Session {
             transport: makeTransport(this.tabId, () => this.stream),
             buffer: this.buffer,
             abr: this.abr,
-            getSettings: () => settings
+            getSettings: () => settings,
+            sessionCount: () => [...sessions.values()].filter(session => session.port && !session.downloader.paused).length,
+            takePrefetchSlot: () => prefetchBudget.take(),
+            prioritizeSeek: () => prefetchBudget.prioritizeSeek()
         });
         // Observe every playlist the downloader learns (player manifest loads go through
         // downloader.load -> ingestPlaylist) so it can be re-taught after a worker restart.
@@ -1195,7 +1234,7 @@ class Session {
         this.activeVariantId = null;
         this.setupPipeline();
         this.persistState({ soon: true });
-        if (stream.type === 'progressive') await ensureRefererRule(stream.url, stream.frameUrl || '').catch(() => { });
+        if (!this.privateTab && stream.type === 'progressive') await ensureRefererRule(stream.url, stream.frameUrl || '').catch(() => { });
     }
 
     notePlaylist(url, text, parsed) {
@@ -1321,6 +1360,7 @@ async function endSession(session, { clearCache = true, restoreMedia = true } = 
     if (!sessions.has(session.id)) return;
     session.closing = true;
     sessions.delete(session.id);
+    distributeCache();
     session.destroy();
     removeSessionState(session.id);
     if (clearCache) await session.buffer.clearStream().catch(() => { });
@@ -1344,6 +1384,7 @@ async function endSession(session, { clearCache = true, restoreMedia = true } = 
 
 async function handleRequest(session, msg) {
     const controller = new AbortController();
+    session.requests.get(msg.reqId)?.abort();
     session.requests.set(msg.reqId, controller);
     try {
         const res = await session.downloader.load({
@@ -1352,7 +1393,7 @@ async function handleRequest(session, msg) {
             headers: msg.headers || {},
             kind: msg.kind || 'segment',
             signal: controller.signal,
-            zeroCopy: !!msg.zeroCopy
+            zeroCopy: !!msg.zeroCopy && !session.privateTab
         });
         if (controller.signal.aborted) return;
         session.post({
@@ -1378,7 +1419,7 @@ async function handleRequest(session, msg) {
             error: String((err && err.message) || err)
         });
     } finally {
-        session.requests.delete(msg.reqId);
+        if (session.requests.get(msg.reqId) === controller) session.requests.delete(msg.reqId);
     }
 }
 
@@ -1386,7 +1427,11 @@ async function handleRequest(session, msg) {
 // Export / recording (HLS + progressive). Chunks are streamed to the player, which
 // assembles a Blob in page memory (service workers cannot create object URLs).
 // ----------------------------------------------------------------------------
-function fileBaseName(stream) {
+function fileBaseName(stream, title) {
+    const clean = value => value.replace(/\.(m3u8|mpd|mp4|webm|mkv|mov|m4v)$/i, '')
+        .replace(/[^\p{L}\p{N} ._-]+/gu, '_').replace(/^[.\s]+|[.\s]+$/g, '').slice(0, 100);
+    const name = typeof title === 'string' ? clean(title) : '';
+    if (name) return name;
     try {
         const u = new URL(stream.url);
         const last = u.pathname.split('/').filter(Boolean).pop() || 'stream';
@@ -1508,186 +1553,204 @@ function sanitizeDashPlan(plan) {
     return out.length ? out : null;
 }
 
-async function runExport(session, opts = {}) {
-    if (session.exportJob) {
-        session.post({ type: 'EXPORT_ERROR', error: 'An export is already running. Wait for it to finish or cancel it.' });
-        return false;
+async function runExport(session, opts = {}, saved = null) {
+    if (session.exportJob || (saved && activeExports.has(saved.id))) {
+        session.post({ type: 'EXPORT_ERROR', error: 'An export is already running.' });
+        return;
     }
     const controller = new AbortController();
-    const jobId = crypto.randomUUID();
+    const jobId = saved?.id || crypto.randomUUID();
     session.exportJob = { id: jobId, controller };
+    activeExports.add(jobId);
     const signal = controller.signal;
-    const post = (m) => session.post({ ...m, jobId });
-    const base = fileBaseName(session.stream);
-
+    const format = saved?.format ?? (opts.format === 'original' ? 'original' : undefined);
+    const post = m => session.post({ ...m, jobId, format });
+    let job = saved;
     try {
-        if (session.stream.type === 'progressive') {
-            await exportProgressive(session, post, signal, base);
-        } else if (session.stream.type === 'hls') {
-            const d = session.downloader;
-            const main = d.mainPlaylist();
-            if (!main) throw new Error('Playlist not loaded yet - start playback first.');
-            const parts = [main];
-            const audio = d.activePlaylists().find(p => p.role === 'audio' && p !== main);
-            if (audio) parts.push(audio);
+        const base = saved?.base || fileBaseName(session.stream, opts.title);
+        const progressive = session.stream.type === 'progressive';
+        const parts = saved?.parts || exportParts(session, opts, base);
+        if (!job && !opts.clip && !session.privateTab) {
+            job = { id: jobId, stream: session.stream, tabId: session.tabId, cacheSessionId: session.id, base, parts, format,
+                totalSegments: parts.reduce((count, part) => count + part.segs.length, 0),
+                qualityUrl: parts[0]?.url || session.stream.url,
+                bytes: 0, completedCount: 0, byteOffset: 0, status: 'paused' };
+            await downloadStore.save(job);
+        }
+        const checkpointId = job?.id;
+        if (progressive) await exportProgressive(session, post, signal, base, checkpointId);
+        else {
             for (let i = 0; i < parts.length; i++) {
-                let segs = d.exportSegments(parts[i]);
-                if (opts.recording) segs = recordingSegments(opts.recording, parts[i], segs);
-                if (opts.clip) {
-                    // A-B clip: the range is in player time; segment starts are playlist time.
-                    // Whole segments overlapping [start, end] are kept (cuts land on segment
-                    // boundaries, which are keyframes, so no re-encoding is needed).
-                    const off = typeof d.timelineOffset === 'function' ? (d.timelineOffset(parts[i]) || 0) : 0;
-                    const { start, end } = opts.clip;
-                    segs = segs.filter(s => Number.isFinite(s.start) && s.start + off < end && s.start + off + (s.duration || 0) > start);
-                    if (!segs.length) throw new Error('No segments in the A–B range. Play through it once, then try again.');
-                }
-                const suffix = `${opts.recording ? '-recording' : ''}${opts.clip ? '-clip' : ''}${parts.length > 1 ? (i === 0 ? '-video' : '-audio') : ''}`;
-                await exportHlsPlaylist(session, parts[i], segs, post, signal, `${base}${suffix}`, i, parts.length);
+                const part = parts[i];
+                await exportHlsPlaylist(session, part, part.segs, post, signal, part.name, i, parts.length, checkpointId, !!opts.clip);
             }
-        } else if (session.stream.type === 'dash' && opts.dash) {
-            // The player built the plan from Shaka's parsed MPD; segments are fMP4 like HLS fMP4.
-            for (let i = 0; i < opts.dash.length; i++) {
-                const part = opts.dash[i];
-                const suffix = opts.dash.length > 1 ? (part.role === 'audio' ? '-audio' : '-video') : '';
-                await exportHlsPlaylist(session, { role: part.role, ext: part.ext, mime: part.mime }, part.segs, post, signal, `${base}${suffix}`, i, opts.dash.length);
-            }
-        } else {
-            throw new Error('Export supports HLS, DASH and direct media files.');
+        }
+        if (job) {
+            const current = await downloadStore.get(job.id);
+            await downloadStore.save({ ...current, status: 'cached' });
         }
         post({ type: 'EXPORT_COMPLETE' });
     } catch (err) {
-        post({ type: 'EXPORT_ERROR', error: err.name === 'AbortError' ? 'Export cancelled' : String(err.message || err) });
+        post({ type: 'EXPORT_ERROR', error: err.name === 'AbortError' ? (job ? 'Download paused. Resume from Offline / Cached.' : 'Export cancelled') : String(err.message || err) });
     } finally {
+        controller.abort();
+        activeExports.delete(jobId);
         session.exportJob = null;
     }
-    return true;
 }
 
-async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fileIndex, fileCount) {
+function exportParts(session, opts, base) {
+    if (session.stream.type === 'progressive') return [];
+    if (session.stream.type === 'dash' && opts.dash) {
+        return opts.dash.map(part => ({ ...part,
+            name: base + (opts.clip ? '-clip' : '') + (opts.dash.length > 1 ? (part.role === 'audio' ? '-audio' : '-video') : '')
+        }));
+    }
+    if (session.stream.type !== 'hls') throw new Error('This stream cannot be saved.');
+    const d = session.downloader;
+    const main = d.mainPlaylist();
+    if (!main) throw new Error('Playlist not loaded yet. Start playback first.');
+    const playlists = [main];
+    const audio = d.activePlaylists().find(p => p.role === 'audio' && p !== main);
+    if (audio) playlists.push(audio);
+    return playlists.map((playlist, i) => {
+        let segs = d.exportSegments(playlist);
+        if (opts.recording) segs = recordingSegments(opts.recording, playlist, segs);
+        if (opts.clip) {
+            const off = d.timelineOffset(playlist) || 0;
+            const { start, end } = opts.clip;
+            segs = segs.filter(s => Number.isFinite(s.start) && s.start + off < end && s.start + off + s.duration > start);
+            if (!segs.length) throw new Error('No segments in the A–B range. Play through it once, then try again.');
+        }
+        const suffix = (opts.recording ? '-recording' : '') + (opts.clip ? '-clip' : '') +
+            (playlists.length > 1 ? (i === 0 ? '-video' : '-audio') : '');
+        return { role: playlist.role, url: playlist.url, name: base + suffix, segs };
+    });
+}
+
+async function exportHlsPlaylist(session, playlist, segs, post, signal, name, fileIndex, fileCount, checkpointId, cacheOnly) {
     if (!segs.length) throw new Error('Nothing to save yet');
     if (segs.some(s => s.key && !['NONE', 'AES-128'].includes(s.key.method))) {
         throw new Error('This stream uses SAMPLE-AES/DRM encryption and cannot be exported.');
     }
     const isFmp4 = segs.some(s => s.map);
-    const firstPath = (() => { try { return new URL(segs[0].uri).pathname; } catch (_) { return ''; } })();
     let ext = isFmp4 ? (playlist.role === 'audio' ? 'm4a' : 'mp4') : 'ts';
     let mime = isFmp4 ? (playlist.role === 'audio' ? 'audio/mp4' : 'video/mp4') : 'video/mp2t';
-    if (!isFmp4 && /\.aac$/i.test(firstPath)) { ext = 'aac'; mime = 'audio/aac'; }
     if (playlist.ext) { ext = playlist.ext; mime = playlist.mime || mime; } // DASH: the player knows the container
     const webm = /^web/.test(ext);
 
-    const transport = session.downloader.transport;
     const keyCache = new Map();
     const getKey = async (uri) => {
         if (!keyCache.has(uri)) {
-            keyCache.set(uri, transport(uri, { method: 'GET', headers: {}, signal }).then(r => {
-                if (r.status >= 400 || r.data.byteLength !== 16) throw new Error('Could not load AES-128 key');
-                return r.data;
-            }));
+            keyCache.set(uri, session.downloader.fetchExportKey(uri, signal, cacheOnly));
         }
         return keyCache.get(uri);
     };
 
-    post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime, container: /^web/.test(ext) ? 'webm' : isFmp4 ? 'fmp4' : (ext === 'aac' ? 'aac' : 'ts'), role: playlist.role || 'main' });
     let lastMap = null;
     const LOOKAHEAD = 4;
     const pending = new Map();
     const startFetch = (i) => {
         if (i >= segs.length || pending.has(i)) return;
         const seg = segs[i];
-        const p = (async () => {
+        const p = checkpoint(downloadStore, checkpointId, `seg:${fileIndex}:${i}`, signal, async () => {
             // Encrypted segments come back as raw ciphertext (the downloader must not sniff or
             // trim them): decrypt first, then strip any disguise header from the plaintext.
-            let data = await session.downloader.fetchForExport(seg, signal);
+            let data = await session.downloader.fetchForExport(seg, signal, { cacheOnly });
             if (seg.key && seg.key.method === 'AES-128') {
                 data = await decryptAes128(data, await getKey(seg.key.uri), ivForSegment(seg));
             }
-            if (webm) return data; // the disguise sniffer knows TS/MP4 only
-            const sniff = sniffMedia(data);
-            return sniff && sniff.offset ? data.slice(sniff.offset) : data;
-        })();
+            const media = exportMediaType(data, { webmFragment: webm });
+            if (!media) throw new Error('The server returned a non-media segment. Refresh the source before downloading.');
+            return { data: media.offset ? data.slice(media.offset) : data };
+        }).then(chunk => chunk.data);
         p.catch(() => { }); // awaited in order below; avoid unhandled rejections past a failure
         pending.set(i, p);
     };
     let bytes = 0;
-    for (let i = 0; i < segs.length; i++) {
-        for (let k = i; k < i + LOOKAHEAD; k++) startFetch(k);
-        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-        const seg = segs[i];
-        if (seg.map && (!lastMap || lastMap.uri !== seg.map.uri || JSON.stringify(lastMap.byteRange) !== JSON.stringify(seg.map.byteRange))) {
-            const headers = seg.map.byteRange ? { Range: `bytes=${seg.map.byteRange.offset}-${seg.map.byteRange.offset + seg.map.byteRange.length - 1}` } : {};
-            const init = await transport(seg.map.uri, { method: 'GET', headers, signal });
-            if (init.status >= 400) throw new Error(`Init segment HTTP ${init.status}`);
-            const initSniff = webm ? null : sniffMedia(init.data);
-            const initData = initSniff && initSniff.offset ? init.data.slice(initSniff.offset) : init.data;
-            post({ type: 'EXPORT_CHUNK', fileIndex, kind: 'init', data: S.packBinary(initData) });
-            bytes += initData.byteLength;
-            lastMap = seg.map;
+    try {
+        startFetch(0);
+        const firstMedia = exportMediaType(await pending.get(0), { webmFragment: webm });
+        if (!firstMedia) throw new Error('The cached segment does not contain media. Delete the cached download and try again.');
+        if (!playlist.ext && !isFmp4) {
+            ({ mime } = firstMedia);
+            ext = mime === 'audio/aac' ? 'aac' : mime === 'video/mp4' ? 'mp4' : 'ts';
         }
-        const data = await pending.get(i);
-        pending.delete(i);
-        bytes += data.byteLength;
-        post({ type: 'EXPORT_CHUNK', fileIndex, kind: 'seg', start: seg.start || 0, end: (seg.start || 0) + (seg.duration || 0), url: seg.uri, data: S.packBinary(data) });
-        post({ type: 'EXPORT_PROGRESS', fileIndex, fileCount, done: i + 1, total: segs.length, bytes });
+        post({ type: 'EXPORT_BEGIN', fileIndex, fileCount, filename: `${name}.${ext}`, mime,
+            container: webm ? 'webm' : isFmp4 || ext === 'mp4' ? 'fmp4' : ext, role: playlist.role || 'main' });
+        for (let i = 0; i < segs.length; i++) {
+            for (let k = i; k < i + LOOKAHEAD; k++) startFetch(k);
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            const seg = segs[i];
+            if (seg.map && (!lastMap || lastMap.uri !== seg.map.uri || JSON.stringify(lastMap.byteRange) !== JSON.stringify(seg.map.byteRange))) {
+                const { data: initData } = await checkpoint(downloadStore, checkpointId, `init:${fileIndex}:${i}`, signal, async () => {
+                    const range = seg.map.byteRange;
+                    const data = await session.downloader.fetchForExport({
+                        uri: seg.map.uri, range: range ? `bytes=${range.offset}-${range.offset + range.length - 1}` : null
+                    }, signal, { cacheOnly, keepOriginal: webm });
+                    const media = exportMediaType(data, { webmFragment: webm });
+                    if (!media) throw new Error('The source returned an invalid initialization segment.');
+                    return { data };
+                });
+                if (!exportMediaType(initData, { webmFragment: webm })) throw new Error('The cached initialization segment does not contain media.');
+                await sendExportChunk(session, post, { fileIndex, kind: 'init', data: S.packBinary(initData) }, signal);
+                bytes += initData.byteLength;
+                lastMap = seg.map;
+            }
+            const data = await pending.get(i);
+            if (exportMediaType(data, { webmFragment: webm })?.mime !== firstMedia.mime) {
+                throw new Error('The source changed media format or returned an invalid segment.');
+            }
+            pending.delete(i);
+            bytes += data.byteLength;
+            await sendExportChunk(session, post, { fileIndex, kind: 'seg', start: seg.start || 0, end: (seg.start || 0) + (seg.duration || 0), url: seg.uri, data: S.packBinary(data) }, signal);
+            post({ type: 'EXPORT_PROGRESS', fileIndex, fileCount, done: i + 1, total: segs.length, bytes });
+        }
+    } catch (error) {
+        session.exportJob.controller.abort();
+        await Promise.allSettled(pending.values());
+        throw error;
     }
     post({ type: 'EXPORT_FILE_DONE', fileIndex });
 }
 
-async function exportProgressive(session, post, signal, name) {
-    const transport = session.downloader.transport;
+async function exportProgressive(session, post, signal, name, checkpointId) {
     const url = session.stream.url;
     const CHUNK = 4 * 1024 * 1024;
-    let ext = 'mp4';
-    const m = /\.(mp4|m4v|webm|mkv|mov|ogv)(\?|$)/i.exec(url);
-    if (m) ext = m[1].toLowerCase();
-    const mime = { webm: 'video/webm', mkv: 'video/x-matroska', mov: 'video/quicktime', ogv: 'video/ogg' }[ext] || 'video/mp4';
-    post({ type: 'EXPORT_BEGIN', fileIndex: 0, fileCount: 1, filename: `${name}.${ext}`, mime });
-    const fetchChunk = async (offset) => {
-        const res = await transport(url, { method: 'GET', headers: { Range: `bytes=${offset}-${offset + CHUNK - 1}` }, signal });
-        if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
-        return res;
-    };
-    const first = await fetchChunk(0);
-    post({ type: 'EXPORT_CHUNK', fileIndex: 0, data: S.packBinary(first.data) });
-    let offset = first.data.byteLength;
-    const cr = first.headers['content-range'];
-    const total = cr ? parseInt(cr.split('/')[1], 10) : NaN;
-    post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total: Number.isFinite(total) ? total : offset, bytes: offset });
-    // 200 = server ignored Range and sent the whole file; short read = end of file.
-    if (first.status === 200 || first.data.byteLength < CHUNK) {
-        post({ type: 'EXPORT_FILE_DONE', fileIndex: 0 });
-        return;
-    }
-    if (Number.isFinite(total)) {
-        // Known size: 4 chunks in flight (range accelerator), emitted strictly in order.
-        const pending = new Map();
-        const offsets = [];
-        for (let o = offset; o < total; o += CHUNK) offsets.push(o);
-        for (let i = 0; i < offsets.length; i++) {
-            for (let k = i; k < Math.min(i + 4, offsets.length); k++) {
-                if (pending.has(k)) continue;
-                const p = fetchChunk(offsets[k]);
-                p.catch(() => { }); // awaited in order; no unhandled rejection after a failure
-                pending.set(k, p);
+    let offset = 0;
+    let total;
+    let validator;
+    for (;;) {
+        const chunk = await checkpoint(downloadStore, checkpointId, `byte:${offset}`, signal, async () => {
+            const headers = { Range: `bytes=${offset}-${offset + CHUNK - 1}` };
+            if (validator) headers['If-Range'] = validator;
+            const res = await session.downloader.fetchProgressiveRange(url, headers, signal);
+            const reportedTotal = validateExportRange(res, offset, CHUNK, total);
+            if ((offset > 0 && /^(?:text\/(?:html|xml)|application\/(?:json|xml))\b/i.test(res.headers['content-type'] || '')) ||
+                (offset === 0 && exportMediaType(res.data)?.offset !== 0)) {
+                throw new Error('The source returned a page or unsupported data instead of a media file.');
             }
-            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-            const res = await pending.get(i);
-            pending.delete(i);
-            post({ type: 'EXPORT_CHUNK', fileIndex: 0, data: S.packBinary(res.data) });
-            offset += res.data.byteLength;
-            post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total, bytes: offset });
+            const etag = res.headers.etag;
+            const identity = etag && !etag.startsWith('W/') ? etag : res.headers['last-modified'];
+            if (validator && validator !== identity) throw new Error('The source file changed during export.');
+            return { data: res.data, offset, total: reportedTotal, validator: identity };
+        });
+        if (offset === 0) {
+            const media = exportMediaType(chunk.data);
+            if (media?.offset !== 0) throw new Error('The cached response does not contain media. Delete that download and try again.');
+            const ext = {
+                'video/webm': /\.mkv$/i.test(new URL(url).pathname) ? 'mkv' : 'webm',
+                'video/mp4': /\.mov$/i.test(new URL(url).pathname) ? 'mov' : 'mp4',
+                'video/mp2t': 'ts', 'audio/aac': 'aac', 'video/ogg': 'ogv', 'video/x-msvideo': 'avi'
+            }[media.mime];
+            post({ type: 'EXPORT_BEGIN', fileIndex: 0, fileCount: 1, filename: `${name}.${ext}`, mime: media.mime });
         }
-    } else {
-        // Content-Range not readable: sequential until a short chunk.
-        for (;;) {
-            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-            const res = await fetchChunk(offset);
-            post({ type: 'EXPORT_CHUNK', fileIndex: 0, data: S.packBinary(res.data) });
-            offset += res.data.byteLength;
-            post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total: offset, bytes: offset });
-            if (res.status === 200 || res.data.byteLength < CHUNK) break;
-        }
+        total = chunk.total;
+        validator ||= chunk.validator;
+        await sendExportChunk(session, post, { fileIndex: 0, data: S.packBinary(chunk.data) }, signal);
+        offset += chunk.data.byteLength;
+        post({ type: 'EXPORT_PROGRESS', fileIndex: 0, fileCount: 1, done: offset, total, bytes: offset });
+        if (offset >= total) break;
     }
     post({ type: 'EXPORT_FILE_DONE', fileIndex: 0 });
 }
@@ -1695,7 +1758,74 @@ async function exportProgressive(session, post, signal, name) {
 // ----------------------------------------------------------------------------
 // Player port
 // ----------------------------------------------------------------------------
+function connectVaultExport(port) {
+    let disconnected = false;
+    let session;
+    port.onDisconnect.addListener(() => {
+        disconnected = true;
+        session?.exportJob?.controller.abort();
+    });
+    port.onMessage.addListener(msg => {
+        if (msg?.type === 'EXPORT_CANCEL') session?.exportJob?.controller.abort();
+        else if (msg?.type === 'EXPORT_ACK') acknowledgeExport(session, msg);
+        else if (msg?.type === 'EXPORT_RESUME' && !session && typeof msg.id === 'string') {
+            session = { post: message => { if (!disconnected) port.postMessage(message); } };
+            prepare(msg.id).catch(err => session.post({ type: 'EXPORT_ERROR', error: err.message }));
+        }
+    });
+
+    async function prepare(id) {
+        const job = await downloadStore.get(id);
+        if (disconnected) return;
+        if (!job) throw new Error('This download was removed.');
+        const live = [...sessions.values()].find(s => s.tabId === job.tabId && s.stream.id === job.stream.id && s.stream.url === job.stream.url);
+        const tab = live ? null : await getTab(job.tabId, { create: false });
+        if (disconnected) return;
+        const originalTab = tab?.streams.get(job.stream.id)?.url === job.stream.url;
+        session.stream = job.stream;
+        session.downloader = live?.downloader || new SegmentDownloader({
+            transport: originalTab ? makeTransport(job.tabId, () => job.stream) :
+                (url, opts) => networkBudget.run(url, opts.signal, () => directFetch(url, opts, job.stream.frameUrl || '')),
+            buffer: originalTab && job.cacheSessionId ? new BufferManager(job.tabId, job.cacheSessionId) : { getSegment: async () => null },
+            abr: new ABRController(),
+            getSettings: () => settings
+        });
+        try { await runExport(session, {}, job); }
+        finally { if (!live) session.downloader.destroy(); }
+    }
+}
+
+function acknowledgeExport(session, msg) {
+    const job = session?.exportJob;
+    if (job?.id === msg.jobId && job.ack?.sequence === msg.sequence) job.ack.resolve();
+}
+
+function sendExportChunk(session, post, message, signal) {
+    return new Promise((resolve, reject) => {
+        const job = session.exportJob;
+        const abort = () => finish(new DOMException('Aborted', 'AbortError'));
+        const finish = error => {
+            clearTimeout(timeout);
+            signal.removeEventListener('abort', abort);
+            job.ack = null;
+            if (error) reject(error);
+            else resolve();
+        };
+        const timeout = setTimeout(() => finish(new Error('The export output stopped responding. Resume from the library.')), 30000);
+        const sequence = job.sequence = (job.sequence || 0) + 1;
+        job.ack = { sequence, resolve: () => finish() };
+        if (signal.aborted) { abort(); return; }
+        signal.addEventListener('abort', abort, { once: true });
+        try { post({ type: 'EXPORT_CHUNK', ...message, sequence }); }
+        catch (error) { finish(error); }
+    });
+}
+
 api.runtime.onConnect.addListener((port) => {
+    if (port.name === 'velostream-vault' && port.sender?.url?.startsWith(api.runtime.getURL('player/player.html?mode=offline&'))) {
+        connectVaultExport(port);
+        return;
+    }
     if (port.name !== 'velostream-player' || !port.sender?.url?.startsWith(api.runtime.getURL('player/player.html?'))) return;
     const tabId = port.sender && port.sender.tab ? port.sender.tab.id : -1;
     let session = null;
@@ -1739,8 +1869,10 @@ api.runtime.onConnect.addListener((port) => {
                     port.postMessage({ type: 'FATAL', error: 'Stream session not found. Re-open the player from the popup.' });
                     return;
                 }
-                session = new Session({ id: msg.sessionId, tabId, stream });
+                session = new Session({ id: msg.sessionId, tabId, stream, privateTab: !!port.sender.tab?.incognito });
                 sessions.set(session.id, session);
+                distributeCache();
+                checkStorage();
                 tab.playerSessionId = session.id;
                 persistTab(tabId);
                 // Worker restart: re-teach the downloader the playlists Shaka already holds.
@@ -1760,7 +1892,7 @@ api.runtime.onConnect.addListener((port) => {
             session.port = port;
             // Direct media files are loaded by the player page's <video>: give those requests
             // the site's Referer/Origin so hot-link protection accepts them.
-            if (session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
+            if (!session.privateTab && session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
             const pageUrl = await api.tabs.get(tabId).then(t => (t && t.url) || '', () => '');
             if (disconnected || session.closing || session.port !== port) return;
             tab.pageUrl ||= pageUrl;
@@ -1774,7 +1906,8 @@ api.runtime.onConnect.addListener((port) => {
 
         switch (msg.type) {
             case 'REQUEST':
-                handleRequest(session, msg);
+                if (!session.switching && !session.closing) handleRequest(session, msg);
+                else session.post({ type: 'RESPONSE', reqId: msg.reqId, ok: false, status: 0, error: 'Stream is switching' });
                 break;
             case 'ABORT': {
                 const c = session.requests.get(msg.reqId);
@@ -1782,7 +1915,9 @@ api.runtime.onConnect.addListener((port) => {
                 break;
             }
             case 'TELEMETRY': {
+                checkStorage();
                 session.telemetry = {
+                    hidden: !!msg.hidden,
                     currentTime: +msg.currentTime || 0,
                     bufferAhead: +msg.bufferAhead || 0,
                     paused: !!msg.paused,
@@ -1830,9 +1965,11 @@ api.runtime.onConnect.addListener((port) => {
                 break;
             case 'PURGE_CACHE': {
                 // Drop every cached segment of this stream and refill from the playhead.
-                session.downloader.reset();
+                const downloader = session.downloader;
+                downloader.reset();
                 await session.buffer.clearStream().catch(() => { });
-                session.downloader.seek(+msg.time || (session.telemetry && session.telemetry.currentTime) || 0);
+                if (session.downloader !== downloader || session.closing) break;
+                downloader.seek(+msg.time || (session.telemetry && session.telemetry.currentTime) || 0);
                 session.post({ type: 'PURGED', time: +msg.time || 0 });
                 break;
             }
@@ -1868,7 +2005,7 @@ api.runtime.onConnect.addListener((port) => {
                         session.post({ type: 'EXPORT_ERROR', error: 'This DASH stream cannot be saved.' });
                         break;
                     }
-                    runExport(session, { dash: parts });
+                    runExport(session, { dash: parts, clip: !!msg.clip, format: msg.format, title: msg.title });
                     break;
                 }
                 const clip = msg.clip && Number.isFinite(+msg.clip.start) && Number.isFinite(+msg.clip.end) && +msg.clip.end > +msg.clip.start
@@ -1877,7 +2014,7 @@ api.runtime.onConnect.addListener((port) => {
                     session.post({ type: 'EXPORT_ERROR', error: 'A–B clips can be saved from HLS streams only.' });
                     break;
                 }
-                runExport(session, clip ? { clip } : {});
+                runExport(session, { clip, format: msg.format, title: msg.title });
                 break;
             }
             case 'RECORD_START':
@@ -1893,13 +2030,17 @@ api.runtime.onConnect.addListener((port) => {
                 }
                 session.recording = null;
                 session.persistState({ soon: true });
-                runExport(session, { recording: rec });
+                runExport(session, { recording: rec, format: msg.format, title: msg.title });
                 break;
             }
+            case 'EXPORT_ACK':
+                acknowledgeExport(session, msg);
+                break;
             case 'EXPORT_CANCEL':
                 if (session.exportJob) session.exportJob.controller.abort();
                 break;
             case 'STORE_SET':
+                if (session.privateTab) break;
                 if (/^fs_bm_[\w-]{1,64}$/.test(msg.key || '') && Array.isArray(msg.value)) {
                     await writeStorage(() => api.storage.local.set({ [msg.key]: msg.value }));
                 }
@@ -1917,6 +2058,7 @@ api.runtime.onConnect.addListener((port) => {
         disconnected = true;
         if (!session || session.closing || session.port !== port) return;
         session.port = null;
+        session.exportJob?.controller.abort();
         // Give the bridge a moment to reconnect (navigation within bfcache, SW hiccup).
         session.disconnectTimer = setTimeout(() => {
             if (!session.port) endSession(session);
@@ -2174,6 +2316,18 @@ function respondAsync(promise, sendResponse) {
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.action !== 'string') return false;
+    if (message.action === 'VAULT_LIST' || message.action === 'VAULT_DELETE') {
+        if (sender.url?.split('#', 1)[0] !== api.runtime.getURL('popup/library.html')) return false;
+        if (message.action === 'VAULT_LIST') return respondAsync(downloadStore.listSummaries().then(jobs => ({
+            ok: true, jobs: jobs.map(job => ({ ...job, status: activeExports.has(job.id) ? 'running' : job.status }))
+        })), sendResponse);
+        if (typeof message.id !== 'string' || activeExports.has(message.id)) {
+            sendResponse({ ok: false, error: 'Pause the download before deleting it.' });
+            return false;
+        }
+        activeExports.add(message.id);
+        return respondAsync(downloadStore.remove(message.id).then(() => ({ ok: true })).finally(() => activeExports.delete(message.id)), sendResponse);
+    }
     const fromTab = sender.tab ? sender.tab.id : undefined;
 
     switch (message.action) {
@@ -2223,6 +2377,11 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return respondAsync(openLibraryResume(message), sendResponse);
         case 'HISTORY_SAVE':
             if (!sender.url?.startsWith(api.runtime.getURL('player/player.html'))) return false;
+            // Private tabs share extension storage with ordinary tabs in spanning mode.
+            if (sender.tab?.incognito || api.extension?.inIncognitoContext) {
+                sendResponse({ ok: true, persisted: false });
+                return false;
+            }
             return respondAsync(Promise.resolve().then(() => saveHistoryEntry(message)), sendResponse);
         case 'LIBRARY_WRITE':
             if (!sender.url?.startsWith(api.runtime.getURL('popup/library.html'))) return false;
@@ -2289,6 +2448,12 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'LAUNCH_FROM_PAGE':
             if (fromTab === undefined) return false;
             return respondAsync(launchFromPage(fromTab, sender.frameId ?? 0), sendResponse);
+        case 'OPEN_LOCAL_PLAYER':
+            if (sender.url !== api.runtime.getURL('popup/popup.html') || !Number.isInteger(message.tabId)) return false;
+            return respondAsync((async () => {
+                if (!await pingFrame(message.tabId, 0)) throw new Error('Open a website tab to use the Aethvyr overlay.');
+                return api.tabs.sendMessage(message.tabId, { action: 'MOUNT_LOCAL_PLAYER' }, { frameId: 0 });
+            })(), sendResponse);
         case 'LAUNCH_URL':
             return respondAsync(launchManualUrl(message.tabId, message.url, message.typeHint), sendResponse);
         case 'GET_BADGE_STATE':
@@ -2354,6 +2519,7 @@ async function teardownTab(tabId, { keepPlayer = false, removed = false } = {}) 
 }
 
 api.tabs.onRemoved.addListener((tabId) => {
+    tabPrivacy.delete(tabId);
     closedTabs.add(tabId);
     if (closedTabs.size > 256) closedTabs.delete(closedTabs.values().next().value);
     clearLibraryResume(tabId);

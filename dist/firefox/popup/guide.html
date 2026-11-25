@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en" class="lib-root">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aethvyr Feature Guide</title>
+    <link rel="stylesheet" href="../common/tokens.css">
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/library.css">
+</head>
+<body class="lib-page">
+    <a class="skip-link" href="#guide-start">Skip to the guide</a>
+    <main id="app" class="lib feature-guide" data-accent="blue">
+        <header class="app-header lib-header">
+            <img class="app-icon" src="../icons/icon-48.png" alt="" width="36" height="36">
+            <div class="lib-heading">
+                <h1>Aethvyr Feature Guide</h1>
+                <p class="muted lib-summary">Find the controls you need while you watch.</p>
+            </div>
+            <a class="btn small" href="library.html">Open Library</a>
+        </header>
+        <nav class="guide-links" aria-label="Guide sections">
+            <a href="#guide-start">Getting started</a>
+            <a href="#guide-watch">Playback and subtitles</a>
+            <a href="#guide-save">Downloads</a>
+            <a href="#guide-studio">Studio</a>
+            <a href="#guide-library">Library</a>
+        </nav>
+
+        <section class="card guide-start" id="guide-start">
+            <h2>Start watching</h2>
+            <ol>
+                <li><strong>On a website</strong> Start its video, then choose <strong>Play in Aethvyr</strong> or pick a stream in the toolbar popup.</li>
+                <li><strong>On your device</strong> Drop a file onto the overlay or choose <strong>Open Local File</strong> in the popup on a supported website tab.</li>
+                <li><strong>While watching</strong> Open <strong>Studio</strong> with the sliders button. Use <kbd>?</kbd> on a keyboard for the current shortcuts.</li>
+            </ol>
+        </section>
+
+        <div class="guide-grid">
+            <section class="card" id="guide-watch">
+                <h2>Playback and subtitles</h2>
+                <dl>
+                    <dt>Seek or find a chapter</dt>
+                    <dd>Drag the seekbar or hover for time and a preview when available. Open <strong>Studio → Tools → Chapters</strong> to jump to a chapter or load a WebVTT chapter file.</dd>
+                    <dt>Load subtitles</dt>
+                    <dd>Open <strong>Subtitles &amp; Audio</strong> with the captions button. Pick a track or load SRT, VTT, or ASS. Open the transcript to search and jump to a line.</dd>
+                    <dt>Loop or watch in a small window</dt>
+                    <dd>Use <strong>Studio → Tools</strong> for A–B loop, Mini player, and Picture in Picture where the browser supports it.</dd>
+                </dl>
+            </section>
+            <section class="card" id="guide-save">
+                <h2>Downloads and clips</h2>
+                <dl>
+                    <dt>Save a supported stream</dt>
+                    <dd>Open <strong>Studio → Tools → Download</strong>. Choose <strong>MP4</strong> or <strong>Original</strong> when the source offers a choice. The toolbar download button uses that choice.</dd>
+                    <dt>Save only a clip</dt>
+                    <dd>Play through the range, then set <strong>In</strong> and <strong>Out</strong> under <strong>Clip from buffer</strong>. HLS and DASH clips follow cached segment boundaries.</dd>
+                    <dt>Resume or re-export</dt>
+                    <dd>Open <a href="library.html#offline">Library → Offline / Cached</a>. Choose <strong>Resume</strong> for a paused job or <strong>Export</strong> for a finished cache. Re-export an older short-timeline MP4 here if the source is still cached.</dd>
+                </dl>
+            </section>
+            <section class="card" id="guide-studio">
+                <h2>Get more from Studio</h2>
+                <dl>
+                    <dt>Quality</dt>
+                    <dd>Select stream quality or let Auto adapt. Choose Eco, Balanced, Performance, or Custom for background prefetch.</dd>
+                    <dt>Audio and Display</dt>
+                    <dd>Balance volume with Smart loudness under <strong>Audio</strong>. Try <strong>Display → Graphics → Auto</strong> and use the comparison control to check the effect.</dd>
+                    <dt>Preferences and diagnostics</dt>
+                    <dd>Use <strong>Prefs → Player look</strong> to choose Minimal, Standard, or Pro controls. If playback fails, save a report under <strong>Tools → Save playback diagnostics</strong>.</dd>
+                </dl>
+            </section>
+            <section class="card" id="guide-library">
+                <h2>Organize in Library</h2>
+                <dl>
+                    <dt>Pick up where you left off</dt>
+                    <dd>Open <strong>Continue watching</strong>. Use favorites, bookmarks, or named collections to keep track of videos.</dd>
+                    <dt>Find a saved file</dt>
+                    <dd>Use <a href="library.html#local">Local files</a> for media remembered through supported file handles. Your original file stays on your device.</dd>
+                    <dt>Sync on your terms</dt>
+                    <dd>Enable account sync in popup Settings to share eligible positions and bookmarks between your browsers. Stream URLs stay local.</dd>
+                </dl>
+            </section>
+        </div>
+    </main>
+</body>
+</html>

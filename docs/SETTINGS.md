@@ -40,8 +40,8 @@ Other storage keys:
 | `look.hidden` | `[]` | Hidden buttons: `back`, `fwd`, `volume`, `speed`, `cc`, `pip`, `fs`, `lock`, `info`, `dl`, `audioOnly`, `mini`, `frameBack`, `frameFwd`, `loop`, `snapshot`, `eq`, `gpu` (unknown ids are dropped) |
 | `look.order` | `[]` | Order of the right-hand buttons (`speed`, `cc`, `studio`, `pip`, `fs`); missing ids follow in the default order |
 | `look.pillX`, `look.pillY` | `0.5`, `0.85` | Floating-pill centre as a fraction of the player (0–1); clamped on screen |
-| `syncEnabled` | `false` | Opt-in sync through the browser account. Not synced: `syncEnabled`, `settingsVersion`, `uiScale`, `maxWorkers`, `cacheSizeMB`, `maxBufferSec`, `mseBufferAhead`, `mseBufferBehind`, `rebufferingGoal`, `rangeAccel`, `dvrMinutes`, `maxRenderRes`, `shader`, `shaderStrength`, `qualityCap`, `memory.volume`, `memory.muted`, `memory.qualityHeight` (device-specific) |
-| `quickLaunchBadge` | `true` | On-page *Play in Velostream* pill |
+| `syncEnabled` | `false` | Opt-in sync through the browser account. Not synced: `syncEnabled`, `settingsVersion`, `uiScale`, `maxWorkers`, `resourceProfile`, `prefetchMbps`, `cacheSizeMB`, `pausedBufferMB`, `maxBufferSec`, `mseBufferAhead`, `mseBufferBehind`, `rebufferingGoal`, `rangeAccel`, `dvrMinutes`, `maxRenderRes`, `shader`, `shaderStrength`, `qualityCap`, `memory.volume`, `memory.muted`, `memory.qualityHeight` (device-specific) |
+| `quickLaunchBadge` | `true` | On-page *Play in Aethvyr* pill |
 
 ## Playback
 
@@ -65,10 +65,13 @@ Other storage keys:
 
 | Setting | Default | Range | Meaning |
 |---------|---------|-------|---------|
-| `maxBufferSec` | `86400` | 10–86400 | Seconds to download ahead; 86400 = the whole video |
-| `cacheSizeMB` | `2048` | 32–8192 | IndexedDB budget per tab |
+| `resourceProfile` | `balanced` | eco / balanced / max / custom | Background prefetch ceilings of 60 s / 2 workers, 180 s / 4 workers, and 900 s / 8 workers. Custom uses the limits below. All profiles share an eight-request background budget. |
+| `maxBufferSec` | `86400` | 10–86400 | User ceiling. Custom allows prefetch up to the whole video, subject to cache and scheduling limits. |
+| `prefetchMbps` | `0` | 0–1000 | Custom profile average speculative bandwidth in Mbit/s, divided among active sessions. Zero disables pacing. Playback requests can use the full connection. |
+| `pausedBufferMB` | `256` | 0–8192 | Disk prefetch budget while paused. Zero disables speculative prefetch while paused. |
+| `cacheSizeMB` | `2048` | 32–8192 | Shared session cache ceiling. Eco also caps the total at 128 MiB and Balanced at 512 MiB. Sessions split the available budget equally. |
 | `maxWorkers` | `6` | 2–8 | Parallel segment downloads |
-| `rangeAccel` | `true` | | Split large downloads into parallel range requests |
+| `rangeAccel` | `true` | | Split eligible on-demand segment requests into parallel ranges |
 | `dvrMinutes` | `30` | 0–180 | Live rewind window; `0` disables the DVR |
 
 ## Player buffer (Shaka MSE, in RAM)

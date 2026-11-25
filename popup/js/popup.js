@@ -226,7 +226,7 @@
     async function launch(stream, button) {
         button.disabled = true;
         showMessage('');
-        announce('Opening the Velostream player');
+        announce('Opening the Aethvyr player');
         const res = await send({ action: 'LAUNCH_PLAYER', tabId, streamId: stream.id });
         if (res && res.ok) {
             window.close();
@@ -463,7 +463,7 @@
         fillForm();
     }
 
-    /** Per-site auto-replace: detected videos on this site open in Velostream automatically. */
+    /** Per-site auto-replace: detected videos on this site open in Aethvyr automatically. */
     let siteHost = '';
 
     /** Keeps the per-site switch in step with settings changed elsewhere (reset, the player). */
@@ -503,7 +503,7 @@
     // Init
     // -------------------------------------------------------------------
     document.addEventListener('DOMContentLoaded', async () => {
-        $('version').textContent = `Velostream v${api.runtime.getManifest().version}`;
+        $('version').textContent = `Aethvyr v${api.runtime.getManifest().version}`;
         const [tab] = await api.tabs.query({ active: true, currentWindow: true }).catch(() => []);
         tabId = tab ? tab.id : null;
 
@@ -577,7 +577,7 @@
             const file = e.target.files && e.target.files[0];
             e.target.value = '';
             if (!file) return;
-            if (file.size > 5 * 1024 * 1024) { showMessage('That file is too large to be a Velostream backup.'); return; }
+            if (file.size > 5 * 1024 * 1024) { showMessage('That file is too large to be an Aethvyr backup.'); return; }
             try {
                 const res = await api.runtime.sendMessage({ action: 'BACKUP_RESTORE', json: await file.text() });
                 if (!res?.ok) throw new Error(res?.error || 'Could not restore backup.');
@@ -605,7 +605,7 @@
                 $('permission-banner').hidden = true;
                 showMessage('Access granted. Reload the page with the video.', true);
             } else {
-                showMessage('Access was not granted. Velostream cannot detect videos without it.');
+                showMessage('Access was not granted. Aethvyr cannot detect videos without it.');
             }
         });
         $('rescan-btn').addEventListener('click', async () => {
@@ -649,6 +649,16 @@
             renderHistory();
             announce('History cleared');
         });
+        $('open-local').addEventListener('click', async () => {
+            const button = $('open-local');
+            button.disabled = true;
+            const result = await send({ action: 'OPEN_LOCAL_PLAYER', tabId });
+            if (result?.ok) window.close();
+            else {
+                showMessage(result?.error || 'Open a website tab to use the Aethvyr overlay.');
+                button.disabled = false;
+            }
+        });
         $('open-library').addEventListener('click', () => {
             api.tabs.create({ url: api.runtime.getURL('popup/library.html') });
             window.close();
@@ -672,11 +682,11 @@
         $('sync-clear').addEventListener('click', async () => {
             // Another device with sync on would upload its copy again on its next change.
             const msg = settings.syncEnabled
-                ? 'Delete Velostream data from your browser account? Sync stays on here, so this device uploads its data again. Turn sync off on all devices first to remove it for good.'
-                : 'Delete Velostream data from your browser account? Devices that still have sync on will upload theirs again.';
+                ? 'Delete Aethvyr data from your browser account? Sync stays on here, so this device uploads its data again. Turn sync off on all devices first to remove it for good.'
+                : 'Delete Aethvyr data from your browser account? Devices that still have sync on will upload theirs again.';
             if (!window.confirm(msg)) return;
             const res = await api.runtime.sendMessage({ action: 'SYNC_CLEAR' }).catch(e => ({ ok: false, error: e && e.message }));
-            if (res && res.ok) { announce('Synced data deleted'); showMessage('Velostream data deleted from your browser account.', true); } else showMessage(`Could not delete: ${(res && res.error) || 'unknown error'}`);
+            if (res && res.ok) { announce('Synced data deleted'); showMessage('Aethvyr data deleted from your browser account.', true); } else showMessage(`Could not delete: ${(res && res.error) || 'unknown error'}`);
         });
         api.storage.onChanged.addListener((changes, area) => {
             if (area !== 'local') return;

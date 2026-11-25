@@ -5,6 +5,37 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## Unreleased
+
+- Added the Aethvyr toolbar mark, shared celestial palette, updated screenshots and playback demo.
+- Private player sessions now keep bookmarks, local-file records and segment caches in memory. Private exports skip durable checkpoints.
+
+- Streaming retries respect server cooldowns on HTTP 429 and 503, including parallel byte-range downloads.
+
+- Fixed private web-video watch positions appearing in regular history when the extension had private-window access.
+
+- Introduced the Aethvyr display name across the extension and its packages. Existing installs, backups, and account sync use their original identifiers.
+
+## [2.7.1] - 2026-11-25
+
+- Finalize MP4 exports with the complete duration and an audio/video seek index.
+- Use the player title for new stream download names when available.
+- Add a feature guide to the popup, Studio, and Library, with a quick tour in the README.
+
+## [2.7.0] - 2026-11-25
+
+- Added Eco, Balanced, Max and Custom streaming profiles with a shared background prefetch budget.
+- Added a local diagnostics report with playback timing, buffer history, frame counts and error codes.
+- Account sync now excludes stream URLs and rewrites older synced history when an updated device syncs.
+- Added live progress in Offline / Cached for downloads with known segment or byte totals.
+- Added CI, browser package artifacts, regression tests, and updated release and benchmarking documentation.
+
+## [2.6.0] - 2026-11-24
+
+- Added local playback in the Velostream overlay with playlists, sidecar subtitles, and Chromium file resume where supported.
+- Added resumable exports, Offline / Cached downloads, cached clip export, and a paused prefetch budget.
+- Reject non-media downloads, preserve the chosen export format, and improve seek previews and chapter navigation.
+
 ## [2.5.0] - 2026-11-20
 
 - Added separate Anime, Donghua, Cartoons and Other Videos shelves with website filtering and local category corrections.

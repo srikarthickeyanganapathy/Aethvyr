@@ -16,8 +16,11 @@
 
 import { parsePlaylist, segmentKey, segmentIndexForTime, serializeMedia, alignLiveTimeline } from './hls-parser.js';
 
+import { prefetchPolicy } from './resource-policy.js';
+
 const MAX_RETRIES = 4;
 const BASE_BACKOFF_MS = 400;
+const MAX_RETRY_WAIT_MS = 30000;
 const MIN_WORKERS = 2;
 const ACCEL_MIN_BYTES = 1.5 * 1024 * 1024;  // only split downloads expected to be this large
 const ACCEL_CHUNK_MIN = 512 * 1024;
@@ -163,6 +166,20 @@ export function sniffMedia(buf) {
     return null;
 }
 
+/** Container bytes are authoritative. Authentication pages and manifests can return HTTP 200. */
+export function exportMediaType(data, { webmFragment = false } = {}) {
+    const u = asBytes(data);
+    if (!u?.length) return null;
+    const four = (offset, name) => [...name].every((ch, i) => u[offset + i] === ch.charCodeAt(0));
+    if (u[0] === 0x1a && u[1] === 0x45 && u[2] === 0xdf && u[3] === 0xa3) return { mime: 'video/webm', offset: 0 };
+    if (webmFragment && u[0] === 0x1f && u[1] === 0x43 && u[2] === 0xb6 && u[3] === 0x75) return { mime: 'video/webm', offset: 0 };
+    if (four(0, 'OggS')) return { mime: 'video/ogg', offset: 0 };
+    if (four(0, 'RIFF') && four(8, 'AVI ')) return { mime: 'video/x-msvideo', offset: 0 };
+    const sniff = sniffMedia(data);
+    if (sniff && /^(?:video\/(?:mp4|mp2t)|audio\/aac)$/.test(sniff.mime)) return sniff;
+    return null;
+}
+
 /** Trim junk in front of a (plaintext) segment and report its real container. */
 export function normalizeSegment(data, mime) {
     const sniff = sniffMedia(data);
@@ -186,14 +203,24 @@ function concatBuffers(buffers) {
 
 function sleep(ms, signal) {
     return new Promise((resolve, reject) => {
-        const t = setTimeout(resolve, ms);
-        if (signal) {
-            signal.addEventListener('abort', () => {
-                clearTimeout(t);
-                reject(new DOMException('Aborted', 'AbortError'));
-            }, { once: true });
-        }
+        const abort = () => {
+            clearTimeout(timer);
+            reject(new DOMException('Aborted', 'AbortError'));
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', abort);
+            resolve();
+        }, ms);
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
     });
+}
+
+function matchesRange(response, start, end) {
+    const value = response.headers['content-range'];
+    const match = /^bytes (\d+)-(\d+)\/(?:\d+|\*)$/i.exec(value || '');
+    return response.status === 206 && response.data?.byteLength === end - start + 1 &&
+        (!value || (match && +match[1] === start && +match[2] === end));
 }
 
 function isRetryable(err) {
@@ -212,6 +239,17 @@ export class HttpError extends Error {
     }
 }
 
+/** Convert delay-seconds or an HTTP date into an absolute retry deadline. */
+export function retryAfterDeadline(header, now = Date.now()) {
+    if (typeof header !== 'string') return 0;
+    const value = header.trim();
+    if (/^\d+$/.test(value)) return Math.min(Number.MAX_SAFE_INTEGER, now + Number(value) * 1000);
+    // Date.parse also accepts non-HTTP inputs such as "-1" and "1.5".
+    if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*[, ]/i.test(value)) return 0;
+    const date = Date.parse(value);
+    return date > now ? date : 0;
+}
+
 export class SegmentDownloader {
     /**
      * @param {object} deps
@@ -221,11 +259,15 @@ export class SegmentDownloader {
      * @param {import('./abr-controller.js').ABRController} deps.abr
      * @param {() => {maxBufferSec:number, maxWorkers:number}} deps.getSettings
      */
-    constructor({ transport, buffer, abr, getSettings }) {
+    constructor({ transport, buffer, abr, getSettings, sessionCount = () => 1, takePrefetchSlot = () => () => {}, prioritizeSeek = () => () => {} }) {
         this.transport = transport;
+        this.originCooldowns = new Map();
         this.buffer = buffer;
         this.abr = abr;
         this.getSettings = getSettings;
+        this.sessionCount = sessionCount;
+        this.takePrefetchSlot = takePrefetchSlot;
+        this.prioritizeSeek = prioritizeSeek;
 
         this.playlists = new Map();     // playlistUrl -> {url, parsed, role, cursor, lastUsed}
         this.segmentIndex = new Map();  // segmentKey -> {playlistUrl, index}
@@ -235,6 +277,9 @@ export class SegmentDownloader {
         this.inflight = new Map();      // segmentKey -> {promise, controller, prefetch, playlistUrl, index}
         this.queue = [];                // pending prefetch tasks (ordered)
         this.concurrency = 3;
+        this.lastPrefetchStart = 0;
+        this.lastPrefetchBytes = 0;
+        this.bandwidthTimer = null;
         this.activePrefetch = 0;
         this.activeOnDemand = 0;
         this.paused = false;
@@ -260,7 +305,7 @@ export class SegmentDownloader {
         this.playback = { currentTime: 0, bufferAhead: 0, paused: true, updatedAt: 0 };
         this.stats = {
             bytesDownloaded: 0, segmentsDownloaded: 0, cacheHits: 0, cacheMisses: 0,
-            errors: 0, lastLatencyMs: 0
+            errors: 0, lastLatencyMs: 0, retries: 0, failedAttempts: 0
         };
         this._pumpScheduled = false;
     }
@@ -628,7 +673,14 @@ export class SegmentDownloader {
             if (sniff) outHeaders['content-type'] = sniff.mime;
             return { ...res, status: res.status === 206 ? 200 : res.status, headers: outHeaders, data: new ArrayBuffer(0) };
         }
-        const res = await this._load(req);
+        const priority = this.seekPriority;
+        const target = priority?.keys.has(key);
+        let res;
+        try {
+            res = await this._load(req);
+        } finally {
+            if (target && priority === this.seekPriority) this.endSeekPriority();
+        }
         if ((req.kind === 'segment' || req.kind === 'other') && res.data && res.data.byteLength && res.status < 400 &&
             !this.isEncrypted(key)) {
             const sniff = sniffMedia(res.data);
@@ -701,6 +753,10 @@ export class SegmentDownloader {
                     if (zeroCopy) return cachedReply();
                 }
             }
+            if (kind === 'key' && method === 'GET' && res.data?.byteLength === 16 &&
+                generation === this.generation && !this.destroyed) {
+                await this.buffer.storeSegment('key:' + url, res.data).catch(() => {});
+            }
             if ((kind === 'manifest') && res.data && res.status < 400) {
                 try {
                     const text = new TextDecoder().decode(res.data);
@@ -731,8 +787,7 @@ export class SegmentDownloader {
     }
 
     _windowSeconds() {
-        const s = this.getSettings();
-        return Math.max(10, s.maxBufferSec || 90);
+        return prefetchPolicy(this.getSettings(), 1, this.playback.hidden).windowSeconds;
     }
 
     /**
@@ -740,7 +795,7 @@ export class SegmentDownloader {
      * (parallelism hides per-request latency), fewer when the buffer is healthy (battery).
      */
     adjustConcurrency() {
-        const maxWorkers = Math.min(8, Math.max(MIN_WORKERS, this.getSettings().maxWorkers || 6));
+        const maxWorkers = prefetchPolicy(this.getSettings(), this.sessionCount(), this.playback.hidden).workers;
         const ahead = this.playback.bufferAhead + this.cachedAheadSeconds();
         const latency = this.stats.lastLatencyMs;
         // Whole-video pre-buffering: keep every worker busy until the target is nearly reached,
@@ -749,7 +804,7 @@ export class SegmentDownloader {
         if (ahead >= this._prefetchWindow() * 0.95) target = MIN_WORKERS;
         else if (ahead < 30 || latency > 250) target = maxWorkers;
         else target = Math.max(MIN_WORKERS, maxWorkers - 1);
-        this.concurrency = target;
+        this.concurrency = Math.min(target, maxWorkers);
     }
 
     /** Seconds of contiguous cached/in-flight media after the cursor of the main playlist. */
@@ -870,40 +925,66 @@ export class SegmentDownloader {
         while (this.failures.size > FAIL_TRACK_MAX) this.failures.delete(this.failures.keys().next().value);
     }
 
+    _pausedCacheLimit() {
+        return this.playback.paused ? Math.min(this.buffer.capBytes, this.getSettings().pausedBufferMB * 1024 * 1024) : undefined;
+    }
+
     _pump() {
         if (this.paused || this.destroyed) return;
         // Wait for the cache key set (re-pumps when ready) or we would refetch cached segments.
         if (!this._bufferReady) { this._bufferInitPromise(); return; }
+        const limit = this._pausedCacheLimit();
+        if (limit != null && this.buffer.currentSize + this.buffer.reserved >= limit) return;
+        if (this.buffer.capBytes === 0) return;
+        const settings = this.getSettings();
+        const paced = settings.resourceProfile === 'custom' && settings.prefetchMbps > 0;
+        if (paced) {
+            if (this.activePrefetch) return;
+            // Spread completed segment bytes across time. Demand requests bypass this timer.
+            const interval = this.lastPrefetchBytes * 8 * Math.max(1, this.sessionCount()) / (settings.prefetchMbps * 1000);
+            const wait = this.lastPrefetchStart + interval - Date.now();
+            if (wait > 0) {
+                clearTimeout(this.bandwidthTimer);
+                this.bandwidthTimer = setTimeout(() => this.schedulePump(), Math.min(wait, 60000));
+                return;
+            }
+        }
         this.queue = this._buildQueue();
-        const slots = Math.max(0, this.concurrency - this.activePrefetch - this.activeOnDemand);
-        for (let i = 0; i < slots && this.queue.length; i++) {
-            this._startPrefetch(this.queue.shift());
+        const workers = Math.min(this.concurrency, prefetchPolicy(this.getSettings(), this.sessionCount(), this.playback.hidden).workers);
+        const slots = Math.max(0, workers - this.activePrefetch - this.activeOnDemand);
+        for (let i = 0; i < (paced ? Math.min(1, slots) : slots) && this.queue.length; i++) {
+            const release = this.takePrefetchSlot();
+            if (!release) break;
+            this._startPrefetch(this.queue.shift(), release);
         }
     }
 
-    _startPrefetch(task) {
+    _startPrefetch(task, release) {
         const controller = new AbortController();
         const entry = { controller, prefetch: true, playlistUrl: task.playlistUrl, index: task.index, promise: null };
         const generation = this.generation;
+        const started = Date.now();
         this.activePrefetch++;
         entry.promise = (async () => {
             try {
                 const headers = task.range ? { Range: task.range } : {};
                 let res;
                 try {
-                    res = await this._fetchWithRetry(task.url, { method: 'GET', headers }, controller.signal, false, true);
+                    res = await this._fetchWithRetry(task.url, { method: 'GET', headers }, controller.signal, false, true, false);
                 } catch (err) {
                     // Recorded before `finally` re-pumps, or the pump would restart this key at once.
                     if (err && err.name !== 'AbortError' && !controller.signal.aborted &&
                         generation === this.generation) this._noteFailure(task.key);
                     throw err;
                 }
+                this.lastPrefetchStart = started;
+                this.lastPrefetchBytes = res.data?.byteLength || 0;
                 // Purged (reset) while downloading: never re-insert into the cleared cache.
                 if (res.data && res.data.byteLength && res.status < 400 &&
                     generation === this.generation && !this.destroyed) {
                     // Encrypted segments are cached byte-exact (sniffing ciphertext corrupts it).
                     const norm = this._normalize(task.key, res.data, res.headers['content-type']);
-                    const stored = await this.buffer.storeSegment(task.key, norm.data, norm.mime).catch(err => {
+                    const stored = await this.buffer.storeSegment(task.key, norm.data, norm.mime, this._pausedCacheLimit()).catch(err => {
                         console.warn('[Downloader] Cache store failed:', err && err.message);
                         return false;
                     });
@@ -913,6 +994,7 @@ export class SegmentDownloader {
                 return res;
             } finally {
                 this.activePrefetch--;
+                release();
                 // An aborted task may already have been replaced by a new one for the same key.
                 if (this.inflight.get(task.key) === entry) this.inflight.delete(task.key);
                 this.schedulePump();
@@ -942,7 +1024,7 @@ export class SegmentDownloader {
     /** One Range request; adds its own duration to timing.connMs (connection-time for ABR). */
     async _timedRange(url, o, e, signal, timing) {
         const t0 = Date.now();
-        const r = await this.transport(url, { method: 'GET', headers: { Range: `bytes=${o}-${e}` }, signal });
+        const r = await this._request(url, { method: 'GET', headers: { Range: `bytes=${o}-${e}` }, signal });
         timing.connMs += Date.now() - t0;
         return r;
     }
@@ -953,7 +1035,7 @@ export class SegmentDownloader {
         for (let o = start; o <= end; o += size) {
             const e = Math.min(end, o + size - 1);
             jobs.push(this._timedRange(url, o, e, signal, timing).then(r => {
-                if (r.status !== 206 || !r.data || r.data.byteLength !== e - o + 1) {
+                if (!matchesRange(r, o, e)) {
                     const err = new Error(`Range ${o}-${e} failed (HTTP ${r.status})`);
                     err.status = r.status;
                     // 200 = Range ignored, 206 with the wrong length = Range mis-honoured,
@@ -1006,6 +1088,7 @@ export class SegmentDownloader {
         } catch (err) {
             ctl.abort();
             if (signal && signal.aborted) throw err && err.name === 'AbortError' ? err : new DOMException('Aborted', 'AbortError');
+            if (err?.retryAt || err?.status === 429) throw err;
             if (err && (err.rangeUnsupported || RANGE_REJECT_STATUS.has(err.status))) {
                 this.noRangeHosts.add(host);
                 this.rangeStrikes.delete(host);
@@ -1016,7 +1099,7 @@ export class SegmentDownloader {
             }
             // This download only: one plain request (its errors go to _fetchWithRetry's retries).
             const t0 = Date.now();
-            const res = await this.transport(url, { method: 'GET', headers, signal });
+            const res = await this._request(url, { method: 'GET', headers, signal });
             this._abrMs.set(res, Math.max(1, Date.now() - t0));
             return res;
         } finally {
@@ -1074,15 +1157,42 @@ export class SegmentDownloader {
         return { status: 200, headers: outHeaders, url: first.url, data: concatBuffers(buffers) };
     }
 
-    async _fetchWithRetry(url, { method, headers }, signal, onDemand, isSegment = false) {
+    async _request(url, options) {
+        if (this.originCooldowns.size) {
+            const origin = new URL(url).origin;
+            const cooldown = this.originCooldowns.get(origin);
+            if (cooldown?.retryAt > Date.now()) throw Object.assign(new HttpError(cooldown.status, url), cooldown);
+            if (cooldown) this.originCooldowns.delete(origin);
+        }
+        const response = await this.transport(url, options);
+        if (response.status === 429 || response.status === 503) {
+            const retryAt = retryAfterDeadline(response.headers?.['retry-after']);
+            if (retryAt > Date.now()) {
+                const origin = new URL(url).origin;
+                const previous = this.originCooldowns.get(origin);
+                if (!previous || retryAt > previous.retryAt) {
+                    if (!previous && this.originCooldowns.size >= 64) {
+                        this.originCooldowns.delete(this.originCooldowns.keys().next().value);
+                    }
+                    this.originCooldowns.set(origin, { status: response.status, retryAt });
+                }
+            }
+            if (retryAt || response.status === 429) {
+                throw Object.assign(new HttpError(response.status, url), { retryAt });
+            }
+        }
+        return response;
+    }
+
+    async _fetchWithRetry(url, { method, headers }, signal, onDemand, isSegment = false, allowAcceleration = true) {
         let attempt = 0;
         for (;;) {
             if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
             const started = Date.now();
             try {
-                const res = this._canAccelerate(url, method, headers, isSegment)
+                const res = allowAcceleration && this._canAccelerate(url, method, headers, isSegment)
                     ? await this._accelFetch(url, headers, signal)
-                    : await this.transport(url, { method, headers, signal });
+                    : await this._request(url, { method, headers, signal });
                 if (res.status >= 400) throw new HttpError(res.status, url);
                 const elapsed = Date.now() - started;
                 const bytes = res.data ? res.data.byteLength : 0;
@@ -1096,12 +1206,17 @@ export class SegmentDownloader {
                 this.abr.reportSegmentDownload(bytes, abrMs > 0 ? abrMs : elapsed);
                 return res;
             } catch (err) {
+                if (err?.name !== 'AbortError') this.stats.failedAttempts++;
                 attempt++;
                 if (!isRetryable(err) || attempt > MAX_RETRIES || this.destroyed) throw err;
                 // Exponential backoff with jitter; on-demand loads retry faster.
                 const base = onDemand ? BASE_BACKOFF_MS / 2 : BASE_BACKOFF_MS;
                 const delay = base * Math.pow(2, attempt - 1) * (0.75 + Math.random() * 0.5);
-                await sleep(delay, signal);
+                const waitMs = Math.max(delay, (err?.retryAt || 0) - Date.now());
+                // Release the worker for long cooldowns. Later calls consult the same deadline.
+                if (waitMs > MAX_RETRY_WAIT_MS) throw err;
+                await sleep(waitMs, signal);
+                this.stats.retries++;
             }
         }
     }
@@ -1121,6 +1236,8 @@ export class SegmentDownloader {
      * @param {number} time player (presentation) time, i.e. video.currentTime
      */
     seek(time) {
+        this.endSeekPriority();
+        const keys = new Set();
         time = Number(time);
         if (!Number.isFinite(time)) time = 0;
         this._seekAt = Date.now();
@@ -1129,16 +1246,24 @@ export class SegmentDownloader {
             const segs = p.parsed.segments;
             if (!segs.length) continue;
             const target = segmentIndexForTime(segs, time, this.timelineOffset(p));
+            const key = segmentKey(segs[target].uri, segs[target].range);
+            if (!this.buffer.has(key)) keys.add(key);
             const endTime = segs[target].start + windowSec;
             // segs[t.index] can be missing when a live refresh shrank the window meanwhile.
             this._abortWhere(t => t.playlistUrl === p.url && (t.index < target || !segs[t.index] || segs[t.index].start > endTime));
             p.cursor = Math.max(-1, target - 1);
             p.lastUsed = Date.now();
         }
+        if (keys.size) this.seekPriority = { keys, finish: this.prioritizeSeek() };
         this.queue = [];
         this.playback.bufferAhead = 0;
         this.concurrency = Math.min(8, Math.max(MIN_WORKERS, this.getSettings().maxWorkers || 6));
         this.schedulePump();
+    }
+
+    endSeekPriority() {
+        this.seekPriority?.finish();
+        this.seekPriority = null;
     }
 
     pause() {
@@ -1152,6 +1277,7 @@ export class SegmentDownloader {
 
     /** Abort everything and forget the queue (stream switch / close). */
     reset() {
+        this.endSeekPriority();
         // Downloads still finishing (prefetch or on-demand) belong to the old generation and will
         // not write into a cache that is about to be cleared (PURGE_CACHE: reset + clearStream).
         this.generation++;
@@ -1161,6 +1287,7 @@ export class SegmentDownloader {
     }
 
     destroy() {
+        clearTimeout(this.bandwidthTimer);
         this.destroyed = true;
         clearTimeout(this._retryTimer);
         this._retryTimer = null;
@@ -1202,19 +1329,59 @@ export class SegmentDownloader {
      *  - without it, the ciphertext is returned byte-exact and the caller must decrypt and then
      *    call stripMediaPrefix(plaintext) itself.
      */
+    async fetchExportKey(url, signal, cacheOnly) {
+        const cached = await this.buffer.getSegment('key:' + url, { markServed: false }).catch(() => null);
+        if (cached?.data?.byteLength === 16) return cached.data;
+        if (cacheOnly) throw new Error('The encryption key for this clip is no longer cached.');
+        const res = await this._fetchWithRetry(url, { method: 'GET', headers: {} }, signal, false);
+        if (res.data.byteLength !== 16) throw new Error('Could not load AES-128 key.');
+        return res.data;
+    }
+
+    fetchProgressiveRange(url, headers, signal) {
+        return this._fetchWithRetry(url, { method: 'GET', headers }, signal, false);
+    }
+
+    async exportPrefetch(key, signal) {
+        const request = this.inflight.get(key);
+        if (!request?.prefetch) return null;
+        signal.throwIfAborted();
+        let abort;
+        const aborted = new Promise((_, reject) => {
+            abort = () => reject(signal.reason);
+            signal.addEventListener('abort', abort, { once: true });
+        });
+        try {
+            return await Promise.race([request.promise.catch(() => null), aborted]);
+        } finally {
+            signal.removeEventListener('abort', abort);
+        }
+    }
+
     async fetchForExport(seg, signal, opts = {}) {
         const key = segmentKey(seg.uri, seg.range);
         const encrypted = isEncryptedSegment(seg);
         let cached = await this.buffer.getSegment(key, { markServed: false }).catch(() => null);
         // A copy an older build trimmed (sniffed ciphertext): AES-CBC needs whole 16-byte blocks.
         if (cached && encrypted && seg.key.method === 'AES-128' && (!cached.data || cached.data.byteLength % 16 !== 0)) cached = null;
-        let data = cached ? cached.data
-            : (await this._fetchWithRetry(seg.uri, { method: 'GET', headers: seg.range ? { Range: seg.range } : {} }, signal, false, true)).data;
+        if (!cached && opts.cacheOnly) throw new Error("Part of this clip is no longer cached. Play through the range and try again.");
+        let data = cached?.data;
+        if (!data) {
+            const prefetched = await this.exportPrefetch(key, signal);
+            const response = prefetched || await this._fetchWithRetry(seg.uri, {
+                method: 'GET', headers: seg.range ? { Range: seg.range } : {}
+            }, signal, false, true);
+            const range = /^bytes=(\d+)-(\d+)$/.exec(seg.range || '');
+            if (range && !matchesRange(response, +range[1], +range[2])) {
+                throw new Error(`The source returned the wrong segment byte range (${seg.range}).`);
+            }
+            data = response.data;
+        }
         if (encrypted) {
             if (typeof opts.decrypt !== 'function') return data;
             data = await opts.decrypt(data, seg);
         }
         // Exported files must not contain the fake image headers some CDNs prepend.
-        return stripMediaPrefix(data);
+        return opts.keepOriginal ? data : stripMediaPrefix(data);
     }
 }

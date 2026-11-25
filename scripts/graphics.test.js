@@ -6,6 +6,29 @@ import '../common/shared.js';
 
 const S = globalThis.VelostreamShared;
 
+test('sustained render overload steps down while one spike and missing GPU timers are tolerated', () => {
+    const source = readFileSync(new URL('../player/shader-pipeline.js', import.meta.url), 'utf8');
+    let now = 0;
+    const context = { window: {}, performance: { now: () => now } };
+    vm.runInNewContext(source, context);
+    const canvas = { hidden: false };
+    const pipeline = new context.window.VelostreamShaders.VideoShaderPipeline({}, canvas);
+    pipeline.preset = 'cas';
+    pipeline.configure = ({ preset }) => { pipeline.preset = preset; };
+    pipeline.resetGuard(false);
+    now = 3100;
+    pipeline.watch(20);
+    assert.equal(pipeline.preset, 'cas');
+    now += 3100;
+    pipeline.watch(20);
+    assert.equal(pipeline.preset, 'off');
+    assert.equal(pipeline.lastTiming.gpuMs, null);
+    assert.equal(pipeline.lastTiming.cpuSubmitMs, 20);
+    pipeline.onContextLost({ preventDefault() {} });
+    assert.equal(canvas.hidden, true);
+    assert.equal(pipeline.active, false);
+});
+
 test('retired graphics choices migrate without enabling a new effect', () => {
     assert.equal(S.mergeSettings({ shader: 'fsr' }).shader, 'cas');
     assert.equal(S.mergeSettings({ shader: 'deband' }).shader, 'off');

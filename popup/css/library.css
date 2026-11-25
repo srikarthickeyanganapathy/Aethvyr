@@ -195,3 +195,29 @@ body.hc .lib-dialog { border: 2px solid #fff; }
 .vcard .card-corrections > summary { font-size: 12px; color: var(--text-secondary); }
 .lib-toolbar .lib-sort { min-width: 0; }
 .lib-toolbar .lib-sort select { width: 100%; max-width: 16rem; text-overflow: ellipsis; }
+
+.lib-toolbar[hidden] { display: none; }
+.lib-device-list { display: grid; gap: 8px; list-style: none; margin: 12px 0 0; padding: 0; }
+.lib-device-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.lib-device-details { flex: 1 1 180px; min-width: 0; }
+.lib-device-details p { margin: 4px 0 0; }
+.lib-device-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.lib-device-actions .btn { min-height: 44px; }
+
+#local-overlay { position: fixed; inset: 0; width: 100%; height: 100%; max-width: none; max-height: none; margin: 0; padding: 0; border: 0; background: #000; }
+#local-overlay iframe { display: block; width: 100%; height: 100%; border: 0; }
+
+.lib-device-details progress { display: block; width: min(100%, 280px); margin-top: 6px; accent-color: var(--accent); }
+
+.feature-guide :is(h2, dd, dl, ol) { margin: 0; }
+.feature-guide h2 { font-size: calc(var(--u) * 17); }
+.feature-guide :is(dl, ol) { margin-top: 12px; }
+.feature-guide ol { padding-inline-start: 24px; }
+.feature-guide li + li { margin-top: 8px; }
+.feature-guide dt { font-weight: 700; margin-top: 12px; }
+.feature-guide dd { color: var(--text-2); margin-top: 4px; }
+.feature-guide a:not(.btn) { color: var(--accent); text-underline-offset: 3px; }
+.feature-guide section { scroll-margin-top: 16px; }
+.guide-links { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.guide-links a { padding-block: 10px; }
+.guide-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); gap: 16px; }
