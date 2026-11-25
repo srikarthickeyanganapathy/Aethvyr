@@ -28,7 +28,7 @@ jobs:
         run: |
           expected="v$(node -p 'require("./package.json").version')"
           test "$GITHUB_REF_NAME" = "$expected" || { echo "Expected tag $expected"; exit 1; }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aethvyr-browser-packages
           path: dist/aethvyr-*.zip
