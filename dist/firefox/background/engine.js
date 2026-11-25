@@ -17,6 +17,7 @@ import '../common/shared.js';
 import { BufferManager, sweepOrphans } from './buffer-manager.js';
 import { SegmentDownloader, exportMediaType } from './downloader.js';
 import { checkpoint, downloadStore, validateExportRange } from './download-store.js';
+import { PrefetchBudget } from './resource-policy.js';
 import { ABRController } from './abr-controller.js';
 import { parsePlaylist, ivForSegment, decryptAes128 } from './hls-parser.js';
 import { initSync } from './sync.js';
@@ -68,6 +69,9 @@ const tabs = new Map();
 const closedTabs = new Set();
 const activeExports = new Set();
 const sessions = new Map(); // sessionId -> Session
+const prefetchBudget = new PrefetchBudget(8, () => {
+    for (const session of sessions.values()) session.downloader.schedulePump();
+});
 const persistTimers = new Map();
 const tabClears = new Map();
 const resumeRequests = new Map();
@@ -1167,7 +1171,9 @@ class Session {
             transport: makeTransport(this.tabId, () => this.stream),
             buffer: this.buffer,
             abr: this.abr,
-            getSettings: () => settings
+            getSettings: () => settings,
+            sessionCount: () => [...sessions.values()].filter(session => session.port && !session.downloader.paused).length,
+            takePrefetchSlot: () => prefetchBudget.take()
         });
         // Observe every playlist the downloader learns (player manifest loads go through
         // downloader.load -> ingestPlaylist) so it can be re-taught after a worker restart.
@@ -1530,7 +1536,7 @@ async function runExport(session, opts = {}, saved = null) {
         const progressive = session.stream.type === 'progressive';
         const parts = saved?.parts || exportParts(session, opts, base);
         if (!job && !opts.clip) {
-            job = { id: jobId, stream: session.stream, tabId: session.tabId, base, parts, format,
+            job = { id: jobId, stream: session.stream, tabId: session.tabId, cacheSessionId: session.id, base, parts, format,
                 totalSegments: parts.reduce((count, part) => count + part.segs.length, 0),
                 qualityUrl: parts[0]?.url || session.stream.url,
                 bytes: 0, completedCount: 0, byteOffset: 0, status: 'paused' };
@@ -1745,7 +1751,7 @@ function connectVaultExport(port) {
         session.downloader = live?.downloader || new SegmentDownloader({
             transport: originalTab ? makeTransport(job.tabId, () => job.stream) :
                 (url, opts) => directFetch(url, opts, job.stream.frameUrl || ''),
-            buffer: originalTab ? new BufferManager(job.tabId, job.stream.id) : { getSegment: async () => null },
+            buffer: originalTab && job.cacheSessionId ? new BufferManager(job.tabId, job.cacheSessionId) : { getSegment: async () => null },
             abr: new ABRController(),
             getSettings: () => settings
         });
@@ -2272,11 +2278,8 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message.action !== 'string') return false;
     if (message.action === 'VAULT_LIST' || message.action === 'VAULT_DELETE') {
         if (sender.url?.split('#', 1)[0] !== api.runtime.getURL('popup/library.html')) return false;
-        if (message.action === 'VAULT_LIST') return respondAsync(downloadStore.list().then(jobs => ({
-            ok: true, jobs: jobs.map(job => ({
-                id: job.id, name: job.base, bytes: job.bytes, total: job.totalSegments,
-                completed: job.completedCount, status: activeExports.has(job.id) ? 'running' : job.status
-            }))
+        if (message.action === 'VAULT_LIST') return respondAsync(downloadStore.listSummaries().then(jobs => ({
+            ok: true, jobs: jobs.map(job => ({ ...job, status: activeExports.has(job.id) ? 'running' : job.status }))
         })), sendResponse);
         if (typeof message.id !== 'string' || activeExports.has(message.id)) {
             sendResponse({ ok: false, error: 'Pause the download before deleting it.' });

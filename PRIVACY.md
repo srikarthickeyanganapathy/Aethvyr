@@ -39,14 +39,23 @@ Velostream copy the following into the browser's extension sync storage (`storag
 
 - your settings, except device-specific ones (volume, interface size, buffer and cache sizes,
   GPU enhancement, quality cap and similar);
-- watch positions of your most recent videos: the video address, the page address and the title;
+- watch positions and titles of recent videos, plus a cleaned website page address when available;
 - bookmarks for those videos, and your library (favorites and collections).
 
 Your browser then syncs that storage through **your own browser account**: Google for Chrome and
 Edge sync, Mozilla for a Firefox account. Velostream runs no server and never receives this data.
-Video addresses are synced as they are, including any access tokens in them, because those are
-needed to play the video again. If your browser itself is not signed in to sync, the data stays on
-the device.
+Stream addresses stay on the device that played them. Sync strips page query strings and fragments
+and omits page URLs with URL credentials or paths that look like credentials. A valid YouTube
+video ID is kept for watch-page navigation. Direct links and some sites that identify videos
+through query strings may need to be reopened manually on another device.
+
+An updated device rewrites older synced history the next time it successfully syncs. Update your
+other devices to continue syncing. If sync is already off, use *Delete synced data* to clear older
+copies still stored in your account.
+
+Playback diagnostics are local and exported only when you choose *Save playback diagnostics*.
+The report contains supported numeric playback and browser data and excludes page URLs,
+stream URLs, titles, request headers, and raw error messages.
 
 Turning sync off stops uploading. To remove what was already uploaded, use *Delete synced data* in
 the popup (devices that still have sync on will upload their copy again).

@@ -826,12 +826,16 @@
             const size = `${((item.bytes || 0) / (1024 * 1024)).toFixed(1)} MB`;
             const status = local ? (item.time > 0 ? `Resume at ${fmtTime(item.time)}` : 'Ready to play')
                 : `${running ? 'In progress' : item.status === 'cached' ? 'Ready to export' : 'Paused'} · ${size}${segmentCount}`;
+            const expected = item.total || item.totalBytes;
+            const received = item.total ? item.completed : item.bytes;
+            const percent = expected ? Math.min(100, Math.round(100 * (received || 0) / expected)) : null;
+            const progress = local || percent == null ? '' : `<progress max="100" value="${percent}" aria-label="Cached progress for ${esc(item.name)}"></progress>`;
             const target = local ? 'mode=local&amp;file=' : 'mode=offline&amp;id=';
             const label = local ? (item.time > 0 ? 'Resume' : 'Play') : item.status === 'cached' ? 'Export' : 'Resume';
             return `<li class="card lib-device-row">
-                <div class="lib-device-details"><h3 class="vc-title">${esc(item.name)}</h3><p class="muted num">${esc(status)}</p></div>
+                <div class="lib-device-details"><h3 class="vc-title">${esc(item.name)}</h3><p class="muted num">${esc(status)}${percent == null || local ? '' : ` · ${percent}%`}</p>${progress}</div>
                 ${running ? '' : `<div class="lib-device-actions">
-                    <a class="btn btn-primary small" aria-label="${label} ${esc(item.name)}" href="../player/player.html?${target}${encodeURIComponent(item.id)}">${label}</a>
+                    <a class="btn btn-primary small" data-device-open="${esc(item.id)}" aria-label="${label} ${esc(item.name)}" href="../player/player.html?${target}${encodeURIComponent(item.id)}">${label}</a>
                     <button type="button" class="btn btn-quiet small lib-danger-text" data-device-remove="${esc(item.id)}" aria-label="${local ? 'Remove' : 'Delete'} ${esc(item.name)}">${local ? 'Remove' : 'Delete'}</button>
                 </div>`}
             </li>`;
@@ -839,9 +843,16 @@
         const content = openFile + (rows ? `<ul class="lib-device-list">${rows}</ul>` : emptyMarkup(deviceStatus || VIEWS[view].empty));
         if (lastMarkup === content) return;
         lastMarkup = content;
-        const restore = $('view').contains(document.activeElement);
+        const active = document.activeElement;
+        const restore = $('view').contains(active);
+        const open = active?.dataset.deviceOpen;
+        const remove = active?.dataset.deviceRemove;
         S.setHTML($('view'), content);
-        if (restore) $('main').focus({ preventScroll: true });
+        if (restore) {
+            const keep = Array.from($('view').querySelectorAll('[data-device-open], [data-device-remove]'))
+                .find(el => (open && el.dataset.deviceOpen === open) || (remove && el.dataset.deviceRemove === remove));
+            (keep || $('main')).focus({ preventScroll: true });
+        }
     }
 
     async function reloadDeviceItems() {
@@ -1078,5 +1089,8 @@
         });
         // "Watched x ago" labels; the markup comparison makes this a no-op when nothing changed.
         setInterval(() => { if (!document.hidden) render(); }, 60000);
+        setInterval(() => {
+            if (!document.hidden && view === 'offline' && !$('dialog').open) reloadDeviceItems();
+        }, 5000);
     });
 })();

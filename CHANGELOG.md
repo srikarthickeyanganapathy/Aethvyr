@@ -5,6 +5,14 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## [2.7.0] - 2026-11-25
+
+- Added Eco, Balanced, Max and Custom streaming profiles with a shared background prefetch budget.
+- Added a local diagnostics report with playback timing, buffer history, frame counts and error codes.
+- Account sync now excludes stream URLs and rewrites older synced history when an updated device syncs.
+- Added live progress in Offline / Cached for downloads with known segment or byte totals.
+- Added CI, browser package artifacts, regression tests, and updated release and benchmarking documentation.
+
 ## [2.6.0] - 2026-11-24
 
 - Added local playback in the Velostream overlay with playlists, sidecar subtitles, and Chromium file resume where supported.

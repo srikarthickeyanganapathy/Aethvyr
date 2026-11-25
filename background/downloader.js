@@ -16,6 +16,8 @@
 
 import { parsePlaylist, segmentKey, segmentIndexForTime, serializeMedia, alignLiveTimeline } from './hls-parser.js';
 
+import { prefetchPolicy } from './resource-policy.js';
+
 const MAX_RETRIES = 4;
 const BASE_BACKOFF_MS = 400;
 const MIN_WORKERS = 2;
@@ -245,11 +247,13 @@ export class SegmentDownloader {
      * @param {import('./abr-controller.js').ABRController} deps.abr
      * @param {() => {maxBufferSec:number, maxWorkers:number}} deps.getSettings
      */
-    constructor({ transport, buffer, abr, getSettings }) {
+    constructor({ transport, buffer, abr, getSettings, sessionCount = () => 1, takePrefetchSlot = () => () => {} }) {
         this.transport = transport;
         this.buffer = buffer;
         this.abr = abr;
         this.getSettings = getSettings;
+        this.sessionCount = sessionCount;
+        this.takePrefetchSlot = takePrefetchSlot;
 
         this.playlists = new Map();     // playlistUrl -> {url, parsed, role, cursor, lastUsed}
         this.segmentIndex = new Map();  // segmentKey -> {playlistUrl, index}
@@ -759,8 +763,7 @@ export class SegmentDownloader {
     }
 
     _windowSeconds() {
-        const s = this.getSettings();
-        return Math.max(10, s.maxBufferSec || 90);
+        return prefetchPolicy(this.getSettings()).windowSeconds;
     }
 
     /**
@@ -768,7 +771,7 @@ export class SegmentDownloader {
      * (parallelism hides per-request latency), fewer when the buffer is healthy (battery).
      */
     adjustConcurrency() {
-        const maxWorkers = Math.min(8, Math.max(MIN_WORKERS, this.getSettings().maxWorkers || 6));
+        const maxWorkers = prefetchPolicy(this.getSettings(), this.sessionCount()).workers;
         const ahead = this.playback.bufferAhead + this.cachedAheadSeconds();
         const latency = this.stats.lastLatencyMs;
         // Whole-video pre-buffering: keep every worker busy until the target is nearly reached,
@@ -777,7 +780,7 @@ export class SegmentDownloader {
         if (ahead >= this._prefetchWindow() * 0.95) target = MIN_WORKERS;
         else if (ahead < 30 || latency > 250) target = maxWorkers;
         else target = Math.max(MIN_WORKERS, maxWorkers - 1);
-        this.concurrency = target;
+        this.concurrency = Math.min(target, maxWorkers);
     }
 
     /** Seconds of contiguous cached/in-flight media after the cursor of the main playlist. */
@@ -909,13 +912,16 @@ export class SegmentDownloader {
         const limit = this._pausedCacheLimit();
         if (limit != null && this.buffer.currentSize + this.buffer.reserved >= limit) return;
         this.queue = this._buildQueue();
-        const slots = Math.max(0, this.concurrency - this.activePrefetch - this.activeOnDemand);
+        const workers = Math.min(this.concurrency, prefetchPolicy(this.getSettings(), this.sessionCount()).workers);
+        const slots = Math.max(0, workers - this.activePrefetch - this.activeOnDemand);
         for (let i = 0; i < slots && this.queue.length; i++) {
-            this._startPrefetch(this.queue.shift());
+            const release = this.takePrefetchSlot();
+            if (!release) break;
+            this._startPrefetch(this.queue.shift(), release);
         }
     }
 
-    _startPrefetch(task) {
+    _startPrefetch(task, release) {
         const controller = new AbortController();
         const entry = { controller, prefetch: true, playlistUrl: task.playlistUrl, index: task.index, promise: null };
         const generation = this.generation;
@@ -925,7 +931,7 @@ export class SegmentDownloader {
                 const headers = task.range ? { Range: task.range } : {};
                 let res;
                 try {
-                    res = await this._fetchWithRetry(task.url, { method: 'GET', headers }, controller.signal, false, true);
+                    res = await this._fetchWithRetry(task.url, { method: 'GET', headers }, controller.signal, false, true, false);
                 } catch (err) {
                     // Recorded before `finally` re-pumps, or the pump would restart this key at once.
                     if (err && err.name !== 'AbortError' && !controller.signal.aborted &&
@@ -947,6 +953,7 @@ export class SegmentDownloader {
                 return res;
             } finally {
                 this.activePrefetch--;
+                release();
                 // An aborted task may already have been replaced by a new one for the same key.
                 if (this.inflight.get(task.key) === entry) this.inflight.delete(task.key);
                 this.schedulePump();
@@ -1108,13 +1115,13 @@ export class SegmentDownloader {
         return { status: 200, headers: outHeaders, url: first.url, data: concatBuffers(buffers) };
     }
 
-    async _fetchWithRetry(url, { method, headers }, signal, onDemand, isSegment = false) {
+    async _fetchWithRetry(url, { method, headers }, signal, onDemand, isSegment = false, allowAcceleration = true) {
         let attempt = 0;
         for (;;) {
             if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
             const started = Date.now();
             try {
-                const res = this._canAccelerate(url, method, headers, isSegment)
+                const res = allowAcceleration && this._canAccelerate(url, method, headers, isSegment)
                     ? await this._accelFetch(url, headers, signal)
                     : await this.transport(url, { method, headers, signal });
                 if (res.status >= 400) throw new HttpError(res.status, url);

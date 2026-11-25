@@ -234,7 +234,16 @@
                 <fieldset>
                     <legend>Engine</legend>
                     <div class="field">
-                        <label for="s-maxBufferSec">Pre-buffer ahead</label>
+                        <label for="s-resourceProfile">Streaming profile</label>
+                        <select id="s-resourceProfile" name="resourceProfile">
+                            <option value="eco">Eco</option>
+                            <option value="balanced">Balanced</option>
+                            <option value="max">Max</option>
+                            <option value="custom">Custom</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-maxBufferSec">Pre-buffer ceiling</label>
                         <select id="s-maxBufferSec" name="maxBufferSec" data-type="number">
                             <option value="30">30 s (data saver)</option>
                             <option value="60">1 min</option>

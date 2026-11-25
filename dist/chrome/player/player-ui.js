@@ -1092,6 +1092,7 @@
             this.errorShown = false;
             this.secondTick = 0;
             this.lastQuality = { total: 0, at: 0 };
+            this.diagnostics = { history: [], errors: {} };
             this.statusPersistent = null;
             this.resolveInit = null;
             this.initPromise = new Promise(res => { this.resolveInit = res; });
@@ -1430,6 +1431,7 @@
             const v = this.video;
             const type = this.stream.type;
             const gen = ++this.loadGen;
+            this.diagnostics = { started: performance.now(), history: [], errors: {}, waitingMs: 0, waitingEvents: 0 };
             this.hideError();
             if (type === 'progressive') {
                 this.mode = 'native';
@@ -1986,7 +1988,7 @@
   <div class="card error glass elevated" role="alertdialog" aria-modal="true" aria-labelledby="fs-err-title" aria-describedby="fs-err-msg">
     <h2 id="fs-err-title">${icon('warn')}<span>Playback error</span></h2>
     <p id="fs-err-msg"></p>
-    <div class="btns"><button type="button" class="pillbtn primary btn-retry">Retry</button><button type="button" class="pillbtn btn-err-close">Close player</button></div>
+    <div class="btns"><button type="button" class="pillbtn primary btn-retry">Retry</button><button type="button" class="pillbtn btn-report">Save diagnostics</button><button type="button" class="pillbtn btn-err-close">Close player</button></div>
   </div>
 </div>`);
             document.body.appendChild(host);
@@ -2346,6 +2348,7 @@
             on('.mini-close', 'click', () => this.destroy());
             on('.btn-err-close', 'click', () => this.destroy());
             on('.btn-retry', 'click', () => this.retry());
+            on('.btn-report', 'click', () => this.saveDiagnostics());
             on('.btn-play', 'click', () => this.togglePlay());
             on('.mini-play', 'click', () => this.togglePlay());
             on('.mini-expand', 'click', () => this.setMini(false));
@@ -2402,9 +2405,24 @@
             });
             media('playing', () => { if (this.gpu && this.gpu.active && !this.audioOnly) this.gpu.start(); });
             media('pause', () => { if (this.gpu) { this.gpu.stop(); this.gpu.renderOnce(); } });
-            media('playing', () => { this.setBuffering(false); this.setStatus('playing'); this.scheduleHide(); });
+            media('playing', () => {
+                const d = this.diagnostics;
+                if (d.started !== undefined && d.startupMs === undefined) d.startupMs = performance.now() - d.started;
+                this.finishDiagnosticWait();
+                this.setBuffering(false);
+                this.setStatus('playing');
+                this.scheduleHide();
+            });
             media('pause', () => { this.updatePlayButtons(); if (!v.ended) this.setStatus('paused'); this.showControls(true); this.saveHistory(true); });
-            media('waiting', () => this.setBuffering(true));
+            media('waiting', () => {
+                const d = this.diagnostics;
+                if (d.startupMs !== undefined && d.waitSince === undefined && !v.paused && !v.seeking) {
+                    d.waitSince = performance.now();
+                    d.waitingEvents++;
+                }
+                this.setBuffering(true);
+            });
+            media('pause', () => this.finishDiagnosticWait());
             media('canplay', () => this.setBuffering(false));
             media('ended', () => {
                 this.setStatus('ended');
@@ -2443,6 +2461,7 @@
             media('leavepictureinpicture', () => this.$('.btn-pip').setAttribute('aria-pressed', 'false'));
             media('error', () => {
                 if (this.mode !== 'native' || !v.error || this.closed) return;
+                this.diagnostics.errors.mediaCode = v.error.code;
                 if (this.localPlayback) {
                     this.showError('Cannot play this file', 'This browser could not read the file or its codec.');
                     return;
@@ -2460,8 +2479,10 @@
                 // <video> only reports "format error"; ask the engine what the server really said.
                 this.probeStatus(this.stream.url).then(status => {
                     if (status === 401 || status === 403) {
+                        this.diagnostics.errors.httpStatus = status;
                         this.showError('Access denied', `The server refused the file (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Velostream again.`);
                     } else if (status >= 400) {
+                        this.diagnostics.errors.httpStatus = status;
                         this.showError('Cannot load this file', `The server returned HTTP ${status}.`);
                     } else if (!status) {
                         this.showError('Cannot load this file', 'The file could not be downloaded. Check your connection and retry.');
@@ -3047,10 +3068,12 @@
             if (!err) return;
             const code = err.code;
             const data = Array.isArray(err.data) ? err.data : [];
+            this.diagnostics.errors.shakaCode = code;
+            if (code === 1001 && Number.isInteger(data[1])) this.diagnostics.errors.httpStatus = data[1];
             const netUrl = code >= 1000 && code < 2000 && typeof data[0] === 'string' ? data[0] : '';
             const reason = code === 1002 && data[1] ? String(data[1].message || data[1]) : '';
             const httpStatus = code === 1001 && typeof data[1] === 'number' ? ` HTTP ${data[1]}` : '';
-            console.warn(`[Velostream] Shaka error ${code}${httpStatus} (severity ${err.severity})${netUrl ? ` ${netUrl.slice(0, 300)}` : ''}${reason ? ` - ${reason}` : ''}`);
+            console.warn(`[Velostream] Shaka error ${code}${httpStatus} (severity ${err.severity})`);
             if (code === 3017) {
                 // QUOTA_EXCEEDED_ERROR: mobile SourceBuffer limits. Shrink buffers and keep going.
                 this.player.configure({ streaming: { bufferBehind: 8, bufferingGoal: 15 } });
@@ -4621,6 +4644,15 @@
 
         onSecond() {
             this.secondTick++;
+            const diagnostic = this.diagnostics;
+            if (diagnostic.started !== undefined) {
+                diagnostic.history.push({
+                    elapsedSeconds: (performance.now() - diagnostic.started) / 1000,
+                    bufferSeconds: this.bufferAhead(),
+                    cachedSeconds: this.localPlayback ? null : this.engineStats?.cachedAhead
+                });
+                if (diagnostic.history.length > 60) diagnostic.history.shift();
+            }
             this.sendTelemetry(Date.now() - this.lastVariantsSentAt > 10000);
             this.renderStats();
             this.checkSleep();
@@ -5020,6 +5052,41 @@
                 if (this.decoderKey !== key) return;
                 this.decoderInfo = !r.supported ? 'Not supported' : `${r.smooth ? 'Smooth' : 'May stutter'} · ${r.powerEfficient ? 'hardware (power efficient)' : 'software'}`;
             }, () => { if (this.decoderKey === key) this.decoderInfo = 'Unknown'; });
+        }
+
+        finishDiagnosticWait() {
+            const d = this.diagnostics;
+            if (d.waitSince === undefined) return;
+            d.waitingMs += performance.now() - d.waitSince;
+            delete d.waitSince;
+        }
+
+        async saveDiagnostics() {
+            const v = this.video;
+            const d = this.diagnostics;
+            const quality = v.getVideoPlaybackQuality?.() || {};
+            let shakaStats;
+            try { shakaStats = this.player?.getStats(); } catch (_) { /* detached player */ }
+            const report = window.VelostreamDiagnostics.build({
+                version: extApi.runtime.getManifest().version,
+                userAgent: navigator.userAgent,
+                transport: this.localPlayback ? 'local' : this.stream?.type,
+                modes: { gpu: this.gpu?.active, normalization: this.audio.active && this.settings?.audio.loudnessNorm,
+                    resourceProfile: this.settings?.resourceProfile },
+                media: { width: v.videoWidth, height: v.videoHeight, totalFrames: quality.totalVideoFrames,
+                    droppedFrames: quality.droppedVideoFrames, codecs: shakaStats?.currentCodecs, videoBitrate: shakaStats?.streamBandwidth },
+                playback: { startupMs: d.startupMs, positionSeconds: v.currentTime, bufferSeconds: this.bufferAhead(),
+                    waitingEvents: d.waitingEvents, waitingMs: (d.waitingMs || 0) + (d.waitSince === undefined ? 0 : performance.now() - d.waitSince) },
+                network: this.localPlayback ? null : this.engineStats,
+                history: d.history,
+                errors: d.errors
+            });
+            try {
+                const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+                await downloadBlob(this.shadow, blob, 'velostream-playback-diagnostics.json');
+            } catch (error) {
+                this.announce(error.message, 'warn');
+            }
         }
 
         renderStats() {
@@ -5861,7 +5928,8 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             const workers = clamp(Math.round(Number(s.maxWorkers) || 4), 2, 8);
             return `<div class="section-label">Buffer &amp; network</div>
 ${this.selectField('bf-paused-limit', 'Prefetch while paused', withCurrentOption([[0, 'Off'], [128, '128 MB'], [256, '256 MB'], [512, '512 MB'], [1024, '1 GB']], s.pausedBufferMB, v => `${v} MB`), s.pausedBufferMB)}
-${this.selectField('bf-window', 'Pre-buffer window', withCurrentOption(PREBUFFER_WINDOWS, s.maxBufferSec, v => `${v >= 60 && v % 60 === 0 ? `${v / 60} min` : `${v} s`} (custom)`), s.maxBufferSec ?? 86400)}
+${this.selectField('bf-profile', 'Streaming profile', [['eco', 'Eco'], ['balanced', 'Balanced'], ['max', 'Max'], ['custom', 'Custom']], s.resourceProfile)}
+${this.selectField('bf-window', 'Pre-buffer ceiling', withCurrentOption(PREBUFFER_WINDOWS, s.maxBufferSec, v => `${v >= 60 && v % 60 === 0 ? `${v / 60} min` : `${v} s`} (custom)`), s.maxBufferSec ?? 86400)}
 ${this.rangeField('bf-ahead', 'RAM buffer ahead', 15, 180, 5, s.mseBufferAhead, `${s.mseBufferAhead} s`)}
 ${this.rangeField('bf-behind', 'Back-buffer kept', 10, 180, 5, s.mseBufferBehind, `${s.mseBufferBehind} s`)}
 ${this.rangeField('bf-workers', 'Parallel workers', 2, 8, 1, workers, `${workers}`)}
@@ -5869,7 +5937,7 @@ ${this.selectField('bf-cache', 'Disk cache cap', withCurrentOption(CACHE_CAPS, s
 ${this.switchField('bf-range', 'Range accelerator (parallel chunks)', s.rangeAccel !== false)}
 ${this.switchField('bf-pause', 'Pause background prefetch', !!this.prefetchPaused)}
 <div role="menu" aria-label="Buffer actions">${this.row({ id: 'bf-purge', label: 'Purge & rebuild buffer', meta: `${ahead} ahead`, role: 'menuitem', lead: 'rotate' })}</div>
-<p class="hint">The pre-buffer lives on disk (IndexedDB); RAM ahead/behind is what the video element keeps decoded.</p>`;
+<p class="hint">Profiles cap background prefetch at 1, 3, or 15 minutes. Custom uses your chosen ceiling. The disk cache and playback RAM have separate limits.</p>`;
         }
 
         qualitySection() {
@@ -6045,6 +6113,7 @@ ${this.row({ id: 'tl-mini', label: 'Mini player', role: 'menuitem', lead: 'mini'
 ${this.row({ id: 'tl-audio', label: 'Audio-only battery saver', meta: this.audioOnly ? 'On' : 'Off', role: 'menuitem', lead: 'headphones' })}
 ${document.pictureInPictureEnabled ? this.row({ id: 'tl-pip', label: 'Picture in Picture', role: 'menuitem', lead: 'pip' }) : ''}
 ${this.row({ id: 'tl-lock', label: 'Lock touch controls', role: 'menuitem', lead: 'lock' })}
+${this.row({ id: 'tl-diagnostics', label: 'Save playback diagnostics', role: 'menuitem', lead: 'download' })}
 ${this.row({ id: 'tl-stats', label: this.settings.showStats ? 'Hide playback statistics' : 'Show playback statistics', role: 'menuitem', lead: 'info' })}</div>`;
             return html;
         }
@@ -6291,6 +6360,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 each('[data-q]', el => this.selectQuality(el.dataset.q === 'auto' ? 'auto' : +el.dataset.q));
                 select('q-cap', v => { this.setQualityCap(+v); this.announce(`Resolution cap ${+v ? `${v}p` : 'off'}`, 'studio'); });
                 const shakaBuf = () => { if (this.player) { try { this.configureShaka(); } catch (_) { /* player gone */ } } };
+                select('bf-profile', v => this.saveSettings({ resourceProfile: v }));
                 select('bf-window', v => {
                     this.saveSettings({ maxBufferSec: +v });
                     const w = PREBUFFER_WINDOWS.find(x => x[0] === +v);
@@ -6416,6 +6486,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                         this.announce(`Loaded ${cues.length} chapters`, 'check');
                     } catch (error) { this.announce(error.message, 'warn'); }
                 });
+                click('tl-diagnostics', () => this.saveDiagnostics());
                 click('tl-stats', () => {
                     this.saveSettings({ showStats: !this.settings.showStats });
                     this.closePopover(true);

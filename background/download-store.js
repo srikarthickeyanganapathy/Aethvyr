@@ -31,7 +31,23 @@ async function transaction(stores, mode, body) {
 }
 
 export const downloadStore = {
-    list: () => transaction('jobs', 'readonly', tx => tx.objectStore('jobs').getAll()),
+    async listSummaries() {
+        const summaries = [];
+        await transaction('jobs', 'readonly', tx => {
+            const request = tx.objectStore('jobs').openCursor();
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return;
+                const job = cursor.value;
+                summaries.push({
+                    id: job.id, name: job.base, bytes: job.bytes, totalBytes: job.totalBytes,
+                    total: job.totalSegments, completed: job.completedCount, status: job.status
+                });
+                cursor.continue();
+            };
+        });
+        return summaries;
+    },
     get: id => transaction('jobs', 'readonly', tx => tx.objectStore('jobs').get(id)),
     save: job => transaction('jobs', 'readwrite', tx => tx.objectStore('jobs').put(job)),
     read: (id, index) => transaction('chunks', 'readonly', tx => tx.objectStore('chunks').get([id, index])),
@@ -48,7 +64,10 @@ export const downloadStore = {
                 chunks.put({ ...chunk, streamId: id, segmentIndex: index });
                 job.bytes = (job.bytes || 0) + chunk.data.byteLength;
                 if (index.startsWith('seg:')) job.completedCount = (job.completedCount || 0) + 1;
-                if (index.startsWith('byte:')) job.byteOffset = chunk.offset + chunk.data.byteLength;
+                if (index.startsWith('byte:')) {
+                    job.byteOffset = chunk.offset + chunk.data.byteLength;
+                    job.totalBytes = chunk.total;
+                }
                 jobs.put(job);
             };
         };

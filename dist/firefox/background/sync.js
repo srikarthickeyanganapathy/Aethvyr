@@ -32,7 +32,7 @@
  * Every merge is deterministic (ties broken by content) so devices converge and never ping-pong.
  */
 
-const VERSION = 1;
+const VERSION = 2;
 const PREFIX = 'vs_';
 const META_KEY = 'vs_meta';
 const SECTIONS = ['set', 'hist', 'lib', 'bm'];
@@ -81,7 +81,9 @@ export const DEVICE_SPECIFIC_SETTINGS = Object.freeze([
     'hwTier', // each device detects its own hardware tier
     'uiScale',
     'maxWorkers',
+    'resourceProfile',
     'cacheSizeMB',
+    'pausedBufferMB',
     'maxBufferSec',
     'mseBufferAhead',
     'mseBufferBehind',
@@ -252,13 +254,33 @@ function parseMeta(m) {
     return { v: m.v, dev: str(m.dev, 64), at: fin(m.at) ? m.at : 0, s };
 }
 
-function sanitizeHistEntry(a) {
+/** Keep page navigation where it is safe to do so. Stream URLs stay on the source device. */
+export function syncPageUrl(value) {
+    if (!httpUrl(value)) return '';
+    try {
+        const url = new URL(value);
+        if (url.username || url.password || url.hostname === 'localhost' || url.hostname.endsWith('.local')) return '';
+        const path = decodeURIComponent(url.pathname);
+        if (/(?:^|\/)(?:token|signature|auth|signed|session|secret|key|access[-_]?token)(?:\b|_)/i.test(path) ||
+            path.split('/').some(segment => /^[\w+.-]{40,}$/.test(segment)) ||
+            SENSITIVE_PATH.test(path)) return '';
+        const videoId = /^(?:(?:www|m)\.)?youtube\.com$/i.test(url.hostname) && url.pathname === '/watch' ? url.searchParams.get('v') : null;
+        url.search = '';
+        url.hash = '';
+        if (videoId && /^[\w-]{11}$/.test(videoId)) url.searchParams.set('v', videoId);
+        return url.href;
+    } catch (_) { return ''; }
+}
+
+const SENSITIVE_PATH = /(?:[;?&]|%)(?:token|signature|sig|auth|jwt|session|key|password)=/i;
+
+export function sanitizeHistEntry(a) {
     if (!Array.isArray(a) || a.length < 8) return null;
-    const [k, url, page, title, t, d, done, updatedAt, subOffset, loopA, loopB] = a;
-    if (typeof k !== 'string' || !KEY_RE.test(k) || ['__proto__', 'constructor', 'prototype'].includes(k) || !httpUrl(url) || !fin(updatedAt) || updatedAt <= 0) return null;
+    const [k, , page, title, t, d, done, updatedAt, subOffset, loopA, loopB] = a;
+    if (typeof k !== 'string' || !KEY_RE.test(k) || ['__proto__', 'constructor', 'prototype'].includes(k) || !fin(updatedAt) || updatedAt <= 0) return null;
     const num = (n, lo, hi) => (fin(n) && n >= lo && n <= hi ? n : null);
     return [
-        k, url, httpUrl(page), str(title, 200),
+        k, '', syncPageUrl(page), str(title, 200).replace(/https?:\/\/\S+/gi, '[link]'),
         num(t, 0, 1e7) ?? 0, num(d, 0, 1e7) ?? 0, done ? 1 : 0, updatedAt,
         num(subOffset, -1e4, 1e4) ?? 0, num(loopA, 0, 1e7), num(loopB, 0, 1e7)
     ];
@@ -361,18 +383,18 @@ function syncedSubset(merged) {
 // ---------------------------------------------------------------------------
 // History / bookmark / library compact forms
 // ---------------------------------------------------------------------------
-function compactEntry(k, e) {
-    if (!KEY_RE.test(k) || !isObj(e) || !httpUrl(e.url) || !fin(e.updatedAt)) return null;
+export function compactEntry(k, e) {
+    if (!KEY_RE.test(k) || !isObj(e) || !fin(e.updatedAt)) return null;
     return sanitizeHistEntry([
-        k, e.url, e.page, e.title,
+        k, '', e.page, e.title,
         fin(e.t) ? round1(e.t) : 0, fin(e.d) ? round1(e.d) : 0, e.done ? 1 : 0, e.updatedAt,
         fin(e.subOffset) ? round1(e.subOffset) : 0, fin(e.loopA) ? round1(e.loopA) : null, fin(e.loopB) ? round1(e.loopB) : null
     ]);
 }
 
-function expandEntry(a) {
+export function expandEntry(a, local = {}) {
     return {
-        url: a[1], title: a[3], page: a[2], t: a[4], d: a[5], done: !!a[6],
+        url: httpUrl(local.url), title: a[3], page: httpUrl(local.page) || a[2], t: a[4], d: a[5], done: !!a[6],
         subOffset: a[8], loopA: a[9], loopB: a[10], updatedAt: a[7]
     };
 }
@@ -655,7 +677,7 @@ function createSync(api, S, clock, writeStorage) {
                 const lc = cur ? compactEntry(k, cur) : null;
                 if (lc && canon(lc) === canon(r)) continue;
                 if (!cur || !lc || r[7] > lc[7] || (r[7] === lc[7] && canon(r) > canon(lc))) {
-                    merged[k] = { ...cur, ...expandEntry(r) };
+                    merged[k] = { ...cur, ...expandEntry(r, cur) };
                 }
             }
             for (const [k, t] of Object.entries(tomb)) {
@@ -925,7 +947,7 @@ function createSync(api, S, clock, writeStorage) {
             return;
         }
         const remoteSetUsable = rs?.status === 'ok';
-        if (remoteSetUsable && !(rs.status === 'ok' && state.setAt > rs.data.at)) {
+        if (meta?.v === VERSION && remoteSetUsable && state.setAt <= rs.data.at) {
             const chunks = [];
             for (let i = 0; i < rs.meta.n; i++) chunks.push(remote[`${PREFIX}set_${i}`]);
             if (chunks.every(c => typeof c === 'string')) {
@@ -1089,9 +1111,9 @@ function createSync(api, S, clock, writeStorage) {
         enabled = true;
         queue(async () => {
             if (!enabled) return;
-            await pull();
-            // Turning sync on pushes right away; a wake-up only checks (and writes if anything differs).
-            markDirty(!!fromToggle);
+            const pulled = await pull();
+            // Rewrite v1 history without stream addresses once the remote snapshot is readable.
+            markDirty(!!fromToggle || pulled?.meta?.v < VERSION);
         });
     }
 

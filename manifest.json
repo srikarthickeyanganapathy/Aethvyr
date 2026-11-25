@@ -2,7 +2,7 @@
     "manifest_version": 3,
     "name": "Velostream 2.0",
     "short_name": "Velostream",
-    "version": "2.6.0",
+    "version": "2.7.0",
     "description": "Accessible, customizable HLS/DASH/MP4 player with parallel prefetching for mobile and desktop browsers.",
     "permissions": [
         "downloads",

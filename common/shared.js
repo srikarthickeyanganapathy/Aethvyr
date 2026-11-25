@@ -104,6 +104,7 @@
             qualityHeight: 0         // 0 = Auto (ABR)
         },
         // Engine: pre-buffer the whole video in the background (bounded by the cache size)
+        resourceProfile: 'balanced', // eco | balanced | max | custom (device-specific)
         maxBufferSec: 86400,         // seconds ahead to pre-download; 86400 = whole video
         pausedBufferMB: 256,         // IndexedDB prefetch limit while paused, 0 disables
         cacheSizeMB: 2048,           // IndexedDB ring buffer per tab
@@ -228,6 +229,7 @@
             out.settingsVersion = 2;
         }
         out.settingsVersion = 3; // v3 only adds keys; defaults fill them in
+        if (!['eco', 'balanced', 'max', 'custom'].includes(out.resourceProfile)) out.resourceProfile = 'balanced';
         out.maxBufferSec = Math.min(86400, Math.max(10, out.maxBufferSec));
         out.mseBufferAhead = Math.min(300, Math.max(15, out.mseBufferAhead));
         out.mseBufferBehind = Math.min(300, Math.max(10, out.mseBufferBehind));
@@ -560,7 +562,7 @@
         }
         const history = {};
         const entries = Object.entries(isPlainObject(data.history) ? data.history : {})
-            .filter(([k, e]) => /^[\w-]{1,64}$/.test(k) && !['__proto__', 'constructor', 'prototype'].includes(k) && isPlainObject(e) && httpUrl(e.url))
+            .filter(([k, e]) => /^[\w-]{1,64}$/.test(k) && !['__proto__', 'constructor', 'prototype'].includes(k) && isPlainObject(e) && (httpUrl(e.url) || (e.url === '' && typeof e.title === 'string' && finiteNum(e.updatedAt) !== null)))
             .sort((a, b) => (finiteNum(b[1].updatedAt) || 0) - (finiteNum(a[1].updatedAt) || 0))
             .slice(0, 200);
         for (const [k, e] of entries) {

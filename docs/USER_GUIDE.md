@@ -376,11 +376,16 @@ for Firefox), with no Velostream server involved:
 
 Changes upload about 10–60 seconds after you make them, and other devices pick them up when their
 browser syncs. *Sync now* forces a round trip; *Delete synced data* removes Velostream's copy
-from your account. Browser sync storage is small (about 100 KB), so with very long video addresses
-only the most recent videos sync. See the [privacy policy](../PRIVACY.md#optional-sync-across-your-devices).
+from your account. Browser sync storage is small (about 100 KB), so only recent videos sync. Stream URLs stay on the source device. See the [privacy policy](../PRIVACY.md#optional-sync-across-your-devices).
 - On Firefox: **Allow access to websites**, when site access has not been granted yet.
 
 ---
+
+## Playback diagnostics
+
+Open **Studio → Tools → Save playback diagnostics** or use **Save diagnostics** on the playback error screen.
+The JSON includes startup time, rebuffering events, recent buffer levels, frame counts and numeric error codes.
+It stays on your device unless you share it.
 
 ## Accessibility
 
