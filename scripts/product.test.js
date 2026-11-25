@@ -34,6 +34,28 @@ function memoryStorage(values = {}) {
     };
 }
 
+test('Aethvyr restores and re-exports a Velostream backup with its original storage identity', async () => {
+    const local = memoryStorage();
+    const api = { storage: { local } };
+    const legacy = {
+        app: 'velostream', version: 2, settings: { maxWorkers: 3 },
+        bookmarks: { fs_bm_episode: [{ t: 17, label: 'Return here' }] },
+        history: { episode: { title: 'Episode', url: 'https://example.test/video.mp4', t: 17, updatedAt: 10 } },
+        library: { favorites: ['episode'], collections: [] }
+    };
+    const shared = globalThis.VelostreamShared;
+    await shared.restoreBackup(api, JSON.stringify(legacy));
+    assert.equal(local.data.fs_settings.maxWorkers, 3);
+    assert.equal(local.data.fs_history.episode.t, 17);
+    assert.deepEqual(local.data.fs_bm_episode, legacy.bookmarks.fs_bm_episode);
+    assert.deepEqual(local.data.fs_library.favorites, ['episode']);
+    const exported = await shared.buildBackup(api);
+    assert.equal(exported.app, legacy.app);
+    assert.equal(exported.version, legacy.version);
+    assert.deepEqual(exported.bookmarks, legacy.bookmarks);
+    assert.match(shared.backupFilename(), /^aethvyr-backup-/);
+});
+
 test('sync round trip merges newer positions without replacing local stream URLs', async () => {
     const S = globalThis.VelostreamShared;
     const signed = 'https://cdn.example/playlist.m3u8?token=must-stay-local';

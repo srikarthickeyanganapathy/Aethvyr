@@ -81,7 +81,7 @@ export const DEVICE_SPECIFIC_SETTINGS = Object.freeze([
     'hwTier', // each device detects its own hardware tier
     'uiScale',
     'maxWorkers',
-    'resourceProfile',
+    'resourceProfile', 'prefetchMbps',
     'cacheSizeMB',
     'pausedBufferMB',
     'maxBufferSec',

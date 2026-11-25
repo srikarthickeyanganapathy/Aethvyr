@@ -202,6 +202,7 @@ export class BufferManager {
             }
             // Assign (not accumulate) so a retried init after a failure cannot double count.
             this.currentSize = total;
+            if (total > this.capBytes) await this._evictLocked(() => this._shortfall(0), true);
         }).catch(err => {
             this.ready = null;
             throw err;
@@ -210,7 +211,10 @@ export class BufferManager {
     }
 
     setCapacity(mb) {
-        this.capBytes = Math.max(32, mb) * 1024 * 1024;
+        this.capBytes = Math.max(0, Math.floor(mb * 1024 * 1024));
+        if (this.currentSize > this.capBytes) {
+            this._serialize(() => this._evictLocked(() => this._shortfall(0), true)).catch(() => {});
+        }
     }
 
     has(segmentId) {
@@ -245,6 +249,7 @@ export class BufferManager {
         return this._serialize(async () => {
             if (limit != null && this.currentSize + this.reserved + size > limit) return false;
             if (this._shortfall(size) > 0) await this._evictLocked(() => this._shortfall(size));
+            if (this._shortfall(size) > 0) return false;
             this.reserved += size;
             this._pin(segmentId);
             return true;
@@ -274,9 +279,8 @@ export class BufferManager {
      * Store a segment. Evicts first when the cap would be exceeded; retries once on
      * QuotaExceededError after an aggressive eviction.
      *
-     * The cap is soft in one case only: when every stored segment is protected and unserved
-     * (look-ahead window larger than the cap) the write still goes through, otherwise the
-     * downloader would re-fetch the same segment forever.
+     * If protected segments fill the cap, serve demand bytes directly. The downloader
+     * applies its existing per-segment cooldown to declined speculative writes.
      */
     storeSegment(segmentId, data, mime = '', limit) {
         const write = this.clearing.then(() => this._storeSegment(segmentId, data, mime, limit));
@@ -308,6 +312,7 @@ export class BufferManager {
         } finally {
             this.reserved = Math.max(0, this.reserved - size);
             this._unpin(segmentId);
+            if (this.currentSize > this.capBytes) await this._serialize(() => this._evictLocked(() => this._shortfall(0), true));
         }
         return true;
     }
@@ -371,7 +376,7 @@ export class BufferManager {
      * that moment (after earlier evictions and commits), so concurrent stores never each
      * evict their own stale estimate.
      */
-    async _evictLocked(needFn) {
+    async _evictLocked(needFn, resize = false) {
         if (needFn() <= 0) return 0;
         const db = await openDB();
         const recs = await scanMeta(db, prefixRange(this.tabId));
@@ -416,6 +421,7 @@ export class BufferManager {
         if (freed < bytesNeeded) collect(rec => !own(rec) || !this._isProtected(rec.segmentId));
         // Pass 3: cap reached with everything protected - shrink the oldest played DVR history.
         if (freed < bytesNeeded) collect(rec => rec.served);
+        if (resize && freed < bytesNeeded) collect(() => true);
         if (!victims.length) return 0;
 
         const tx = db.transaction([META, DATA], 'readwrite');

@@ -1,7 +1,7 @@
 /**
- * Velostream - Package built extensions into store-ready zip files.
+ * Aethvyr - Package built extensions into store-ready zip files.
  *   npm run build && npm run package
- * Produces dist/velostream-chrome-<version>.zip and dist/velostream-firefox-<version>.zip
+ * Produces dist/aethvyr-chrome-<version>.zip and dist/aethvyr-firefox-<version>.zip
  * (the Firefox zip doubles as an .xpi for signing on addons.mozilla.org).
  */
 import fs from 'fs';
@@ -37,7 +37,7 @@ async function main() {
         return { target, dir };
     });
     for (const { target, dir } of targets) {
-        const out = path.join(DIST, `velostream-${target}-${version}.zip`);
+        const out = path.join(DIST, `aethvyr-${target}-${version}.zip`);
         const temporary = out + '.' + process.pid + '.tmp';
         let bytes;
         try {

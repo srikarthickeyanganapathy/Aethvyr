@@ -13,11 +13,11 @@
     --text-2: var(--text-secondary);
     --fill: rgba(118, 118, 128, 0.24);
     --fill-hover: rgba(118, 118, 128, 0.36);
-    --accent: #0A84FF;
-    --accent-strong: #0058D0;
-    --green: #30D158;
-    --amber: #FF9F0A;
-    --red: #FF6961;
+    --accent: var(--accent-default);
+    --accent-strong: var(--accent-active);
+    --green: var(--success);
+    --amber: var(--warning);
+    --red: var(--error);
     --spring: var(--ease-spring);
     color-scheme: dark;
 }

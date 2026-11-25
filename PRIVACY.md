@@ -1,11 +1,11 @@
 # Privacy policy
 
-*Last updated: 16 November 2026*
+*Last updated: 25 November 2026*
 
-Velostream is a browser extension that plays and saves video from the pages you visit. It is
+Aethvyr is a browser extension that plays and saves video from the pages you visit. It is
 designed to work entirely on your device.
 
-## What Velostream does not do
+## What Aethvyr does not do
 
 - It does **not** collect, sell or share personal data.
 - It has **no servers**, accounts, analytics, telemetry, crash reporting or advertising.
@@ -17,16 +17,18 @@ designed to work entirely on your device.
 
 | Data | Where it is stored | Purpose | Retention |
 |------|--------------------|---------|-----------|
-| Settings (player preferences, gestures, shortcuts, site profiles, sites set to *Always play in Velostream*) | `storage.local` | Your preferences | Until you change them or uninstall |
+| Settings (player preferences, gestures, shortcuts, site profiles, sites set to *Always play in Aethvyr*) | `storage.local` | Your preferences | Until you change them or uninstall |
 | Watch positions and bookmarks (video URL, title, position) | `storage.local` | *Continue watching* and resume | Newest 200 videos; *Clear history* in the popup deletes them |
 | Library (favorites and collections of videos from your history) | `storage.local` | The library page | Until you remove them or uninstall |
 | Streams and subtitles detected in a tab | `storage.session` | The popup's stream list | Until the tab closes or the browser restarts |
 | Video segments | IndexedDB (extension origin) | Pre-buffering for smooth playback and seeking | Deleted when you close the player |
 | Downloaded videos and snapshots | Your downloads folder | What you chose to save | Yours to manage |
 
+When you grant private-window access, the web video player skips watch-history writes for private tabs. Private bookmarks and local-file records live in the player page. Private web playback uses a per-session memory cache capped at 16 MiB and skips durable download checkpoints. Private exports can save a file you explicitly select, and interrupted private exports must restart. Private requests use their owning page’s network context, subject to its cross-origin access rules. Regular tabs still save their watch positions for Continue Watching.
+
 ## Network requests
 
-Velostream makes requests only to the servers that host the video you chose to play: playlists,
+Aethvyr makes requests only to the servers that host the video you chose to play: playlists,
 segments, keys and subtitles. It repeats the headers the site's own player used (Referer,
 Origin, cookies for that site and authorization headers) so the server accepts the requests.
 These go to the same servers the site's player would contact. No request goes to the developer
@@ -35,7 +37,7 @@ or any third party.
 ## Optional sync across your devices
 
 Sync is **off by default**. Only if you turn on *Sync across my devices* in the popup does
-Velostream copy the following into the browser's extension sync storage (`storage.sync`):
+Aethvyr copy the following into the browser's extension sync storage (`storage.sync`):
 
 - your settings, except device-specific ones (volume, interface size, buffer and cache sizes,
   GPU enhancement, quality cap and similar);
@@ -43,7 +45,7 @@ Velostream copy the following into the browser's extension sync storage (`storag
 - bookmarks for those videos, and your library (favorites and collections).
 
 Your browser then syncs that storage through **your own browser account**: Google for Chrome and
-Edge sync, Mozilla for a Firefox account. Velostream runs no server and never receives this data.
+Edge sync, Mozilla for a Firefox account. Aethvyr runs no server and never receives this data.
 Stream addresses stay on the device that played them. Sync strips page query strings and fragments
 and omits page URLs with URL credentials or paths that look like credentials. A valid YouTube
 video ID is kept for watch-page navigation. Direct links and some sites that identify videos
@@ -66,7 +68,7 @@ What each permission is used for is documented in [docs/PERMISSIONS.md](docs/PER
 
 ## Children
 
-Velostream does not knowingly collect any data from anyone, including children.
+Aethvyr does not knowingly collect any data from anyone, including children.
 
 ## Changes
 

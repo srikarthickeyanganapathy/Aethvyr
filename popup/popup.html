@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Velostream</title>
+    <title>Aethvyr</title>
     <link rel="stylesheet" href="../common/tokens.css">
     <link rel="stylesheet" href="css/style.css">
 </head>
@@ -14,7 +14,7 @@
     <div id="app" data-accent="blue">
         <header class="app-header">
             <img class="app-icon" src="../icons/icon-48.png" alt="" width="28" height="28">
-            <h1>Velostream</h1>
+            <h1>Aethvyr</h1>
             <span id="status-pill" class="status-pill" role="status"><span class="dot" aria-hidden="true"></span><span id="status-text">Ready</span></span>
             <a class="icon-btn header-library" href="library.html" target="_blank" rel="noopener noreferrer" aria-label="Open library" title="Open library"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h6l2 2h8v12H4z"/></svg></a>
         </header>
@@ -31,7 +31,7 @@
 
         <section id="permission-banner" class="card warn" hidden aria-labelledby="perm-title">
             <h2 id="perm-title" class="card-title">Site access needed</h2>
-            <p class="muted">Velostream needs permission to read pages so it can detect and play videos.</p>
+            <p class="muted">Aethvyr needs permission to read pages so it can detect and play videos.</p>
             <button type="button" id="grant-permission" class="btn btn-primary">Allow access to websites</button>
         </section>
 
@@ -86,7 +86,7 @@
         <section id="site-card" class="card site" hidden aria-labelledby="site-title">
             <label class="field site-field">
                 <span>
-                    <span id="site-title" class="section-title">Always play in Velostream</span>
+                    <span id="site-title" class="section-title">Always play in Aethvyr</span>
                     <span id="site-host" class="muted site-host"></span>
                 </span>
                 <input type="checkbox" role="switch" id="site-auto" aria-describedby="site-host">
@@ -106,7 +106,7 @@
         <details id="history" class="card fold" open>
             <summary><span class="section-title">Continue watching</span><span id="history-count" class="count num">0</span></summary>
             <ul id="history-list" class="history-list"></ul>
-            <p id="history-empty" class="muted">Videos you watch in Velostream appear here with their position.</p>
+            <p id="history-empty" class="muted">Videos you watch in Aethvyr appear here with their position.</p>
             <div class="btn-row">
                 <button type="button" id="open-library" class="btn btn-quiet small">Open library</button>
                 <button type="button" id="history-clear" class="btn btn-quiet small">Clear history</button>
@@ -239,9 +239,13 @@
                         <select id="s-resourceProfile" name="resourceProfile">
                             <option value="eco">Eco</option>
                             <option value="balanced">Balanced</option>
-                            <option value="max">Max</option>
+                            <option value="max">Performance</option>
                             <option value="custom">Custom</option>
                         </select>
+                    </div>
+                    <div class="field">
+                        <label for="s-prefetchMbps">Custom prefetch budget (Mbit/s, 0 = unlimited)</label>
+                        <input id="s-prefetchMbps" name="prefetchMbps" type="number" data-type="number" min="0" max="1000" step="1">
                     </div>
                     <div class="field">
                         <label for="s-maxBufferSec">Pre-buffer ceiling</label>
@@ -259,7 +263,7 @@
                         <input id="s-pausedBufferMB" name="pausedBufferMB" type="number" data-type="number" min="0" max="8192" step="1">
                     </div>
                     <div class="field">
-                        <label for="s-cacheSizeMB">Cache per tab</label>
+                        <label for="s-cacheSizeMB">Shared cache budget</label>
                         <select id="s-cacheSizeMB" name="cacheSizeMB" data-type="number">
                             <option value="256">256 MB</option>
                             <option value="512">512 MB</option>

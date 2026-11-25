@@ -30,8 +30,8 @@ jobs:
           test "$GITHUB_REF_NAME" = "$expected" || { echo "Expected tag $expected"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
-          name: velostream-browser-packages
-          path: dist/velostream-*.zip
+          name: aethvyr-browser-packages
+          path: dist/aethvyr-*.zip
           if-no-files-found: error
 
   dependencies:

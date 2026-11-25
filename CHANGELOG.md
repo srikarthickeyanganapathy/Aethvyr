@@ -5,6 +5,17 @@ All notable changes are listed here. The format follows
 [Semantic Versioning](https://semver.org/). Feature updates raise the minor version (2.1, 2.2, ...),
 bug-fix-only updates the patch version.
 
+## Unreleased
+
+- Added the Aethvyr toolbar mark, shared celestial palette, updated screenshots and playback demo.
+- Private player sessions now keep bookmarks, local-file records and segment caches in memory. Private exports skip durable checkpoints.
+
+- Streaming retries respect server cooldowns on HTTP 429 and 503, including parallel byte-range downloads.
+
+- Fixed private web-video watch positions appearing in regular history when the extension had private-window access.
+
+- Introduced the Aethvyr display name across the extension and its packages. Existing installs, backups, and account sync use their original identifiers.
+
 ## [2.7.1] - 2026-11-25
 
 - Finalize MP4 exports with the complete duration and an audio/video seek index.

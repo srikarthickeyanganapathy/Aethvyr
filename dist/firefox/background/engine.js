@@ -15,9 +15,10 @@
 
 import '../common/shared.js';
 import { BufferManager, sweepOrphans } from './buffer-manager.js';
+import { PrivateBuffer } from './private-buffer.js';
 import { SegmentDownloader, exportMediaType } from './downloader.js';
 import { checkpoint, downloadStore, validateExportRange } from './download-store.js';
-import { PrefetchBudget } from './resource-policy.js';
+import { cacheShareMB, NetworkBudget, PrefetchBudget } from './resource-policy.js';
 import { ABRController } from './abr-controller.js';
 import { parsePlaylist, ivForSegment, decryptAes128 } from './hls-parser.js';
 import { initSync } from './sync.js';
@@ -54,8 +55,8 @@ const settingsReady = api.storage.local.get(S.SETTINGS_KEY).then(res => {
 api.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !changes[S.SETTINGS_KEY]) return;
     settings = S.mergeSettings(changes[S.SETTINGS_KEY].newValue);
+    distributeCache();
     for (const session of sessions.values()) {
-        session.buffer.setCapacity(settings.cacheSizeMB);
         session.abr.setMaxHeight(session.qualityCap ?? settings.qualityCap);
         session.downloader.schedulePump();
     }
@@ -69,6 +70,23 @@ const tabs = new Map();
 const closedTabs = new Set();
 const activeExports = new Set();
 const sessions = new Map(); // sessionId -> Session
+const networkBudget = new NetworkBudget();
+let diskBudgetMB = Infinity;
+let lastEstimate = -Infinity;
+function distributeCache() {
+    const share = cacheShareMB(settings, sessions.size, diskBudgetMB);
+    for (const session of sessions.values()) session.buffer.setCapacity(share);
+}
+function checkStorage() {
+    if (Date.now() - lastEstimate < 60000 || !globalThis.navigator?.storage?.estimate) return;
+    lastEstimate = Date.now();
+    navigator.storage.estimate().then(({ usage, quota }) => {
+        if (!Number.isFinite(usage) || !Number.isFinite(quota) || quota <= 0) return;
+        const used = [...sessions.values()].reduce((sum, s) => sum + (s.privateTab ? 0 : s.buffer.currentSize), 0);
+        diskBudgetMB = Math.max(0, (quota - usage + used) / 1048576 - 32);
+        distributeCache();
+    }).catch(() => {});
+}
 const prefetchBudget = new PrefetchBudget(8, () => {
     for (const session of sessions.values()) session.downloader.schedulePump();
 });
@@ -516,6 +534,14 @@ const captureReady = api.storage.session.get(CAPTURE_KEY).then(res => {
     }
 }).catch(() => { });
 let captureTimer;
+const tabPrivacy = new Map();
+function isPrivateTab(tabId) {
+    if (!tabPrivacy.has(tabId)) {
+        // A closing or inaccessible tab must never contribute to the regular capture cache.
+        tabPrivacy.set(tabId, api.tabs.get(tabId).then(tab => !!tab.incognito, () => true));
+    }
+    return tabPrivacy.get(tabId);
+}
 
 function pickFrameId(tab, stream) {
     if (stream && stream.frameId >= 0) return stream.frameId;
@@ -877,12 +903,13 @@ const pageOnlyHosts = new Map();
  *     (page cookies / session) and remember that this host needs it.
  */
 function makeTransport(tabId, getStream) {
-    return async (url, opts) => {
+    return (url, opts) => networkBudget.run(url, opts.signal, async () => {
         // No create: a late request for a closed tab must not resurrect its state.
         const tab = await getTab(tabId, { create: false });
         const stream = getStream();
         const frameId = pickFrameId(tab, stream);
         const frameUrl = (stream && stream.frameUrl) || '';
+        if (await isPrivateTab(tabId)) return proxyViaFrame(tabId, frameId, url, opts);
         await captureReady;
         // Replay auth/token headers the site's player used for this host (Range stays ours).
         // Only headers captured from the same site as the stream's frame (never another site's).
@@ -934,7 +961,7 @@ function makeTransport(tabId, getStream) {
             if (err.name === 'AbortError' || !err.proxyUnavailable) throw err;
             return directFetch(url, opts, frameUrl); // frame gone: last resort
         }
-    };
+    });
 }
 
 // ============================================================================
@@ -1001,12 +1028,13 @@ async function probeStream(tab, stream) {
 // ============================================================================
 // WEBREQUEST: header capture + network-level detection (sees worker/native requests too)
 // ============================================================================
-function rememberReferer(details) {
+async function rememberReferer(details) {
     // Our own player iframe's requests come from the extension origin: never learn from those.
     if (details.tabId < 0) return;
     if (EXT_HOST && ((details.initiator && details.initiator.includes(EXT_HOST)) || (details.originUrl && details.originUrl.includes(EXT_HOST)))) return;
     // Any data request may be an extension-less manifest; the capture map is capped (LRU).
     if (!S.classifyStream(details.url) && !['xmlhttprequest', 'media', 'other'].includes(details.type)) return;
+    if (await isPrivateTab(details.tabId)) return;
     let host;
     try { host = new URL(details.url).hostname; } catch (_) { return; }
     const info = { headers: {}, at: Date.now() };
@@ -1136,7 +1164,8 @@ async function restoreSessionState(session) {
 }
 
 class Session {
-    constructor({ id, tabId, stream }) {
+    constructor({ id, tabId, stream, privateTab }) {
+        this.privateTab = privateTab;
         this.id = id;
         this.tabId = tabId;
         this.stream = stream;
@@ -1150,7 +1179,7 @@ class Session {
         this.closing = false;
         this.disconnectTimer = null;
 
-        this.buffer = new BufferManager(tabId, id, {
+        this.buffer = privateTab ? new PrivateBuffer(settings.cacheSizeMB) : new BufferManager(tabId, id, {
             capBytes: settings.cacheSizeMB * 1024 * 1024,
             isProtected: key => this.downloader.isProtected(key)
         });
@@ -1173,7 +1202,8 @@ class Session {
             abr: this.abr,
             getSettings: () => settings,
             sessionCount: () => [...sessions.values()].filter(session => session.port && !session.downloader.paused).length,
-            takePrefetchSlot: () => prefetchBudget.take()
+            takePrefetchSlot: () => prefetchBudget.take(),
+            prioritizeSeek: () => prefetchBudget.prioritizeSeek()
         });
         // Observe every playlist the downloader learns (player manifest loads go through
         // downloader.load -> ingestPlaylist) so it can be re-taught after a worker restart.
@@ -1204,7 +1234,7 @@ class Session {
         this.activeVariantId = null;
         this.setupPipeline();
         this.persistState({ soon: true });
-        if (stream.type === 'progressive') await ensureRefererRule(stream.url, stream.frameUrl || '').catch(() => { });
+        if (!this.privateTab && stream.type === 'progressive') await ensureRefererRule(stream.url, stream.frameUrl || '').catch(() => { });
     }
 
     notePlaylist(url, text, parsed) {
@@ -1330,6 +1360,7 @@ async function endSession(session, { clearCache = true, restoreMedia = true } = 
     if (!sessions.has(session.id)) return;
     session.closing = true;
     sessions.delete(session.id);
+    distributeCache();
     session.destroy();
     removeSessionState(session.id);
     if (clearCache) await session.buffer.clearStream().catch(() => { });
@@ -1362,7 +1393,7 @@ async function handleRequest(session, msg) {
             headers: msg.headers || {},
             kind: msg.kind || 'segment',
             signal: controller.signal,
-            zeroCopy: !!msg.zeroCopy
+            zeroCopy: !!msg.zeroCopy && !session.privateTab
         });
         if (controller.signal.aborted) return;
         session.post({
@@ -1539,7 +1570,7 @@ async function runExport(session, opts = {}, saved = null) {
         const base = saved?.base || fileBaseName(session.stream, opts.title);
         const progressive = session.stream.type === 'progressive';
         const parts = saved?.parts || exportParts(session, opts, base);
-        if (!job && !opts.clip) {
+        if (!job && !opts.clip && !session.privateTab) {
             job = { id: jobId, stream: session.stream, tabId: session.tabId, cacheSessionId: session.id, base, parts, format,
                 totalSegments: parts.reduce((count, part) => count + part.segs.length, 0),
                 qualityUrl: parts[0]?.url || session.stream.url,
@@ -1560,7 +1591,7 @@ async function runExport(session, opts = {}, saved = null) {
         }
         post({ type: 'EXPORT_COMPLETE' });
     } catch (err) {
-        post({ type: 'EXPORT_ERROR', error: err.name === 'AbortError' ? (opts.clip ? 'Clip export cancelled' : 'Download paused. Resume from Offline / Cached.') : String(err.message || err) });
+        post({ type: 'EXPORT_ERROR', error: err.name === 'AbortError' ? (job ? 'Download paused. Resume from Offline / Cached.' : 'Export cancelled') : String(err.message || err) });
     } finally {
         controller.abort();
         activeExports.delete(jobId);
@@ -1754,7 +1785,7 @@ function connectVaultExport(port) {
         session.stream = job.stream;
         session.downloader = live?.downloader || new SegmentDownloader({
             transport: originalTab ? makeTransport(job.tabId, () => job.stream) :
-                (url, opts) => directFetch(url, opts, job.stream.frameUrl || ''),
+                (url, opts) => networkBudget.run(url, opts.signal, () => directFetch(url, opts, job.stream.frameUrl || '')),
             buffer: originalTab && job.cacheSessionId ? new BufferManager(job.tabId, job.cacheSessionId) : { getSegment: async () => null },
             abr: new ABRController(),
             getSettings: () => settings
@@ -1838,8 +1869,10 @@ api.runtime.onConnect.addListener((port) => {
                     port.postMessage({ type: 'FATAL', error: 'Stream session not found. Re-open the player from the popup.' });
                     return;
                 }
-                session = new Session({ id: msg.sessionId, tabId, stream });
+                session = new Session({ id: msg.sessionId, tabId, stream, privateTab: !!port.sender.tab?.incognito });
                 sessions.set(session.id, session);
+                distributeCache();
+                checkStorage();
                 tab.playerSessionId = session.id;
                 persistTab(tabId);
                 // Worker restart: re-teach the downloader the playlists Shaka already holds.
@@ -1859,7 +1892,7 @@ api.runtime.onConnect.addListener((port) => {
             session.port = port;
             // Direct media files are loaded by the player page's <video>: give those requests
             // the site's Referer/Origin so hot-link protection accepts them.
-            if (session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
+            if (!session.privateTab && session.stream.type === 'progressive') await ensureRefererRule(session.stream.url, session.stream.frameUrl || '');
             const pageUrl = await api.tabs.get(tabId).then(t => (t && t.url) || '', () => '');
             if (disconnected || session.closing || session.port !== port) return;
             tab.pageUrl ||= pageUrl;
@@ -1882,7 +1915,9 @@ api.runtime.onConnect.addListener((port) => {
                 break;
             }
             case 'TELEMETRY': {
+                checkStorage();
                 session.telemetry = {
+                    hidden: !!msg.hidden,
                     currentTime: +msg.currentTime || 0,
                     bufferAhead: +msg.bufferAhead || 0,
                     paused: !!msg.paused,
@@ -2005,6 +2040,7 @@ api.runtime.onConnect.addListener((port) => {
                 if (session.exportJob) session.exportJob.controller.abort();
                 break;
             case 'STORE_SET':
+                if (session.privateTab) break;
                 if (/^fs_bm_[\w-]{1,64}$/.test(msg.key || '') && Array.isArray(msg.value)) {
                     await writeStorage(() => api.storage.local.set({ [msg.key]: msg.value }));
                 }
@@ -2341,6 +2377,11 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return respondAsync(openLibraryResume(message), sendResponse);
         case 'HISTORY_SAVE':
             if (!sender.url?.startsWith(api.runtime.getURL('player/player.html'))) return false;
+            // Private tabs share extension storage with ordinary tabs in spanning mode.
+            if (sender.tab?.incognito || api.extension?.inIncognitoContext) {
+                sendResponse({ ok: true, persisted: false });
+                return false;
+            }
             return respondAsync(Promise.resolve().then(() => saveHistoryEntry(message)), sendResponse);
         case 'LIBRARY_WRITE':
             if (!sender.url?.startsWith(api.runtime.getURL('popup/library.html'))) return false;
@@ -2410,7 +2451,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case 'OPEN_LOCAL_PLAYER':
             if (sender.url !== api.runtime.getURL('popup/popup.html') || !Number.isInteger(message.tabId)) return false;
             return respondAsync((async () => {
-                if (!await pingFrame(message.tabId, 0)) throw new Error('Open a website tab to use the Velostream overlay.');
+                if (!await pingFrame(message.tabId, 0)) throw new Error('Open a website tab to use the Aethvyr overlay.');
                 return api.tabs.sendMessage(message.tabId, { action: 'MOUNT_LOCAL_PLAYER' }, { frameId: 0 });
             })(), sendResponse);
         case 'LAUNCH_URL':
@@ -2478,6 +2519,7 @@ async function teardownTab(tabId, { keepPlayer = false, removed = false } = {}) 
 }
 
 api.tabs.onRemoved.addListener((tabId) => {
+    tabPrivacy.delete(tabId);
     closedTabs.add(tabId);
     if (closedTabs.size > 256) closedTabs.delete(closedTabs.values().next().value);
     clearLibraryResume(tabId);

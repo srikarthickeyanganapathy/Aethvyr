@@ -2,6 +2,16 @@
     'use strict';
 
     let opening;
+    if (globalThis.VelostreamShared?.api.extension?.inIncognitoContext) {
+        const files = new Map();
+        globalThis.VelostreamLocal = Object.freeze({
+            list: async () => [...files.values()],
+            get: async id => files.get(id),
+            save: async entry => { files.set(entry.id, entry); },
+            remove: async id => { files.delete(id); }
+        });
+        return;
+    }
     async function request(mode, action) {
         opening ||= new Promise((resolve, reject) => {
             const open = indexedDB.open('VelostreamLocal', 1);

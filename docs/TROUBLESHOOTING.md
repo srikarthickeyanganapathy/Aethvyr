@@ -7,39 +7,39 @@ Include that line when you report a problem.
 ## Nothing is detected
 
 1. Start the video in the site's own player once, then press **Rescan** in the popup.
-2. Reload the page after installing or updating Velostream; pages opened before do not have its
+2. Reload the page after installing or updating Aethvyr; pages opened before do not have its
    scripts.
 3. On Firefox, check that site access is granted (**Allow access to websites** in the popup).
 4. If the popup says the site uses **DRM** or a **proprietary player**, see below. Some sites
-   (YouTube, for example) feed video through their own MSE pipeline with no manifest Velostream
+   (YouTube, for example) feed video through their own MSE pipeline with no manifest Aethvyr
    could open.
 
 ## Error codes
 
 | Code | Meaning | What to do |
 |------|---------|------------|
-| **1001** HTTP 401 / 403 / 410 | The server refused the link. Usually the site **signs video links** and the signature expired, or it was single-use. | Velostream first switches to a newer link if the page requested one. Otherwise reload the page and open the player again. |
+| **1001** HTTP 401 / 403 / 410 | The server refused the link. Usually the site **signs video links** and the signature expired, or it was single-use. | Aethvyr first switches to a newer link if the page requested one. Otherwise reload the page and open the player again. |
 | **1001** HTTP 404 | The file is gone (the episode or server changed). | Reload the page; pick another server on the site. |
-| **1001** HTTP 5xx / 429 | Server overload. | Velostream retries automatically twice a minute; press Retry later. |
-| **1002** | A request failed outright (connection reset, DNS, TLS, blocked). The message names the server and the reason. | Check your connection. If the reason says *blocked* (`ERR_BLOCKED_BY_CLIENT`), allow that server in your ad or content blocker. Velostream already retries silently and resends requests after its background worker restarts. |
+| **1001** HTTP 5xx / 429 | Server overload. | Aethvyr retries automatically twice a minute; press Retry later. |
+| **1002** | A request failed outright (connection reset, DNS, TLS, blocked). The message names the server and the reason. | Check your connection. If the reason says *blocked* (`ERR_BLOCKED_BY_CLIENT`), allow that server in your ad or content blocker. Aethvyr already retries silently and resends requests after its background worker restarts. |
 | **1003** | Timed out. | Slow server or network; Retry. |
 | **3016**, **4032**, **4012**, **4001** | The browser cannot decode the codec (for example HEVC/AV1 without hardware support, or AC-3 audio). | Try a lower quality, another browser, or *Open in external player*. |
-| **3017** | The player ran out of memory for its buffer (common on phones). | Velostream shrinks the buffer automatically. Lower *Player RAM buffer* in Studio → Quality. |
+| **3017** | The player ran out of memory for its buffer (common on phones). | Aethvyr shrinks the buffer automatically. Lower *Player RAM buffer* in Studio → Quality. |
 | **4000**, **4030** | The manifest could not be parsed. | Usually not a real video playlist (an ad or tracking URL). Pick another stream. |
 | **6xxx** | DRM. | See below. |
 
 ## DRM-protected video
 
 Widevine, PlayReady and FairPlay streams can only be decrypted by the site's own player inside
-the browser's protected media path. Velostream detects them (the popup shows a DRM badge, and the
+the browser's protected media path. Aethvyr detects them (the popup shows a DRM badge, and the
 player explains it) and cannot play or save them. This is by design and will not change.
 
 ## Full screen does not work
 
 - Browsers only allow full screen right after a click or key press **inside the player**. Use the
-  full-screen button or <kbd>F</kbd>. If Velostream is asked without such a gesture (for example
+  full-screen button or <kbd>F</kbd>. If Aethvyr is asked without such a gesture (for example
   *Auto full screen* triggered by Shift or Ctrl alone), it waits for the next real one.
-- If the site embeds its player in an iframe that does not allow full screen, Velostream fills the
+- If the site embeds its player in an iframe that does not allow full screen, Aethvyr fills the
   browser window instead. Press <kbd>F11</kbd> for true full screen.
 - The console message *"Failed to execute 'requestFullscreen'… can only be initiated by a user
   gesture"* comes from the browser itself and is harmless.
@@ -76,4 +76,4 @@ player explains it) and cannot play or save them. This is by design and will not
 ## Resetting
 
 Popup → Settings → **Reset all settings**, or remove and reinstall the extension. Clearing site data does not
-reset Velostream; its settings live in the extension's own storage.
+reset Aethvyr; its settings live in the extension's own storage.

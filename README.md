@@ -1,8 +1,10 @@
 <div align="center">
 
-<img src="icons/icon-128.png" width="96" height="96" alt="Velostream logo">
+<img src="icons/icon-128.png" width="96" height="96" alt="">
 
-# Velostream
+# Aethvyr
+
+*Experience the unseen.*
 
 **A privacy-first video player for the web with adaptive buffering, optional GPU enhancement, and a personal library.**
 
@@ -12,15 +14,17 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
 [Features](#features) · [Install](#install) · [Usage](#usage) · [Docs](#documentation) ·
-[Build from source](#build-from-source) · [Roadmap](docs/ROADMAP.md) · [Privacy](PRIVACY.md) · [Contributing](CONTRIBUTING.md)
+[Build from source](#build-from-source) · [Foundation audit](docs/FOUNDATION.md) · [Roadmap](docs/ROADMAP.md) · [Privacy](PRIVACY.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
 ---
 
+[Watch the desktop playback demo](docs/media/playback-demo.webm)
+
 ## What it does
 
-Open a detected web stream or drop a local video into the same Velostream player. Your usual
+Open a detected web stream or drop a local video into the same Aethvyr player. Your usual
 controls stay close, with advanced tools in Studio.
 
 - **Adaptive buffering** adjusts prefetch workers to the stream and shares a background connection budget across tabs.
@@ -28,18 +32,18 @@ controls stay close, with advanced tools in Studio.
 - **Personal library** brings together Continue Watching, collections, bookmarks, and categories for anime, donghua, cartoons, movies, and series.
 - **Offline / Cached** keeps export progress so interrupted downloads can resume from committed chunks.
 
-Everything runs locally in your browser. Velostream has no servers, no accounts, no analytics and
+Everything runs locally in your browser. Aethvyr has no servers, no accounts, no analytics and
 no remote code. See [PRIVACY.md](PRIVACY.md).
 
-![Velostream in Firefox playing a local demo with Studio open on Save playback diagnostics](docs/media/playback-diagnostics.png)
+![Aethvyr in Edge playing a local test pattern with Studio open on Save playback diagnostics](docs/media/playback-diagnostics.png)
 
-*Firefox screenshot captured with a generated local test clip.*
+*Edge screenshot captured with a generated local test clip.*
 
 ## Try it in a minute
 
 | What you want to do | Where to find it |
 | --- | --- |
-| Watch a website video | Start the site video and choose **Play in Velostream** or select the stream in the popup. |
+| Watch a website video | Start the site video and choose **Play in Aethvyr** or select the stream in the popup. |
 | Watch a local file | Choose **Open Local File** in the popup on a website tab, or drop the file into the overlay. |
 | Improve picture or audio | Open **Studio → Display → Graphics** or **Studio → Audio**. |
 | Find captions, a transcript, or a chapter | Open the captions button for tracks and transcripts. Open **Studio → Tools** for chapters. |
@@ -49,7 +53,7 @@ no remote code. See [PRIVACY.md](PRIVACY.md).
 <details>
 <summary>See the in-extension Feature Guide</summary>
 
-![Firefox screenshot of the Velostream Feature Guide](docs/media/feature-guide.png)
+![Aethvyr Feature Guide in Microsoft Edge](docs/media/feature-guide.png)
 
 </details>
 
@@ -75,6 +79,8 @@ The full tour is in **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)**.
 
 ## Install
 
+The versions below are manifest targets. Desktop verification covers playback and in-place upgrades on Edge 158 and upgrade and private-history checks on Firefox 160. Android and the minimum-version targets still need device testing.
+
 | Browser | How |
 |---------|-----|
 | Chrome, Edge, Brave, Kiwi (Chromium 111+) | Chrome Web Store *(link added on release)*, or load `dist/chrome` unpacked (see below) |
@@ -85,17 +91,17 @@ choose `dist/chrome`.
 
 **Temporary add-on (Firefox):** `about:debugging#/runtime/this-firefox` → *Load Temporary Add-on…*
 → choose `dist/firefox/manifest.json`. Firefox asks you to grant site access for MV3 add-ons: use
-**Allow access to websites** in the Velostream popup.
+**Allow access to websites** in the Aethvyr popup.
 
 ## Usage
 
 1. Open a page with a video and start it once if it does not autoplay.
-2. Click the **"Play in Velostream"** pill on the video, or open the toolbar popup and pick a stream.
+2. Click the **"Play in Aethvyr"** pill on the video, or open the toolbar popup and pick a stream.
 3. The player opens over the site's video. Press <kbd>?</kbd> for all shortcuts and open
    **Studio** (the sliders button) for quality, audio, display, tools and preferences.
 4. **Close** restores the site's own player.
 
-Want a site to always open in Velostream? Turn on **Always play in Velostream** for that site in the popup.
+Want a site to always open in Aethvyr? Turn on **Always play in Aethvyr** for that site in the popup.
 
 ## Documentation
 
@@ -119,7 +125,7 @@ npm ci               # install the locked dependencies
 npm run build        # dist/chrome and dist/firefox
 npm run lint         # ESLint
 npm test             # regression suite
-npm run package      # store zips: dist/velostream-<browser>-<version>.zip
+npm run package      # store zips: dist/aethvyr-<browser>-<version>.zip
 ```
 
 Other scripts: `npm run build:chrome`, `npm run build:firefox`, `npm run watch` (rebuild on save).
@@ -129,7 +135,7 @@ browser-specific manifest. Details in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 ## Project layout
 
 ```
-Velostream/   (repository root)
+./   (repository root)
 ├── manifest.json            MV3 manifest (the build derives the Chrome and Firefox variants)
 ├── background/              Service worker / event page: the engine
 │   ├── engine.js            detection, sessions, launch, transport, export, message router
@@ -153,20 +159,20 @@ Velostream/   (repository root)
 
 ## Limitations
 
-- **DRM** (Widevine, PlayReady, FairPlay) cannot be played or saved. Velostream detects it and says
+- **DRM** (Widevine, PlayReady, FairPlay) cannot be played or saved. Aethvyr detects it and says
   so instead of failing silently. YouTube and most paid services fall in this group.
-- **Signed links expire.** Many sites sign stream URLs for minutes. Velostream switches to a newer
+- **Signed links expire.** Many sites sign stream URLs for minutes. Aethvyr switches to a newer
   link when the page requests one; otherwise reload the page and open the player again.
 - **DASH download** covers on-demand streams: MP4 DASH becomes one `.mp4`; WebM (VP9) DASH is saved
   as the original video and audio files. Live DASH cannot be saved.
-- A site's **Content Security Policy** or a sandboxed embed can forbid full screen; Velostream then
+- A site's **Content Security Policy** or a sandboxed embed can forbid full screen; Aethvyr then
   fills the browser window instead.
 - **GPU enhancement** needs WebGL2 and cannot read cross-origin direct files served without CORS.
 
 ## Responsible use
 
-Velostream is a player and a personal download tool. Only download content you have the right to
-keep, and respect each site's terms of service and your local copyright law. Velostream does not
+Aethvyr is a player and a personal download tool. Only download content you have the right to
+keep, and respect each site's terms of service and your local copyright law. Aethvyr does not
 circumvent DRM and never will.
 
 ## License

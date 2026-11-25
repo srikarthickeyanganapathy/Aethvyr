@@ -28,14 +28,14 @@
     const VIEWS = {
         local: { title: 'Local files', empty: 'No saved local files.' },
         offline: { title: 'Offline / Cached', empty: 'No cached downloads.' },
-        anime: { title: 'Anime', empty: 'Anime appears here after you play it in Velostream.' },
-        donghua: { title: 'Donghua', empty: 'Chinese animation appears here after you play it in Velostream.' },
-        cartoon: { title: 'Cartoons', empty: 'Cartoons appear here after you play them in Velostream.' },
+        anime: { title: 'Anime', empty: 'Anime appears here after you play it in Aethvyr.' },
+        donghua: { title: 'Donghua', empty: 'Chinese animation appears here after you play it in Aethvyr.' },
+        cartoon: { title: 'Cartoons', empty: 'Cartoons appear here after you play them in Aethvyr.' },
         video: { title: 'Other videos', empty: 'Clips and unclassified titles appear here.' },
         series: { title: 'Series', empty: 'Series appear here as you watch episodes.' },
         movies: { title: 'Movies', empty: 'Movies appear here as you watch them.' },
         continue: { title: 'Continue watching', empty: 'Nothing in progress. Videos you stop partway through show up here so you can pick up where you left off.' },
-        recent: { title: 'Recently watched', empty: 'No watch history yet. Play a video in Velostream and it appears here with its position.' },
+        recent: { title: 'Recently watched', empty: 'No watch history yet. Play a video in Aethvyr and it appears here with its position.' },
         favorites: { title: 'Favorites', empty: 'No favorites yet. Select the star on any video to keep it here.' },
         collections: { title: 'Collections', empty: 'No collections yet. Create one above, then use “Collections” on any video to add it.' },
         bookmarked: { title: 'Bookmarked', empty: 'No bookmarks yet. While watching, add bookmarks from the player’s menu and they are listed here.' }
@@ -376,7 +376,7 @@
                     ? `<li><a class="bm-link" href="${esc(timedLink(item.target, b.t, !item.page))}" target="_blank" rel="noopener noreferrer" ${ctl('bm-open', scope, item.key, { i })} aria-label="${esc(fmtTime(b.t))}, ${label}: open ${item.page ? 'website' : 'direct stream'} at this time"><span class="num bm-t">${fmtTime(b.t)}</span><span class="bm-label">${label}</span></a></li>`
                     : `<li><span class="bm-link is-static"><span class="num bm-t">${fmtTime(b.t)}</span><span class="bm-label">${label}</span></span></li>`;
             }).join('');
-            bmsPanel = `<div class="vc-panel" id="p${n}b"><p class="muted vc-note">Bookmarks open the website and start Velostream at the saved time.</p><ol class="bm-list" aria-label="Bookmarks in ${t}">${rows}</ol></div>`;
+            bmsPanel = `<div class="vc-panel" id="p${n}b"><p class="muted vc-note">Bookmarks open the website and start Aethvyr at the saved time.</p><ol class="bm-list" aria-label="Bookmarks in ${t}">${rows}</ol></div>`;
         }
 
         const colNote = memberOf.length ? ` · <span class="vc-cols">${esc(memberOf.map(c => c.name).join(', '))}</span>` : '';
@@ -887,7 +887,7 @@
         const label = local ? 'Remove' : 'Delete';
         const confirm = await ask({
             title: `${label} ${item.name}?`, okLabel: label, danger: true,
-            text: local ? 'The original file stays on your device.' : 'Velostream will delete the cached bytes and saved download progress.'
+            text: local ? 'The original file stays on your device.' : 'Aethvyr will delete the cached bytes and saved download progress.'
         });
         if (!confirm.ok) return;
         button.disabled = true;
@@ -916,7 +916,7 @@
         document.querySelectorAll('.lib-tabs a').forEach(a => {
             if (a.dataset.view === view) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
         });
-        document.title = `${VIEWS[view].title} · Velostream Library`;
+        document.title = `${VIEWS[view].title} · Aethvyr Library`;
         render();
         reloadDeviceItems();
         if (fromUser) announce(VIEWS[view].title);
@@ -969,7 +969,7 @@
     // Init
     // -------------------------------------------------------------------
     document.addEventListener('DOMContentLoaded', async () => {
-        try { $('version').textContent = `Velostream v${api.runtime.getManifest().version}`; } catch (_) { /* no manifest */ }
+        try { $('version').textContent = `Aethvyr v${api.runtime.getManifest().version}`; } catch (_) { /* no manifest */ }
 
         const res = await api.storage.local.get(null);
         for (const [k, v] of Object.entries(res)) if (k.startsWith(SERIES_PREFIX) && SERIES_STATUS.includes(v)) seriesStatuses.set(k, v);

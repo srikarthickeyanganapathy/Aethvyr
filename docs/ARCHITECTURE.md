@@ -1,6 +1,6 @@
 # Architecture
 
-Velostream is a Manifest V3 extension with three execution contexts that cooperate through
+Aethvyr is a Manifest V3 extension with three execution contexts that cooperate through
 messages: **content scripts** in every frame detect streams and act on the page's behalf, the
 **engine** (service worker on Chromium, event page on Firefox) owns detection state, downloading
 and caching, and the **player** is an extension page mounted as an iframe over the site's video.
@@ -53,7 +53,7 @@ It communicates only through `window.postMessage` with tagged messages; it has n
 - Scans the DOM for `<video>`/`<source>`, `<track>` elements and in-memory text tracks (serialized
   to VTT), and listens in the capture phase for `loadedmetadata`/`playing` to know which video is
   live.
-- Draws the on-page **Play in Velostream** pill.
+- Draws the on-page **Play in Aethvyr** pill.
 - **Mounts the player:** creates the `player/player.html` iframe absolutely positioned over the
   chosen `<video>` (or full-page), tracks scroll/resize, and handles layout commands from the
   player (mini player, drag/resize, viewport fill, close). The site's media is paused and muted
@@ -72,7 +72,7 @@ restart does not lose detected streams.
   and encryption info in the popup.
 - **Launch:** picks the frame (the one the user clicked in → the frame that requested the stream →
   any frame with a video → top frame in full-page mode), makes sure the content script is present,
-  and sends `MOUNT_PLAYER`. *Always play in Velostream* (`maybeAutoLaunch`) waits 600 ms so the
+  and sends `MOUNT_PLAYER`. *Always play in Aethvyr* (`maybeAutoLaunch`) waits 600 ms so the
   master playlist wins over its variants.
 - **Sessions:** one per open player, holding the stream, a `SegmentDownloader`, an
   `ABRController` and a `BufferManager`.
@@ -95,7 +95,7 @@ restart does not lose detected streams.
 
 ### `background/abr-controller.js`
 
-Velostream turns Shaka's ABR off and decides itself, because the engine sees the real network
+Aethvyr turns Shaka's ABR off and decides itself, because the engine sees the real network
 throughput, including prefetch. Decisions combine a throughput estimate with buffer level and
 respect the quality cap and any locked quality. Switches are sent to the player as
 `ABR_SWITCH`.

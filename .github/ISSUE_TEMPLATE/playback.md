@@ -1,6 +1,6 @@
 ---
 name: Playback or extension bug
-about: Report a reproducible Velostream problem
+about: Report a reproducible Aethvyr problem
 ---
 
 **What happened?**
@@ -9,7 +9,7 @@ about: Report a reproducible Velostream problem
 
 **Expected result**
 
-**Browser, operating system, and Velostream version**
+**Browser, operating system, and Aethvyr version**
 
 **Playback diagnostics**
 

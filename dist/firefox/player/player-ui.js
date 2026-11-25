@@ -26,13 +26,7 @@
     const SEEK_STEPS = [5, 10, 15, 30];
     const SKIP_STEPS = [30, 60, 85, 90];
     const SLEEP_OPTIONS = [[0, 'Off'], [15, '15 minutes'], [30, '30 minutes'], [45, '45 minutes'], [60, '60 minutes'], ['eov', 'End of video']];
-    const ACCENTS = {
-        blue: { label: 'System Blue', fill: '#0A84FF', strong: '#0058D0' },
-        green: { label: 'Green', fill: '#30D158', strong: '#1E7A36' },
-        indigo: { label: 'Indigo', fill: '#5E5CE6', strong: '#4643C9' },
-        amber: { label: 'Amber', fill: '#FF9F0A', strong: '#9A5B00' },
-        rose: { label: 'Rose', fill: '#FF375F', strong: '#C21E45' }
-    };
+    const ACCENTS = window.VelostreamShared.ACCENTS;
     const UI_SCALES = [[0.85, '85%'], [1, '100%'], [1.25, '125%'], [1.5, '150%']];
     const AUTOHIDE = [[2000, '2 seconds'], [3000, '3 seconds'], [5000, '5 seconds'], [0, 'Never']];
     const EXTERNAL_APPS = [['potplayer', 'PotPlayer', 'Windows'], ['vlc', 'VLC', 'needs vlc:// handler on desktop'], ['mpv', 'mpv', 'needs mpv:// handler'], ['iina', 'IINA', 'macOS'], ['android', 'Android video app', 'MX Player, VLC…']];
@@ -1141,7 +1135,7 @@
             let domain = '';
             try { domain = new URL(this.stream.url).hostname; } catch (_) { domain = location.hostname; }
             this.$('.domain').textContent = domain;
-            this.root.setAttribute('aria-label', `Velostream player: ${title}`);
+            this.root.setAttribute('aria-label', `Aethvyr player: ${title}`);
             this.applySettings();
             if (this.hostApi.local) {
                 this.setStatus('paused');
@@ -1333,7 +1327,7 @@
         async importBackup(file) {
             const S = window.VelostreamShared;
             if (!extApi || !S || !S.restoreBackup) { this.announce('Restore is not available here', 'warn'); return; }
-            if (file.size > 5 * 1024 * 1024) { this.announce('That file is too large to be a Velostream backup', 'warn'); return; }
+            if (file.size > 5 * 1024 * 1024) { this.announce('That file is too large to be an Aethvyr backup', 'warn'); return; }
             try {
                 // Drop unsent edits: the backup replaces the settings they were made against.
                 clearTimeout(this.saveTimer);
@@ -1875,7 +1869,7 @@
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <filter id="fs-sharpen"><feConvolveMatrix id="fs-kernel" order="3" kernelMatrix="0 0 0 0 1 0 0 0 0" preserveAlpha="true"/></filter>
 </svg>
-<div class="root" role="dialog" aria-modal="true" aria-label="Velostream player" tabindex="-1" data-rm="system">
+<div class="root" role="dialog" aria-modal="true" aria-label="Aethvyr player" tabindex="-1" data-rm="system">
   <div class="stage">
     <canvas class="ambient-canvas" width="32" height="18" aria-hidden="true"></canvas>
     <div class="vbox"><video playsinline webkit-playsinline preload="auto" aria-label="Video"></video><canvas class="gl-canvas" hidden aria-hidden="true"></canvas></div>
@@ -1912,7 +1906,7 @@
       <div class="pill-left glass">
         <button type="button" class="ib btn-close" aria-label="Close player">${icon('close', 18)}</button>
         <span class="vdiv" aria-hidden="true"></span>
-        <div class="titles"><span class="title">Velostream</span><span class="domain"></span></div>
+        <div class="titles"><span class="title">Aethvyr</span><span class="domain"></span></div>
         <span class="chip abr num" aria-hidden="true" hidden></span>
         <span class="chip sleep-chip num" hidden>${icon('moon')}<span></span></span>
       </div>
@@ -2485,7 +2479,7 @@
                 this.probeStatus(this.stream.url).then(status => {
                     if (status === 401 || status === 403) {
                         this.diagnostics.errors.httpStatus = status;
-                        this.showError('Access denied', `The server refused the file (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Velostream again.`);
+                        this.showError('Access denied', `The server refused the file (HTTP ${status}). The link may have expired. Reload the page, start the video there briefly, then open Aethvyr again.`);
                     } else if (status >= 400) {
                         this.diagnostics.errors.httpStatus = status;
                         this.showError('Cannot load this file', `The server returned HTTP ${status}.`);
@@ -3123,13 +3117,13 @@
             let msg = `Error code ${code}.`;
             if (code === 1001) {
                 msg = status === 403 || status === 401 || status === 410
-                    ? `The server${from} refused access (HTTP ${status}). Sites like this sign their video links and the signature expires after a while. Reload the page and open Velostream again to get a fresh link.`
+                    ? `The server${from} refused access (HTTP ${status}). Sites like this sign their video links and the signature expires after a while. Reload the page and open Aethvyr again to get a fresh link.`
                     : `The server${from} returned HTTP ${status}.`;
             } else if (code === 1002 || code === 1003) {
                 msg = `${code === 1003 ? 'Timed out' : 'Network error'} while loading the stream${from}${reason ? ` (${reason})` : ''}. Check your connection, or that an ad or content blocker is not blocking ${host || 'the video server'}, then retry.`;
             } else if (code >= 6000 && code < 7000 || (this.drmInfo && (code === 3016 || code === 4032))) {
                 const ks = this.drmInfo && this.drmInfo.keySystem ? ` (${this.drmInfo.keySystem.replace(/^com\./, '')})` : '';
-                msg = `This stream is protected by DRM${ks} and can only be decrypted by the website's own player. Close Velostream to keep watching there, or use Studio › Tools › Open in external player for non-DRM copies.`;
+                msg = `This stream is protected by DRM${ks} and can only be decrypted by the website's own player. Close Aethvyr to keep watching there, or use Studio › Tools › Open in external player for non-DRM copies.`;
             } else if (code === 4032 || code === 4012 || code === 3016 || code === 4001) {
                 msg = 'This browser cannot decode the stream\'s format or codecs.';
             } else if (code === 4000 || code === 4030) {
@@ -3511,6 +3505,7 @@
             const chosen = this.gpuOverride || this.settings.shader || 'off';
             const mobile = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 700;
             if (chosen === 'auto') {
+                if (this.settings.resourceProfile === 'eco') return { preset: 'off', strength: 0 };
                 const hardware = this.graphicsHardware ||= this.detectHardwareTier();
                 if (!hardware.webgl || /SwiftShader|llvmpipe|Microsoft Basic Render/i.test(hardware.renderer)) return { preset: 'off', strength: 0 };
                 const budget = window.VelostreamShared.graphicsBudget(hardware.tier, mobile, this.video.videoHeight);
@@ -3926,7 +3921,7 @@
                 ctx.getImageData(0, 0, 1, 1); // throws now (not inside toBlob) on a tainted canvas
                 c.toBlob(blob => {
                     if (!blob) { this.announce('Screenshot failed', 'warn'); return; }
-                    downloadBlob(this.shadow, blob, `velostream-${fmtTime(v.currentTime).replace(/:/g, '-')}${withSubs ? '-subs' : ''}.png`, false);
+                    downloadBlob(this.shadow, blob, `aethvyr-${fmtTime(v.currentTime).replace(/:/g, '-')}${withSubs ? '-subs' : ''}.png`, false);
                     this.announce(withSubs ? 'Screenshot with subtitles saved' : 'Screenshot saved', 'camera');
                 }, 'image/png');
             } catch (e) {
@@ -4027,7 +4022,7 @@
                 }
                 const blob = await new Promise(res => c.toBlob(res, 'image/png'));
                 if (!blob) throw new Error('encode failed');
-                downloadBlob(this.shadow, blob, `velostream-burst-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`, false);
+                downloadBlob(this.shadow, blob, `aethvyr-burst-${fmtTime(v.currentTime).replace(/:/g, '-')}.png`, false);
                 this.announce('Burst contact sheet saved', 'burst');
             } catch (e) {
                 this.announce('Burst blocked: cross-origin video without CORS', 'warn');
@@ -4722,7 +4717,7 @@
         sendTelemetry(withVariants) {
             if (this.localPlayback) return;
             const v = this.video;
-            const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
+            const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, hidden: document.hidden && !document.pictureInPictureElement, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
             if (this.player && this.mode === 'mse') {
                 const tracks = this.currentVariants();
                 const active = tracks.find(t => t.active);
@@ -5089,12 +5084,13 @@
                 playback: { startupMs: d.startupMs, positionSeconds: v.currentTime, bufferSeconds: this.bufferAhead(),
                     waitingEvents: d.waitingEvents, waitingMs: (d.waitingMs || 0) + (d.waitSince === undefined ? 0 : performance.now() - d.waitSince) },
                 network: this.localPlayback ? null : this.engineStats,
+                render: this.gpu?.active ? { width: this.glCanvas.width, height: this.glCanvas.height, ...this.gpu.lastTiming } : null,
                 history: d.history,
                 errors: d.errors
             });
             try {
                 const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-                await downloadBlob(this.shadow, blob, 'velostream-playback-diagnostics.json');
+                await downloadBlob(this.shadow, blob, 'aethvyr-playback-diagnostics.json');
             } catch (error) {
                 this.announce(error.message, 'warn');
             }
@@ -5912,7 +5908,7 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             this.$('.domain').textContent = domain;
             const title = this.stream.title || this.playbackPageMeta?.showTitle || this.titleFromUrl(this.stream.url);
             this.$('.title').textContent = this.$('.title').title = title;
-            this.root.setAttribute('aria-label', `Velostream player: ${title}`);
+            this.root.setAttribute('aria-label', `Aethvyr player: ${title}`);
             await this.loadBookmarks();
             this.renderMarks();
             this.hideIsland();
@@ -5941,11 +5937,12 @@ ${this.rangeField('cc-pos', 'Vertical position', 0, 80, 1, st.position, `${st.po
             const workers = clamp(Math.round(Number(s.maxWorkers) || 4), 2, 8);
             return `<div class="section-label">Buffer &amp; network</div>
 ${this.selectField('bf-paused-limit', 'Prefetch while paused', withCurrentOption([[0, 'Off'], [128, '128 MB'], [256, '256 MB'], [512, '512 MB'], [1024, '1 GB']], s.pausedBufferMB, v => `${v} MB`), s.pausedBufferMB)}
-${this.selectField('bf-profile', 'Streaming profile', [['eco', 'Eco'], ['balanced', 'Balanced'], ['max', 'Max'], ['custom', 'Custom']], s.resourceProfile)}
+${this.selectField('bf-profile', 'Streaming profile', [['eco', 'Eco'], ['balanced', 'Balanced'], ['max', 'Performance'], ['custom', 'Custom']], s.resourceProfile)}
 ${this.selectField('bf-window', 'Pre-buffer ceiling', withCurrentOption(PREBUFFER_WINDOWS, s.maxBufferSec, v => `${v >= 60 && v % 60 === 0 ? `${v / 60} min` : `${v} s`} (custom)`), s.maxBufferSec ?? 86400)}
 ${this.rangeField('bf-ahead', 'RAM buffer ahead', 15, 180, 5, s.mseBufferAhead, `${s.mseBufferAhead} s`)}
 ${this.rangeField('bf-behind', 'Back-buffer kept', 10, 180, 5, s.mseBufferBehind, `${s.mseBufferBehind} s`)}
 ${this.rangeField('bf-workers', 'Parallel workers', 2, 8, 1, workers, `${workers}`)}
+${this.selectField('bf-bandwidth', 'Custom prefetch budget', withCurrentOption([[0, 'Unlimited'], [1, '1 Mbit/s'], [5, '5 Mbit/s'], [10, '10 Mbit/s'], [25, '25 Mbit/s']], s.prefetchMbps, v => v + ' Mbit/s'), s.prefetchMbps)}
 ${this.selectField('bf-cache', 'Disk cache cap', withCurrentOption(CACHE_CAPS, s.cacheSizeMB, v => `${v >= 1024 && v % 1024 === 0 ? `${v / 1024} GB` : `${v} MB`} (custom)`), s.cacheSizeMB ?? 2048)}
 ${this.switchField('bf-range', 'Range accelerator (parallel chunks)', s.rangeAccel !== false)}
 ${this.switchField('bf-pause', 'Pause background prefetch', !!this.prefetchPaused)}
@@ -6156,7 +6153,7 @@ ${this.selectField('pf-defcap', 'Default resolution cap', QUALITY_CAPS, s.qualit
 ${this.switchField('pf-autofs', 'Full screen on first tap', s.autoFullscreen)}
 ${this.switchField('pf-filethumbs', 'Seek previews for video files', s.fileThumbnails)}
 ${this.switchField('pf-pipsubs', 'Subtitles in Picture-in-Picture', s.pipSubtitles)}
-${this.switchField('pf-badge', 'On-page Play in Velostream button', s.quickLaunchBadge)}
+${this.switchField('pf-badge', 'On-page Play in Aethvyr button', s.quickLaunchBadge)}
 <div class="section-label">Gestures</div>
 ${this.switchField('pf-g-enabled', 'Touch gestures', g.enabled)}
 ${this.switchField('pf-g-doubleTapSeek', 'Double-tap to seek', g.doubleTapSeek)}
@@ -6383,6 +6380,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 range('bf-behind', v => { this.saveSettings({ mseBufferBehind: v }); this.settings.mseBufferBehind = v; shakaBuf(); }, v => `${v} s`);
                 range('bf-workers', v => this.saveSettings({ maxWorkers: v }), v => `${v}`);
                 select('bf-paused-limit', v => this.saveSettings({ pausedBufferMB: +v }));
+                select('bf-bandwidth', v => this.saveSettings({ prefetchMbps: +v }));
                 select('bf-cache', v => this.saveSettings({ cacheSizeMB: +v }));
                 sw('bf-range', v => this.saveSettings({ rangeAccel: v }));
                 sw('bf-pause', v => {
@@ -6598,7 +6596,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         setupMediaSession() {
             if (!('mediaSession' in navigator)) return;
             try {
-                navigator.mediaSession.metadata = new MediaMetadata({ title: this.$('.title').textContent, artist: 'Velostream' });
+                navigator.mediaSession.metadata = new MediaMetadata({ title: this.$('.title').textContent, artist: 'Aethvyr' });
                 const ms = navigator.mediaSession;
                 ms.setActionHandler('play', () => this.video.play());
                 ms.setActionHandler('pause', () => this.video.pause());

@@ -1,11 +1,61 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { checkpoint, validateExportRange } from '../background/download-store.js';
-import { exportMediaType, SegmentDownloader } from '../background/downloader.js';
+import { exportMediaType, retryAfterDeadline, SegmentDownloader } from '../background/downloader.js';
 import { parseMedia, segmentKey } from '../background/hls-parser.js';
 
 const signal = new AbortController().signal;
 const bytes = (...values) => Uint8Array.from(values).buffer;
+
+test('Retry-After accepts seconds and HTTP dates and ignores unusable values', () => {
+    const now = Date.UTC(2026, 0, 1);
+    assert.equal(retryAfterDeadline(' 12 ', now), now + 12000);
+    assert.equal(retryAfterDeadline(new Date(now + 5000).toUTCString(), now), now + 5000);
+    for (const header of [undefined, '', '-2', 'later', '1.5', new Date(now - 5000).toUTCString()]) {
+        assert.equal(retryAfterDeadline(header, now), 0);
+    }
+});
+
+test('a long server cooldown blocks range fallback and same-origin requests while another origin proceeds', async () => {
+    const requests = [];
+    const downloader = new SegmentDownloader({
+        getSettings: () => ({ rangeAccel: true }), abr: { reportSegmentDownload() {} },
+        transport: async (url, options) => {
+            requests.push({ url, range: options.headers.Range });
+            return url.startsWith('https://busy.test/')
+                ? { status: 503, headers: { 'retry-after': '90' } }
+                : { status: 200, headers: {}, data: bytes(7) };
+        }
+    });
+    await assert.rejects(downloader._fetchWithRetry('https://busy.test/a', {
+        method: 'GET', headers: { Range: 'bytes=0-2097151' }
+    }, signal, true, true), { status: 503 });
+    const issued = requests.length;
+    assert.ok(issued > 0 && requests.every(req => req.range));
+    await assert.rejects(downloader.fetchProgressiveRange('https://busy.test/b', {}, signal), { status: 503 });
+    assert.equal(requests.length, issued);
+    assert.equal((await downloader.fetchProgressiveRange('https://ready.test/b', {}, signal)).status, 200);
+});
+
+test('429 delays a retry until the server deadline and allows cancellation while waiting', async () => {
+    const calls = [];
+    const downloader = new SegmentDownloader({
+        abr: { reportSegmentDownload() {} },
+        transport: async () => {
+            calls.push(Date.now());
+            return calls.length === 1 ? { status: 429, headers: { 'retry-after': '1' } } : { status: 200 };
+        }
+    });
+    const result = downloader.fetchProgressiveRange('https://busy.test/one', {}, signal);
+    await new Promise(resolve => setImmediate(resolve));
+    const controller = new AbortController();
+    const cancelled = downloader.fetchProgressiveRange('https://busy.test/two', {}, controller.signal);
+    controller.abort();
+    await assert.rejects(cancelled, { name: 'AbortError' });
+    await result;
+    assert.equal(calls.length, 2);
+    assert.ok(calls[1] - calls[0] >= 1000);
+});
 
 test('harvests an exact ranged segment without fetching or marking it played', async () => {
     const segment = { uri: 'https://example.test/video.mp4', range: 'bytes=20-21' };

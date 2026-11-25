@@ -1,6 +1,6 @@
 # User guide
 
-This guide covers everything you can do in Velostream. For settings stored behind the UI see
+This guide covers everything you can do in Aethvyr. For settings stored behind the UI see
 [SETTINGS.md](SETTINGS.md); for errors see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 - [Opening a video](#opening-a-video)
@@ -19,7 +19,7 @@ This guide covers everything you can do in Velostream. For settings stored behin
 
 ## Opening a video
 
-Velostream watches the page for video streams: HLS playlists (`.m3u8`), DASH manifests (`.mpd`)
+Aethvyr watches the page for video streams: HLS playlists (`.m3u8`), DASH manifests (`.mpd`)
 and direct media files. It finds them in network requests, in `fetch`/XHR calls, in Web Workers,
 in `<video>` elements and through Media Source Extensions, in the page and in embedded frames.
 
@@ -27,9 +27,9 @@ There are four ways to open a detected stream:
 
 | Way | How |
 |-----|-----|
-| **On-page pill** | A **Play in Velostream** pill appears over detected videos. Click it. (Turn it off in the popup with *On-page Play button*.) |
+| **On-page pill** | A **Play in Aethvyr** pill appears over detected videos. Click it. (Turn it off in the popup with *On-page Play button*.) |
 | **Popup** | Click the toolbar icon and pick a stream from **Detected streams**. The best candidate (master playlist, highest quality, not an ad) is listed first. |
-| **Always play in Velostream** | Turn this on for a site in the popup. The first real stream on each page load then opens automatically. |
+| **Always play in Aethvyr** | Turn this on for a site in the popup. The first real stream on each page load then opens automatically. |
 | **Play any stream link** | Paste an `.m3u8`, `.mpd` or media URL into the popup. |
 
 If nothing is detected, start the video in the site's own player once, then press **Rescan** in
@@ -37,17 +37,17 @@ the popup. Streams protected by DRM are listed with an explanation; they cannot 
 [Troubleshooting](TROUBLESHOOTING.md#drm-protected-video)).
 
 The player is mounted **exactly over the site's video**, so the page layout does not change. The
-site's own player is paused and muted while Velostream plays and is restored when you close it.
+site's own player is paused and muted while Aethvyr plays and is restored when you close it.
 
 ### Autoplay
 
 Browsers only allow sound after you have interacted with a page. If playback with sound is
-refused, Velostream starts **muted** and shows *Autoplaying muted · Tap or press any key to
+refused, Aethvyr starts **muted** and shows *Autoplaying muted · Tap or press any key to
 unmute*. Your first tap or key press restores your volume; that tap does not pause the video.
 
 ### Continue watching
 
-Velostream remembers where you stopped in each video and resumes there (*Prefs → Playback →
+Aethvyr remembers where you stopped in each video and resumes there (*Prefs → Playback →
 Resume*: always, ask, or off). The popup lists recent videos under **Continue watching**.
 
 ---
@@ -60,7 +60,7 @@ speed, subtitles, **Studio**, download and full screen.
 
 | Feature | Notes |
 |---------|-------|
-| **Timeline** | Hover or drag for a time tooltip with **thumbnail previews** and the **chapter** title. HLS and DASH show the stream's own thumbnail track when it has one; for direct video files (MP4, WebM…) Velostream makes the previews itself from the file, up to about 200 per video (*Prefs → Playback → Seek previews for video files*). Chapter marks, bookmarks and A-B loop points are drawn on the bar. |
+| **Timeline** | Hover or drag for a time tooltip with **thumbnail previews** and the **chapter** title. HLS and DASH show the stream's own thumbnail track when it has one; for direct video files (MP4, WebM…) Aethvyr makes the previews itself from the file, up to about 200 per video (*Prefs → Playback → Seek previews for video files*). Chapter marks, bookmarks and A-B loop points are drawn on the bar. |
 | **Dynamic island** | The pill at the top briefly shows what changed: volume, speed, seek target, quality switch, buffering, errors. |
 | **Speed** | 0.25×–4×. The chosen speed becomes the default for the next video. Pitch is kept natural unless you turn *Keep voice pitch when speeding up* off. |
 | **Picture-in-Picture** | With subtitles on, the PiP window shows them too, drawn into the picture in your subtitle style (browsers do not show a page's subtitles in PiP by themselves). It keeps updating while the tab is in the background; play/pause in the PiP window controls the player. Needs a picture the page may read: a direct file from a server without CORS falls back to plain PiP. Off in *Prefs → Playback → Subtitles in Picture-in-Picture*. |
@@ -150,13 +150,13 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 
 - **Streams on this page** (when the page has more than one playable stream): switch to another
   one inside the same player, without closing it. Your position in the current one is saved.
-- **Quality**: Auto (Velostream's own adaptive bitrate) or a fixed resolution, and a quality cap
+- **Quality**: Auto (Aethvyr's own adaptive bitrate) or a fixed resolution, and a quality cap
   (for example *never above 720p* on mobile data).
 - **Buffer & network**:
   - *Pre-buffer window*: how far ahead to download in the background, up to the whole video.
   - *Player RAM buffer ahead / behind*: Shaka's MSE buffer. Lower it on low-memory phones.
   - *Parallel downloads*: 2–8 workers.
-  - *Cache size*: the IndexedDB budget per tab.
+  - *Cache size*: the cache budget shared across active sessions.
   - *Range accelerator*: splits large files into parallel range requests.
   - *Pause background download*: stops pre-buffering to save data.
   - **Purge & rebuild buffer**: drops the cache and refills it from the current position.
@@ -210,7 +210,7 @@ Studio is the settings panel inside the player (sliders button). It has five tab
   and thickness, control background darkness, which buttons are shown and their order.
 - **Playback** defaults: speed, seek step, resume, auto full screen, controls auto-hide.
 - **Gestures**, **Mouse**, **Keyboard** (see above).
-- **Device**: on first run Velostream classifies the device as low-end, standard or high-end
+- **Device**: on first run Aethvyr classifies the device as low-end, standard or high-end
   (CPU cores, memory, touch screen size and GPU). Low-end devices get smaller buffers, a 512 MB
   cache, 3 parallel downloads and a 1080p GPU render cap; high-end desktops get 8 downloads, a 4 GB
   cache and a longer RAM buffer. Only settings you had not changed are adjusted. *Re-detect and
@@ -229,7 +229,7 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 
 Open the **CC** button (*Subtitles & Audio*).
 
-- **Captured subtitles.** Velostream collects the site's subtitles automatically: files the page
+- **Captured subtitles.** Aethvyr collects the site's subtitles automatically: files the page
   downloads (`.vtt`, `.srt`, `.ass`), `<track>` elements, and text tracks the site player builds
   in memory. They are listed with the site's label (for example *English · Site*). The site's
   default track is selected automatically.
@@ -237,7 +237,7 @@ Open the **CC** button (*Subtitles & Audio*).
 - **Secondary subtitles (top)**: show a second language at the top of the picture at the same
   time.
 - **Sync offset**: shift timing in 0.1 s steps, or **Sync next line to now**: press it when you
-  hear the next line spoken and Velostream aligns the subtitles.
+  hear the next line spoken and Aethvyr aligns the subtitles.
 - **Speed**: stretch the subtitle timeline for files made for a different frame rate.
 - **Pause on hover** and **click to copy** a line, useful for language learning.
 - **Subtitle style**: font (including dyslexia-friendly and Atkinson Hyperlegible), size, colour,
@@ -304,7 +304,7 @@ Press the **download** button or *Studio → Tools*.
 | A–B clip (HLS or DASH on-demand) | Set loop points A and B (<kbd>[</kbd> / <kbd>]</kbd>), then *Tools → Save A–B clip*: an `.mp4` of just that range, starting at 0:00. Cuts land on segment boundaries (keyframes, no re-encoding), so the clip can start and end a few seconds outside A and B. |
 
 Choose **Save format → Original** to keep `.ts`/`.aac` files instead of MP4. If the first segment
-cannot be remuxed (an unusual codec), Velostream falls back to the original format automatically.
+cannot be remuxed (an unusual codec), Aethvyr falls back to the original format automatically.
 
 Files are saved through the browser's download manager, with a *Save as* dialog when your browser
 asks for one. Encrypted HLS (AES-128) is decrypted while saving. **DRM-protected video cannot be
@@ -340,7 +340,7 @@ Signed links expire. Run the command soon after copying it.
 - **Status** and **telemetry**: bandwidth, cache size, workers and seconds buffered ahead.
 - **Now playing**: download or close the open player.
 - **Detected streams**: with type, resolution, duration, live/DRM badges. *Rescan* and *Clear*.
-- **This site**: *Always play in Velostream*.
+- **This site**: *Always play in Aethvyr*.
 - **Play any stream link**, **Continue watching** (with *Open library*), and global **Settings**
   (appearance, playback, engine, sync, backup).
 
@@ -349,7 +349,7 @@ Signed links expire. Run the command soon after copying it.
 ## Library
 
 *Popup → Continue watching → Open library* opens a full page with every video you played in
-Velostream:
+Aethvyr:
 
 - **Continue watching** (started, not finished), **Recently watched**, **Favorites** (star any
   video), **Collections** and **Bookmarked**. Sections can be linked directly
@@ -366,16 +366,16 @@ Everything stays on your device and is included in backups.
 
 ## Sync across devices
 
-Off by default. Turn on *Settings → Sync across my devices* in the popup on each device. Velostream
+Off by default. Turn on *Settings → Sync across my devices* in the popup on each device. Aethvyr
 then keeps these in step through your **browser account's sync** (Google for Chrome/Edge, Mozilla
-for Firefox), with no Velostream server involved:
+for Firefox), with no Aethvyr server involved:
 
 - settings (but not device-specific ones such as volume, interface size, buffer/cache sizes and
   GPU enhancement);
 - watch positions of your recent videos, their bookmarks, and your library.
 
 Changes upload about 10–60 seconds after you make them, and other devices pick them up when their
-browser syncs. *Sync now* forces a round trip; *Delete synced data* removes Velostream's copy
+browser syncs. *Sync now* forces a round trip; *Delete synced data* removes Aethvyr's copy
 from your account. Browser sync storage is small (about 100 KB), so only recent videos sync. Stream URLs stay on the source device. See the [privacy policy](../PRIVACY.md#optional-sync-across-your-devices).
 - On Firefox: **Allow access to websites**, when site access has not been granted yet.
 
@@ -389,7 +389,7 @@ It stays on your device unless you share it.
 
 ## Accessibility
 
-Velostream is built to be fully usable without a mouse or without sight:
+Aethvyr is built to be fully usable without a mouse or without sight:
 
 - every control is a real button or slider with a label and is reachable with <kbd>Tab</kbd>;
   menus support arrow keys and <kbd>Esc</kbd>;
