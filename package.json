@@ -32,6 +32,6 @@
         "node": ">=18.0.0"
     },
     "dependencies": {
-        "shaka-player": "5.3.3"
+        "shaka-player": "5.3.6"
     }
 }
