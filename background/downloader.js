@@ -1,3 +1,4 @@
+import { HttpError, isRetryable, retryAfterDeadline } from './http-retry.js';
 /**
  * Velostream - Segment Downloader
  *
@@ -223,33 +224,7 @@ function matchesRange(response, start, end) {
         (!value || (match && +match[1] === start && +match[2] === end));
 }
 
-function isRetryable(err) {
-    if (!err || err.name === 'AbortError') return false;
-    if (typeof err.status === 'number' && err.status > 0) {
-        return err.status === 408 || err.status === 429 || err.status >= 500;
-    }
-    return true; // network errors / timeouts
-}
-
-export class HttpError extends Error {
-    constructor(status, url) {
-        super(`HTTP ${status} for ${url}`);
-        this.name = 'HttpError';
-        this.status = status;
-    }
-}
-
-/** Convert delay-seconds or an HTTP date into an absolute retry deadline. */
-export function retryAfterDeadline(header, now = Date.now()) {
-    if (typeof header !== 'string') return 0;
-    const value = header.trim();
-    if (/^\d+$/.test(value)) return Math.min(Number.MAX_SAFE_INTEGER, now + Number(value) * 1000);
-    // Date.parse also accepts non-HTTP inputs such as "-1" and "1.5".
-    if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*[, ]/i.test(value)) return 0;
-    const date = Date.parse(value);
-    return date > now ? date : 0;
-}
-
+export { HttpError, retryAfterDeadline };
 export class SegmentDownloader {
     /**
      * @param {object} deps
@@ -787,7 +762,7 @@ export class SegmentDownloader {
     }
 
     _windowSeconds() {
-        return prefetchPolicy(this.getSettings(), 1, this.playback.hidden).windowSeconds;
+        return prefetchPolicy(this.getSettings(), 1, this.playback.hidden, this.playback.conserve).windowSeconds;
     }
 
     /**
@@ -795,7 +770,7 @@ export class SegmentDownloader {
      * (parallelism hides per-request latency), fewer when the buffer is healthy (battery).
      */
     adjustConcurrency() {
-        const maxWorkers = prefetchPolicy(this.getSettings(), this.sessionCount(), this.playback.hidden).workers;
+        const maxWorkers = prefetchPolicy(this.getSettings(), this.sessionCount(), this.playback.hidden, this.playback.conserve).workers;
         const ahead = this.playback.bufferAhead + this.cachedAheadSeconds();
         const latency = this.stats.lastLatencyMs;
         // Whole-video pre-buffering: keep every worker busy until the target is nearly reached,
@@ -950,7 +925,7 @@ export class SegmentDownloader {
             }
         }
         this.queue = this._buildQueue();
-        const workers = Math.min(this.concurrency, prefetchPolicy(this.getSettings(), this.sessionCount(), this.playback.hidden).workers);
+        const workers = Math.min(this.concurrency, prefetchPolicy(this.getSettings(), this.sessionCount(), this.playback.hidden, this.playback.conserve).workers);
         const slots = Math.max(0, workers - this.activePrefetch - this.activeOnDemand);
         for (let i = 0; i < (paced ? Math.min(1, slots) : slots) && this.queue.length; i++) {
             const release = this.takePrefetchSlot();
@@ -1003,7 +978,7 @@ export class SegmentDownloader {
         entry.promise.catch(err => {
             if (err && err.name !== 'AbortError') {
                 this.stats.errors++;
-                console.warn('[Downloader] Prefetch failed:', task.url, err.message);
+                console.warn('[Downloader] Prefetch failed', Number(err.status) || 0);
             }
         });
         this.inflight.set(task.key, entry);
@@ -1184,7 +1159,7 @@ export class SegmentDownloader {
         return response;
     }
 
-    async _fetchWithRetry(url, { method, headers }, signal, onDemand, isSegment = false, allowAcceleration = true) {
+    async _fetchWithRetry(url, { method, headers, maxBytes }, signal, onDemand, isSegment = false, allowAcceleration = true) {
         let attempt = 0;
         for (;;) {
             if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -1192,7 +1167,7 @@ export class SegmentDownloader {
             try {
                 const res = allowAcceleration && this._canAccelerate(url, method, headers, isSegment)
                     ? await this._accelFetch(url, headers, signal)
-                    : await this._request(url, { method, headers, signal });
+                    : await this._request(url, { method, headers, signal, maxBytes, speculative: !onDemand && !allowAcceleration });
                 if (res.status >= 400) throw new HttpError(res.status, url);
                 const elapsed = Date.now() - started;
                 const bytes = res.data ? res.data.byteLength : 0;
@@ -1339,7 +1314,7 @@ export class SegmentDownloader {
     }
 
     fetchProgressiveRange(url, headers, signal) {
-        return this._fetchWithRetry(url, { method: 'GET', headers }, signal, false);
+        return this._fetchWithRetry(url, { method: 'GET', headers, maxBytes:64 * 1024 ** 2 }, signal, false);
     }
 
     async exportPrefetch(key, signal) {
@@ -1369,8 +1344,8 @@ export class SegmentDownloader {
         if (!data) {
             const prefetched = await this.exportPrefetch(key, signal);
             const response = prefetched || await this._fetchWithRetry(seg.uri, {
-                method: 'GET', headers: seg.range ? { Range: seg.range } : {}
-            }, signal, false, true);
+                method: 'GET', headers: seg.range ? { Range: seg.range } : {}, maxBytes:64 * 1024 ** 2
+            }, signal, false, true, false);
             const range = /^bytes=(\d+)-(\d+)$/.exec(seg.range || '');
             if (range && !matchesRange(response, +range[1], +range[2])) {
                 throw new Error(`The source returned the wrong segment byte range (${seg.range}).`);

@@ -25,12 +25,20 @@
     const CATEGORY_PREFIX = 'fs_category_';
     const classifications = new Map();
     let sourceSite = '';
+    let queue = {};
+    let artwork = false;
+    const episodeEdits = new Map();
+    const EDIT_PREFIX = 'fs_episode_edit_v1_';
+    let stats = {};
     const VIEWS = {
+        queue: { title:'Playback queue', empty:'Add videos from Recently watched or from an episode list.' },
+        statistics: { title:'Watch statistics', empty:'' },
         local: { title: 'Local files', empty: 'No saved local files.' },
         offline: { title: 'Offline / Cached', empty: 'No cached downloads.' },
         anime: { title: 'Anime', empty: 'Anime appears here after you play it in Aethvyr.' },
         donghua: { title: 'Donghua', empty: 'Chinese animation appears here after you play it in Aethvyr.' },
         cartoon: { title: 'Cartoons', empty: 'Cartoons appear here after you play them in Aethvyr.' },
+        education: { title: 'Educational', empty: 'Choose Educational under Edit category for a lecture or course.' },
         video: { title: 'Other videos', empty: 'Clips and unclassified titles appear here.' },
         series: { title: 'Series', empty: 'Series appear here as you watch episodes.' },
         movies: { title: 'Movies', empty: 'Movies appear here as you watch them.' },
@@ -52,6 +60,9 @@
     const openPanels = new Set(); // `${scope}|${key}|cols` / `${scope}|${key}|bms`
     let lastMarkup = '';
     let deviceEntries = [];
+    const batchSelection = new Set();
+    const transferSamples = new Map();
+    let storageRemaining = null;
     let deviceStatus = '';
     let deviceRequest = 0;
     let renderTimer = 0;
@@ -217,8 +228,12 @@
             const inferred = S.classifyLibraryMedia({ ...storedMeta, pageUrl: page, title: storedMeta.showTitle || e.title });
             const meta = { ...storedMeta, ...inferred, season: storedMeta.season ?? inferred.season, episode: storedMeta.episode ?? inferred.episode };
             const categoryKey = page || key;
-            const category = classifications.get(categoryKey) || meta.medium || meta.kind;
-            const episodic = !['movie', 'video'].includes(category) && (category === 'series' || meta.kind === 'series');
+            const manual = classifications.get(categoryKey);
+            if (['series','movie','video'].includes(manual)) meta.kind = manual;
+            if (['anime','donghua','cartoon'].includes(manual)) meta.medium = manual;
+            Object.assign(meta, episodeEdits.get(key));
+            const category = manual === 'education' ? manual : meta.medium || meta.kind;
+            const episodic = meta.kind === 'series';
             const host = hostOf(webUrl(e.page) || e.url) || hostOf(e.url);
             const title = cleanTitle(e.title);
             const done = !!e.done && !(key.length <= 8 && d > 0 && d <= 20 && t / d < 0.8);
@@ -280,7 +295,7 @@
         for (const item of items) {
             if (!item.episodic) continue;
             const title = item.meta.showTitle || item.title;
-            const key = SERIES_PREFIX + JSON.stringify([item.host, title.toLocaleLowerCase()]);
+            const key = SERIES_PREFIX + (webUrl(item.meta.seriesIdentity) || JSON.stringify([item.host, title.toLocaleLowerCase()]));
             if (!groups.has(key)) groups.set(key, []);
             groups.get(key).push(item);
         }
@@ -291,7 +306,7 @@
         const label = S.LIBRARY_TYPES[item.category];
         const format = item.meta.medium && item.meta.kind !== 'video' && item.category === item.meta.medium ? S.LIBRARY_TYPES[item.meta.kind] : '';
         return `<div class="library-cover" data-category="${esc(item.category)}">
-            ${poster ? `<img src="${esc(poster)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
+            ${artwork && poster ? `<img src="${esc(poster)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
             <span class="library-type">${esc(label)}${format ? ' · ' + esc(format) : ''}</span>
         </div>`;
     }
@@ -301,7 +316,14 @@
         return `<label class="category-control"><span>Category</span><select data-category-key="${esc(item.categoryKey)}" aria-label="Category for ${esc(item.title)}">
             <option value="">Auto (${esc(S.LIBRARY_TYPES[item.meta.medium || item.meta.kind])})</option>
             ${Object.entries(S.LIBRARY_TYPES).map(([value, label]) => `<option value="${value}"${manual === value ? ' selected' : ''}>${label}</option>`).join('')}
-        </select></label>`;
+        </select></label>
+        <form data-episode-edit="${esc(item.key)}">
+        <label>Format<select name="kind">${['video','movie','series'].map(k => `<option value="${k}"${item.meta.kind === k ? ' selected' : ''}>${esc(S.LIBRARY_TYPES[k])}</option>`).join('')}</select></label>
+        <label>Medium<select name="medium">${['','anime','donghua','cartoon'].map(k => `<option value="${k}"${item.meta.medium === k ? ' selected' : ''}>${esc(S.LIBRARY_TYPES[k] || 'Unspecified')}</option>`).join('')}</select></label>
+        <label>Series title<input name="showTitle" maxlength="180" value="${esc(item.meta.showTitle || '')}"></label>
+        <label>Season<input name="season" type="number" min="0" max="999" value="${esc(item.meta.season ?? '')}"></label>
+        <label>Episode<input name="episode" type="number" min="0" max="99999" step="any" value="${esc(item.meta.episode ?? '')}"></label>
+        <button class="btn small">Save episode details</button><button class="btn small" type="button" ${ctl('episode-reset','main',item.key)}>Use detected details</button></form>`;
     }
 
     function websiteLink(item) {
@@ -322,12 +344,18 @@
         const status = seriesStatuses.get(key) || 'Watching';
         const unique = new Map();
         for (const episode of [...episodes].sort((a, b) => a.updatedAt - b.updatedAt)) {
-            const id = episode.meta.episode == null ? episode.page || episode.key : `${episode.meta.season ?? 1}:${episode.meta.episode}`;
+            const id = episode.meta.episode == null || episode.meta.season == null ? episode.page || episode.key : `${episode.meta.season ?? 'unknown'}:${episode.meta.episode}`;
             const watched = episode.done || unique.get(id)?.done;
             unique.set(id, { ...episode, done: watched });
         }
         const episodeList = [...unique.values()].sort((a, b) => (a.meta.season ?? 1) - (b.meta.season ?? 1) ||
             (a.meta.episode ?? Infinity) - (b.meta.episode ?? Infinity) || a.updatedAt - b.updatedAt);
+        const seasons = new Map();
+        for (const episode of episodeList) {
+            const season = episode.meta.season;
+            if (!seasons.has(season)) seasons.set(season, []);
+            seasons.get(season).push(episode);
+        }
         const label = episode => episode.meta.episode == null ? episode.title :
             `${episode.meta.season != null ? 'S' + episode.meta.season + ' · ' : ''}Ep ${episode.meta.episode}`;
         return `<li class="card vcard">
@@ -340,8 +368,8 @@
             </div>
             <details data-series="${esc(key)}"${expandedSeries.has(key) ? ' open' : ''}>
                 <summary>Episodes (${episodeList.length})</summary>
-                <ol class="series-episodes">${episodeList.map(e => `<li><strong>${esc(label(e))}</strong> · ${fmtTime(e.t)}${e.done ? ' · Watched' : ''}
-                    <div class="vc-actions">${websiteLink(e)} ${resumeLink(e)}</div>${categoryControl(e)}</li>`).join('')}</ol>
+                ${[...seasons].map(([season,rows]) => `<h4>${season == null ? 'Season unknown' : season === 0 ? 'Specials' : 'Season ' + esc(season)}</h4><ol class="series-episodes">${rows.map(e => `<li><strong>${esc(label(e))}</strong> · ${fmtTime(e.t)}${e.done ? ' · Watched' : ''}
+                    <div class="vc-actions">${websiteLink(e)} ${resumeLink(e)} <button class="btn small" ${ctl('queue-add','main',e.key)}>Add to queue</button></div>${e.bms.length ? '<p>' + esc(plural(e.bms.length,'bookmark')) + '</p>' : ''}<details><summary>Edit episode</summary>${categoryControl(e)}</details></li>`).join('')}</ol>`).join('')}
             </details>
         </li>`;
     }
@@ -391,6 +419,7 @@
             </div>
             <div class="vc-actions">
                 ${open}
+                ${item.target ? `<button class="btn small" ${ctl('queue-add',scope,item.key)}>Add to queue</button><button class="btn small" ${ctl('queue-first',scope,item.key)}>Play next</button>` : ''}
                 <button type="button" class="icon-btn vc-star" ${ctl('star', scope, item.key)} aria-pressed="${item.fav}" aria-label="Favorite ${t}">${ICON.star}</button>
                 <button type="button" class="btn small btn-quiet vc-toggle" ${ctl('cols', scope, item.key)} aria-expanded="${colsOpen}"${colsOpen ? ` aria-controls="p${n}c"` : ''} aria-label="Collections for ${t}">${ICON.folder}<span class="vc-tlabel">Collections</span>${ICON.chevron}</button>
                 ${item.bms.length ? `<button type="button" class="btn small btn-quiet vc-toggle" ${ctl('bms', scope, item.key)} aria-expanded="${bmsOpen}"${bmsOpen ? ` aria-controls="p${n}b"` : ''} aria-label="${plural(item.bms.length, 'bookmark')} in ${t}">${ICON.bookmark}<span class="num">${item.bms.length}</span>${ICON.chevron}</button>` : ''}
@@ -426,7 +455,7 @@
         clearTimeout(renderTimer);
         uid = 0;
         const deviceView = view === 'local' || view === 'offline';
-        document.querySelector('.lib-toolbar').hidden = deviceView;
+        document.querySelector('.lib-toolbar').hidden = deviceView || ['queue','statistics'].includes(view);
         const allItems = buildItems();
         const sources = [...new Set(allItems.map(i => i.host).filter(Boolean))].sort(collator.compare);
         if (sourceSite && !sources.includes(sourceSite)) sourceSite = '';
@@ -442,12 +471,13 @@
         const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
         const groups = seriesGroups(items);
         const counts = {
-            series: [...groups.values()].filter(g => g.some(i => i.category === 'series')).length,
+            series: groups.size,
+            education: items.filter(i => i.category === 'education').length,
             anime: countCategory(items, 'anime'),
             donghua: countCategory(items, 'donghua'),
             cartoon: countCategory(items, 'cartoon'),
             video: items.filter(i => i.category === 'video').length,
-            movies: items.filter(i => i.category === 'movie').length,
+            movies: items.filter(i => i.meta.kind === 'movie').length,
             continue: items.filter(i => i.inProgress).length,
             recent: items.length,
             favorites: items.filter(i => i.fav).length,
@@ -471,8 +501,20 @@
         let markup;
         let countText;
         $('new-collection').hidden = view !== 'collections';
-        if (['series', 'anime', 'donghua', 'cartoon'].includes(view)) {
-            const shelves = [...groups].map(([key, list]) => [key, list.filter(i => i.category === view)]).filter(([, list]) => list.length)
+        if (view === 'queue') {
+            const rows = (queue.keys || []).map(key=>allItems.find(i=>i.key===key)).filter(Boolean);
+            const button = (op,text,key='',disabled=false) => `<button class="btn small" ${ctl('queue-'+op,'queue',key)} ${disabled?'disabled':''}>${text}</button>`;
+            markup = `<div class="vc-actions">${button('clear','Clear queue','',!rows.length)} ${button('restore','Restore previous queue','',!queue.previous?.length)} ${button('shuffle','Shuffle','',rows.length<2)} ${button('repeat','Repeat: '+(queue.repeat?'on':'off'))} ${button('autoplay','Autoplay countdown: '+(queue.autoplay?'on':'off'))}</div>` +
+                (rows.length ? '<ol>'+rows.map((item,i)=>`<li class="card"><strong>${esc(item.title)}</strong><div class="vc-actions">${button('start','Play',item.key)} ${button('up','Move up',item.key,!i)} ${button('down','Move down',item.key,i===rows.length-1)} ${button('remove','Remove',item.key)}</div></li>`).join('')+'</ol>' : emptyMarkup(VIEWS.queue.empty));
+            countText = plural(rows.length,'video');
+        } else if (view === 'statistics') {
+            const recent = days => Object.entries(stats.days || {}).filter(([date])=>date>=new Date(Date.now()-(days-1)*86400000).toISOString().slice(0,10)).reduce((sum,[,n])=>sum+n,0);
+            const categories = Object.entries(stats.categories || {}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>esc(k)+' '+fmtTime(v)).join(', ');
+            markup = `<div class="card"><p>Watch time is recorded on this device during full-player playback.</p><button class="btn small" data-action="stats-toggle">${stats.enabled?'Disable':'Enable'} statistics</button>
+                <button class="btn small" data-action="stats-clear">Delete statistics</button><dl><dt>Total watch time</dt><dd>${fmtTime(stats.seconds || 0)}</dd><dt>Last 7 days / 30 days</dt><dd>${fmtTime(recent(7))} / ${fmtTime(recent(30))}</dd><dt>Average session</dt><dd>${fmtTime((stats.seconds||0)/(stats.sessions||1))}</dd><dt>Completed episodes / movies</dt><dd>${stats.episodes||0} / ${stats.movies||0}</dd><dt>Most watched categories</dt><dd>${categories || 'No activity yet'}</dd></dl></div>`;
+            countText = stats.enabled ? 'Recording locally' : 'Off';
+        } else if (['series', 'anime', 'donghua', 'cartoon'].includes(view)) {
+            const shelves = [...groups].map(([key, list]) => [key, list.filter(i => view === 'series' || i.category === view)]).filter(([, list]) => list.length)
                 .map(([key, list]) => ({ ...list.reduce((a, b) => a.updatedAt > b.updatedAt ? a : b), groupKey: key, list }));
             const singles = items.filter(i => i.category === view && !i.episodic);
             const shown = sortItems([...shelves, ...singles].filter(i => i.list ? i.list.some(ep => matches(ep, tokens)) : matches(i, tokens)));
@@ -506,7 +548,7 @@
                 countText = `${plural(library.collections.length, 'collection')}${tokens.length ? ` · ${plural(shown, 'match', 'matches')}` : ''}`;
             }
         } else {
-            const base = items.filter(i => view === 'continue' ? i.inProgress : view === 'favorites' ? i.fav : view === 'bookmarked' ? i.bms.length > 0 : view === 'movies' ? i.category === 'movie' : view === 'video' ? i.category === 'video' : true);
+            const base = items.filter(i => view === 'continue' ? i.inProgress : view === 'favorites' ? i.fav : view === 'bookmarked' ? i.bms.length > 0 : view === 'movies' ? i.meta.kind === 'movie' : view === 'education' ? i.category === 'education' : view === 'video' ? i.category === 'video' : true);
             const list = sortItems(base.filter(i => matches(i, tokens)));
             if (!base.length) markup = emptyMarkup(VIEWS[view].empty);
             else if (!list.length) markup = emptyMarkup(`No videos here match “${query.trim()}”.`, true);
@@ -705,6 +747,24 @@
         const el = e.target.closest('[data-action]');
         if (!el || !$('view').contains(el)) return;
         const { action, key, scope, col } = el.dataset;
+        if (action.startsWith('queue-') || action.startsWith('stats-')) {
+            const [group,op] = action.split('-');
+            if (group === 'stats' && op === 'clear' && !(await ask({title:'Delete watch statistics?',text:'This clears recorded activity and turns recording off.',okLabel:'Delete',danger:true})).ok) return;
+            if (op === 'start') {
+                const item = history[key];
+                if (!item) return;
+                const result = await api.runtime.sendMessage({action:'LIBRARY_RESUME',page:webUrl(item.page)||webUrl(item.url),streamUrl:webUrl(item.url),time:item.done?0:item.t});
+                if (!result?.ok) { showMessage(result?.error || 'Could not open video.'); return; }
+            }
+            const result = await api.runtime.sendMessage({action:group==='queue'?'WATCH_QUEUE':'WATCH_STATS',op:op==='start'?'played':op,key}).catch(()=>null);
+            if (!result?.ok) showMessage(result?.error || 'Could not save this change.');
+            else announce(group==='queue'?'Playback queue updated':'Watch statistics updated');
+            return;
+        }
+        if (action === 'episode-reset') {
+            await api.storage.local.remove(EDIT_PREFIX + key);
+            return;
+        }
         switch (action) {
             case 'star': toggleFavorite(key); break;
             case 'remove': await removeFromHistory(el, key); break;
@@ -800,7 +860,18 @@
         const el = e.target;
         if (el.dataset.categoryKey && (!el.value || Object.hasOwn(S.LIBRARY_TYPES, el.value))) {
             const key = CATEGORY_PREFIX + el.dataset.categoryKey;
-            const save = el.value ? api.storage.local.set({ [key]: el.value }) : api.storage.local.remove(key);
+            const form = el.closest('label')?.nextElementSibling;
+            const editedKey = form?.dataset.episodeEdit;
+            const edit = episodeEdits.get(editedKey);
+            const patch = {};
+            if (edit) {
+                const next = {...edit};
+                if (['movie','series','video'].includes(el.value) || !el.value) delete next.kind;
+                if (['anime','donghua','cartoon'].includes(el.value) || !el.value) delete next.medium;
+                patch[EDIT_PREFIX + editedKey] = next;
+            }
+            const save = el.value ? api.storage.local.set({ ...patch, [key]: el.value }) :
+                api.storage.local.set(patch).then(() => api.storage.local.remove(key));
             save.then(() => announce('Category updated'), () => showMessage('Could not save this category.'));
             return;
         }
@@ -822,25 +893,31 @@
         const openFile = local ? '<a class="btn btn-primary small" href="../player/player.html?mode=local">Open Local File</a>' : '';
         const rows = deviceEntries.map(item => {
             const running = item.status === 'running';
+            const sample = transferSamples.get(item.id);
+            const rate = running && sample?.speed > 0 ? ' · ' + Math.round(sample.speed / 1024) + ' KiB/s' : '';
+            const eta = rate && item.totalBytes > item.bytes ? ' · about ' + fmtTime((item.totalBytes-item.bytes)/sample.speed) + ' remaining' : '';
             const segmentCount = item.total ? ` · ${item.completed}/${item.total} segments` : '';
             const size = `${((item.bytes || 0) / (1024 * 1024)).toFixed(1)} MB`;
             const status = local ? (item.time > 0 ? `Resume at ${fmtTime(item.time)}` : 'Ready to play')
-                : `${running ? 'In progress' : item.status === 'cached' ? 'Ready to export' : 'Paused'} · ${size}${segmentCount}`;
+                : `${running ? 'In progress' : item.status === 'failed' ? (item.failure === 'storage' ? 'Storage full · free space and retry' : 'Transfer failed · retry available') : item.status === 'cached' ? 'Ready to export' : 'Paused'} · ${size}${segmentCount}${rate}${eta}${item.savedAt ? ' · Last saved ' + new Date(item.savedAt).toLocaleString() : ''}`;
             const expected = item.total || item.totalBytes;
             const received = item.total ? item.completed : item.bytes;
             const percent = expected ? Math.min(100, Math.round(100 * (received || 0) / expected)) : null;
             const progress = local || percent == null ? '' : `<progress max="100" value="${percent}" aria-label="Cached progress for ${esc(item.name)}"></progress>`;
             const target = local ? 'mode=local&amp;file=' : 'mode=offline&amp;id=';
-            const label = local ? (item.time > 0 ? 'Resume' : 'Play') : item.status === 'cached' ? 'Export' : 'Resume';
+            const label = local ? (item.time > 0 ? 'Resume' : 'Play') : item.status === 'cached' ? 'Export' : item.status === 'failed' ? 'Retry' : 'Resume';
             return `<li class="card lib-device-row">
+                ${!local && !running ? `<label><input type="checkbox" data-batch="${esc(item.id)}" ${batchSelection.has(item.id)?'checked':''}> Select</label>` : ''}
                 <div class="lib-device-details"><h3 class="vc-title">${esc(item.name)}</h3><p class="muted num">${esc(status)}${percent == null || local ? '' : ` · ${percent}%`}</p>${progress}</div>
-                ${running ? '' : `<div class="lib-device-actions">
+                ${running ? `<button type="button" class="btn small" data-device-pause="${esc(item.id)}">Pause download</button>` : `<div class="lib-device-actions">
                     <a class="btn btn-primary small" data-device-open="${esc(item.id)}" aria-label="${label} ${esc(item.name)}" href="../player/player.html?${target}${encodeURIComponent(item.id)}">${label}</a>
                     <button type="button" class="btn btn-quiet small lib-danger-text" data-device-remove="${esc(item.id)}" aria-label="${local ? 'Remove' : 'Delete'} ${esc(item.name)}">${local ? 'Remove' : 'Delete'}</button>
                 </div>`}
             </li>`;
         }).join('');
-        const content = openFile + (rows ? `<ul class="lib-device-list">${rows}</ul>` : emptyMarkup(deviceStatus || VIEWS[view].empty));
+        const batch = !local && rows ? `<div class="vc-actions"><button class="btn small" data-batch-start ${batchSelection.size?'':'disabled'}>Export selected (${batchSelection.size})</button>
+            ${storageRemaining == null ? '' : '<span class="muted">'+Math.round(storageRemaining/1048576)+' MiB available to the extension</span>'}</div>` : '';
+        const content = batch + openFile + (rows ? `<ul class="lib-device-list">${rows}</ul>` : emptyMarkup(deviceStatus || VIEWS[view].empty));
         if (lastMarkup === content) return;
         lastMarkup = content;
         const active = document.activeElement;
@@ -866,6 +943,14 @@
                 const result = await api.runtime.sendMessage({ action: 'VAULT_LIST' });
                 if (!result?.ok) throw new Error(result?.error || 'Could not load cached downloads.');
                 items = result.jobs;
+                const estimate = await navigator.storage?.estimate?.().catch(()=>null);
+                storageRemaining = estimate ? Math.max(0,estimate.quota-estimate.usage) : null;
+                const now = Date.now();
+                for (const job of items) {
+                    const old = transferSamples.get(job.id);
+                    transferSamples.set(job.id,{bytes:job.bytes, at:now, speed:old && now>old.at ? Math.max(0,job.bytes-old.bytes)*1000/(now-old.at):0});
+                }
+                for (const id of batchSelection) if (!items.some(i=>i.id===id && i.status!=='running')) batchSelection.delete(id);
             }
             if (view !== current || request !== deviceRequest) return;
             deviceEntries = items.sort((a, b) => collator.compare(a.name, b.name));
@@ -879,6 +964,27 @@
     }
 
     async function removeDeviceItem(event) {
+        if (event.target.matches('[data-batch]')) {
+            const id = event.target.dataset.batch;
+            if (event.target.checked) batchSelection.add(id); else batchSelection.delete(id);
+            render();
+            $('view').querySelector('[data-batch="'+CSS.escape(id)+'"]')?.focus();
+            return;
+        }
+        if (event.target.closest('[data-batch-start]') && batchSelection.size) {
+            const ids = [...batchSelection];
+            const params = new URLSearchParams({mode:'offline',id:ids.shift()});
+            ids.forEach(id=>params.append('next',id));
+            await api.tabs.create({url:api.runtime.getURL('player/player.html')+'?'+params});
+            return;
+        }
+        const pause = event.target.closest('[data-device-pause]');
+        if (pause) {
+            const r = await api.runtime.sendMessage({action:'VAULT_PAUSE',id:pause.dataset.devicePause});
+            if (!r?.ok) showMessage('Download is no longer running.');
+            await reloadDeviceItems();
+            return;
+        }
         const button = event.target.closest('[data-device-remove]');
         if (!button || !['local', 'offline'].includes(view)) return;
         const item = deviceEntries.find(entry => entry.id === button.dataset.deviceRemove);
@@ -971,7 +1077,31 @@
     document.addEventListener('DOMContentLoaded', async () => {
         try { $('version').textContent = `Aethvyr v${api.runtime.getManifest().version}`; } catch (_) { /* no manifest */ }
 
+        $('view').addEventListener('submit', async event => {
+            const form = event.target.closest('[data-episode-edit]');
+            if (!form) return;
+            event.preventDefault();
+            const fields = new FormData(form);
+            const details = {showTitle:fields.get('showTitle').trim(), kind:fields.get('kind'), medium:fields.get('medium')};
+            for (const field of ['season','episode']) details[field] = fields.get(field) === '' ? null : Number(fields.get(field));
+            try {
+                await api.storage.local.set({[EDIT_PREFIX + form.dataset.episodeEdit]:details});
+                announce('Episode details saved');
+            } catch (_) { showMessage('Could not save episode details.'); }
+        });
         const res = await api.storage.local.get(null);
+        artwork = res.fs_library_artwork === true;
+        $('library-artwork').checked = artwork;
+        $('library-artwork').onchange = e => api.storage.local.set({fs_library_artwork:e.target.checked});
+        for (const [key,value] of Object.entries(res)) if (key.startsWith(EDIT_PREFIX)) episodeEdits.set(key.slice(EDIT_PREFIX.length),value);
+        queue = res.fs_watch_queue || {};
+        stats = res.fs_watch_stats || {};
+        const layout = list => {
+            document.body.classList.toggle('library-list',list);
+            $('list-layout').setAttribute('aria-pressed',String(list));
+        };
+        layout(!!res.fs_library_list);
+        $('list-layout').onclick = () => { const list = !document.body.classList.contains('library-list'); layout(list); api.storage.local.set({fs_library_list:list}); };
         for (const [k, v] of Object.entries(res)) if (k.startsWith(SERIES_PREFIX) && SERIES_STATUS.includes(v)) seriesStatuses.set(k, v);
         for (const [key, value] of Object.entries(res)) if (key.startsWith(CATEGORY_PREFIX) && Object.hasOwn(S.LIBRARY_TYPES, value)) classifications.set(key.slice(CATEGORY_PREFIX.length), value);
         settings = S.mergeSettings(res[S.SETTINGS_KEY]);
@@ -1063,12 +1193,24 @@
         api.storage.onChanged.addListener((changes, area) => {
             if (area !== 'local') return;
             let dirty = false;
+            if (changes.fs_library_artwork) {
+                artwork = changes.fs_library_artwork.newValue === true;
+                $('library-artwork').checked = artwork;
+                dirty = true;
+            }
+            if (changes.fs_watch_queue) { queue = changes.fs_watch_queue.newValue || {}; dirty = true; }
+            if (changes.fs_watch_stats) { stats = changes.fs_watch_stats.newValue || {}; dirty = true; }
             if (changes[S.SETTINGS_KEY]) {
                 settings = S.mergeSettings(changes[S.SETTINGS_KEY].newValue);
                 applyTheme();
             }
             if (changes[LIBRARY_KEY]) { library = S.sanitizeLibrary(changes[LIBRARY_KEY].newValue); dirty = true; }
             for (const [k, ch] of Object.entries(changes)) {
+                if (k.startsWith(EDIT_PREFIX)) {
+                    if (ch.newValue) episodeEdits.set(k.slice(EDIT_PREFIX.length),ch.newValue);
+                    else episodeEdits.delete(k.slice(EDIT_PREFIX.length));
+                    dirty = true;
+                }
                 if (k.startsWith(BM_PREFIX) && has(history, k.slice(BM_PREFIX.length))) { setBookmarks(k.slice(BM_PREFIX.length), ch.newValue); dirty = true; }
                 if (k.startsWith(CATEGORY_PREFIX)) {
                     const key = k.slice(CATEGORY_PREFIX.length);

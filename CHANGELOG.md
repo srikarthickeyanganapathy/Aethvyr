@@ -7,6 +7,23 @@ bug-fix-only updates the patch version.
 
 ## Unreleased
 
+- Restricted website access, scoped media credentials and progressive playback rules, and added bulk privacy controls. Opt-in account sync upgrades older snapshots to format v3.
+
+- Completed the Aethvyr visual identity with an orbital prism mark, light and dark artwork, a matching launch badge, and updated Studio and diagnostic labels.
+
+## [2.10.0] - 2026-11-26
+
+- Added Whisper sentence practice, vocabulary bookmarks, TSV flashcards, local subtitle translation and local playback transcription for browsers with compatible installed language packs.
+
+## [2.9.0] - 2026-11-26
+
+- Added a persistent playback queue, confirmed next-episode navigation, cross-site series identity, list view, and optional local watch statistics.
+- Vault supports explicit batch selection, pause and resume, output naming, storage estimates, and transfer speed and ETA when measurable.
+
+## [2.8.0] - 2026-11-26
+
+- Added lightweight shortcuts and reversible visual enhancement for website players, cinema dimming, and popup controls for active playback sessions.
+
 - Added the Aethvyr toolbar mark, shared celestial palette, updated screenshots and playback demo.
 - Private player sessions now keep bookmarks, local-file records and segment caches in memory. Private exports skip durable checkpoints.
 

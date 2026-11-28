@@ -1,9 +1,9 @@
 # Privacy policy
 
-*Last updated: 25 November 2026*
+*Last updated: 26 November 2026*
 
 Aethvyr is a browser extension that plays and saves video from the pages you visit. It is
-designed to work entirely on your device.
+designed to work entirely on your device. The Aethvyr rebrand keeps existing settings, history and bookmarks in the same browser storage.
 
 ## What Aethvyr does not do
 
@@ -18,7 +18,7 @@ designed to work entirely on your device.
 | Data | Where it is stored | Purpose | Retention |
 |------|--------------------|---------|-----------|
 | Settings (player preferences, gestures, shortcuts, site profiles, sites set to *Always play in Aethvyr*) | `storage.local` | Your preferences | Until you change them or uninstall |
-| Watch positions and bookmarks (video URL, title, position) | `storage.local` | *Continue watching* and resume | Newest 200 videos; *Clear history* in the popup deletes them |
+| Watch positions and bookmarks (video URL, title, position) | `storage.local` | *Continue watching* and resume | Newest 200 history entries. History and bookmark deletion have separate controls. |
 | Library (favorites and collections of videos from your history) | `storage.local` | The library page | Until you remove them or uninstall |
 | Streams and subtitles detected in a tab | `storage.session` | The popup's stream list | Until the tab closes or the browser restarts |
 | Video segments | IndexedDB (extension origin) | Pre-buffering for smooth playback and seeking | Deleted when you close the player |
@@ -28,11 +28,20 @@ When you grant private-window access, the web video player skips watch-history w
 
 ## Network requests
 
-Aethvyr makes requests only to the servers that host the video you chose to play: playlists,
-segments, keys and subtitles. It repeats the headers the site's own player used (Referer,
-Origin, cookies for that site and authorization headers) so the server accepts the requests.
-These go to the same servers the site's player would contact. No request goes to the developer
-or any third party.
+Selected media can involve multiple servers. The engine's direct requests omit cookies and reject redirects. For a regular tab, the engine may replay an Authorization or X-Playback-Session-Id header observed for the same tab, frame, source origin and exact resource URL. This bounded cache lives in worker memory. The replay window is 15 minutes. Navigation, tab closure and worker termination clear entries. An update discards the older session-storage header cache.
+
+The owning page can fetch media under its browser origin, cookie and CORS policies. Private and cross-origin segment requests use that path. For progressive playback, an exact-resource rule can send the embedding origin as the Referer to the selected media server. The browser handles native video requests.
+
+## Removing local data
+
+| Data | Control |
+| --- | --- |
+| Watch positions | Clear history in the popup, or remove one entry in Library. |
+| Bookmarks | Clear bookmarks in popup settings, remove individual marks in Studio, or include bookmarks when removing a Library entry. |
+| Favorites and collections | Clear favorites and collections in popup settings, or edit individual items in Library. |
+| Prefetched media | Use Studio’s Purge & rebuild buffer action during playback. Closing the session releases its cache. |
+| Download records and checkpoint bytes | Pause an active transfer, then delete its entry in Library → Offline / Cached. Files already saved are managed in the browser or file manager. |
+| Browser-account copy | Turn off sync on participating devices, then choose Delete synced data in the popup. |
 
 ## Optional sync across your devices
 
@@ -51,7 +60,7 @@ and omits page URLs with URL credentials or paths that look like credentials. A 
 video ID is kept for watch-page navigation. Direct links and some sites that identify videos
 through query strings may need to be reopened manually on another device.
 
-An updated device rewrites older synced history the next time it successfully syncs. Update your
+Sync format v3 omits IP and local host addresses, recognizable direct media paths and nested encoded paths. It redacts URLs and common credential patterns in synced titles and labels. Free-form text may still identify what you watched. An updated device rewrites older synced history the next time it successfully syncs. Update your
 other devices to continue syncing. If sync is already off, use *Delete synced data* to clear older
 copies still stored in your account.
 
@@ -78,3 +87,7 @@ Changes to this policy are published in this file and noted in the changelog.
 
 Open an issue at
 <https://github.com/srikarthickeyanganapathy/Velostream/issues>.
+
+### Library artwork and organization
+
+Library artwork is off by default. Enabling **Load artwork from source websites** lets the library request publisher-supplied images from their hosting domains. Those hosts receive the image request and network address. The library suppresses the referrer. Episode corrections, the queue and its cleared snapshot, and optional watch statistics stay in local extension storage. Delete statistics from the Statistics view.

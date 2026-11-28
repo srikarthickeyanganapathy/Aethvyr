@@ -73,7 +73,7 @@ test('sync round trip merges newer positions without replacing local stream URLs
     };
     const source = await start(local(25, 3000));
     await source.syncNow();
-    assert.equal(remote.data.vs_meta.v, 2);
+    assert.equal(remote.data.vs_meta.v, 3);
     assert.equal(remote.data.vs_meta.s.hist.n, 1);
     const target = local(10, 1000);
     await start(target);
@@ -117,4 +117,26 @@ test('adaptive prefetch respects user ceilings and shares a hard budget across s
     assert.equal(typeof budget.take(), 'function');
     releaseTwo();
     assert.equal(budget.active, 1);
+});
+
+test('v2 history migration scrubs old remote chunks, respects deletion ties and is repeatable', async () => {
+    const { readFileSync } = await import('node:fs');
+    const remote = memoryStorage(JSON.parse(readFileSync(new URL('./fixtures/sync-v2.json', import.meta.url))));
+    const local = memoryStorage({ fs_settings: { syncEnabled: true }, fs_history: {
+        deleted: { url: '', title: 'Old', t: 1, updatedAt: 1500 }
+    } });
+    const clock = { now: () => 600000, setTimeout: () => 1, clearTimeout() {} };
+    const ctl = initSync({ api: { storage: { local, sync: remote, session: memoryStorage(), onChanged: { addListener() {} } } },
+        S: globalThis.VelostreamShared, clock });
+    await ctl.ready;
+    await ctl.whenIdle();
+    await ctl.syncNow();
+    assert.equal(remote.data.vs_meta.v, 3);
+    assert.equal(local.data.fs_history.episode.t, 17);
+    assert.equal(local.data.fs_history.deleted, undefined);
+    assert.equal(local.data.fs_history.episode.page, 'https://page.invalid/show');
+    assert.doesNotMatch(remote.data.vs_hist_0, /token=fixture|media\.invalid/);
+    const saved = structuredClone(remote.data);
+    await ctl.syncNow();
+    assert.deepEqual(remote.data, saved);
 });

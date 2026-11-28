@@ -122,7 +122,7 @@ Other storage keys:
 | Setting | Default | Values |
 |---------|---------|--------|
 | `audio.boost` | `100` | 100–300 % |
-| `audio.preset` | `normal` | `normal`, `voice`, `bass`, `night`, `custom` |
+| Audio preset | Flat (stored as normal) | Flat, Cinema, Voice, Night, Music, Bass or Custom |
 | `audio.eq` | `[0,0,0,0,0]` | dB at 60 Hz, 230 Hz, 910 Hz, 3.6 kHz, 14 kHz |
 | `audio.delayMs` | `0` | 0–1000 |
 | `audio.preservesPitch` | `true` | |
@@ -165,3 +165,5 @@ to accents.
 
 To add a setting: add it to `DEFAULT_SETTINGS`, clamp or validate it in `mergeSettings()`, and
 bump `settingsVersion` only when stored values must be rewritten.
+
+Lecture acceleration is session-only. Studio retains the silence threshold (default -48 dBFS), minimum silence (1500 ms) and speech padding (250 ms).

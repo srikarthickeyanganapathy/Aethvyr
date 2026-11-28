@@ -1,40 +1,21 @@
-# Permissions
-
-Every permission Aethvyr requests, why, and the justification text to use in store listings.
-
-| Permission | Why it is needed |
-|------------|------------------|
-| **Host access `<all_urls>`** | Video can be on any site and inside any embedded frame. The content scripts must run in every frame to detect streams, mount the player over the site's video and fetch with the page's identity. The engine needs host access to download playlists and segments without CORS restrictions. |
-| **`webRequest`** | Detects manifests requested by the site's player at network level, including those requested by Web Workers that content scripts cannot see. It also remembers the Referer, Origin and authorization headers each video host expects, so Aethvyr can repeat them. Read-only: requests are never blocked or modified through this API. |
-| **`declarativeNetRequest`**, **`declarativeNetRequestWithHostAccess`** | One static rule appends `Access-Control-Expose-Headers: Content-Length, Content-Range, Content-Type, Accept-Ranges` to media responses (playlists, segments, subtitles, keys) so byte-range downloads made through the page can read them; it changes nothing else. Per-host session rules add the site's Referer and Origin to requests made by Aethvyr itself (not the site's), because many video CDNs reject requests without them. |
-| **`scripting`** | Injects the content script into frames that were open before Aethvyr was installed or updated, so the player can launch without reloading the page. |
-| **`storage`**, **`unlimitedStorage`** | Settings, watch positions, bookmarks and the library (`storage.local`); per-tab detection state (`storage.session`); only when the user turns on sync, a small copy of settings, recent positions, bookmarks and library in `storage.sync`, which the browser syncs through the user's own account; the background pre-buffer of video segments in IndexedDB, which can be hundreds of megabytes. |
-| **`downloads`** | Saves videos, recordings and snapshots through the browser's download manager, with a *Save as* dialog. |
-| **`activeTab`** | Lets the popup act on the current tab (rescan, launch). |
+# Permissions and site access
 
 ## Store justification text
 
-> **Single purpose:** Aethvyr plays video streams found on web pages in an enhanced,
-> accessible player that pre-buffers, enhances and optionally saves them.
->
-> **Host permissions:** Videos can appear on any website and inside embedded frames. Aethvyr
-> must detect the stream in each frame, place its player over the site's video and download the
-> stream's playlist and segments. No page content is collected or transmitted.
->
-> **webRequest:** Read-only observation of media requests, to detect video manifests requested
-> by the site's player (including from Web Workers) and the headers the video server expects.
->
-> **declarativeNetRequest:** Adds the site's Referer/Origin to Aethvyr's own media requests
-> and exposes range headers on media responses, so streams from hot-link-protected CDNs play.
->
-> **scripting:** Injects Aethvyr's own content script into frames opened before installation
-> so the player can start without a page reload.
->
-> **storage / unlimitedStorage:** Stores settings, watch history and a local cache of video
-> segments for smooth seeking. If the user opts in to sync, settings and recent watch positions
-> are also kept in storage.sync so the browser can sync them through the user's own account.
->
-> **downloads:** Saves the video the user chooses to download.
->
-> **Remote code:** None. All code, including the bundled Shaka Player library, ships in the
-> package.
+| Access | Production use and scope |
+| --- | --- |
+| HTTP and HTTPS host access | Detect media at document start on user-visited websites and their embedded players. The engine reads selected media across origins. File selection works through browser file pickers. File, FTP and other schemes are outside the manifest match patterns. |
+| All matching frames and related blank frames | Embedded players frequently live on a different origin. Each content script operates in its own frame. The engine addresses the owning tab and frame for detection, mounting and page-context requests. |
+| Web-accessible player page | A website frame must be able to navigate its overlay iframe to `player/player.html`. Its JavaScript, shared utilities and bundled libraries load internally from the extension origin. |
+| `webRequest` | Observe request and response metadata for media discovery. In regular tabs, briefly retain selected authentication headers for the exact observed resource in worker memory. |
+| `declarativeNetRequestWithHostAccess` on Chromium, `declarativeNetRequest` on Firefox | Install session rules for progressive video when the extension needs to supply the embedding origin as Referer and expose the response to its player. Rules match an exact media URL, tab, media resource type and extension initiator. |
+| `scripting` | Load the isolated bridge in the requested frame when the user opens the player on an already-loaded website. |
+| `storage` | Store local preferences, library, history and bookmarks, temporary tab state and optional account sync. |
+| `unlimitedStorage` | Support user-configured IndexedDB media caches and resumable export checkpoints that can exceed normal origin retention limits. Application cache budgets and private-session memory limits still apply. |
+| `downloads` | Send an explicitly selected export or snapshot to the browser download manager. |
+
+## Optional and site-scoped access
+
+The automatic detector needs access before page scripts start, sometimes in an embedded origin unrelated to the top-level site. A click-time host grant alone cannot observe earlier requests in those frames. Users can restrict site access in browser extension settings. Denying an embedded host may limit detection there. A fully opt-in host mode would need a grant interface, registration of scripts for granted origins, and a reload path. The redundant `activeTab` permission was removed.
+
+Optional downloads would require coordinating a user-gesture permission prompt with delayed export completion and resume. That flow remains a separate compatibility item. The manifest requests one DNR permission per target. Chromium documents the host-access variant for extensions that already rely on host permissions. [Chrome permission declarations](https://developer.chrome.com/docs/extensions/develop/concepts/declare-permissions) · [Chrome DNR permissions](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest)

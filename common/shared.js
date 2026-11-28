@@ -41,8 +41,8 @@
     });
 
     const GRAPHICS_PRESETS = Object.freeze([
-        ['off', 'Off'], ['auto', 'Auto'], ['cas', 'Detail sharpening'],
-        ['deblock', 'Compression cleanup'], ['anime4k', 'Anime4K'], ['anime4k-hq', 'Anime4K High']
+        ['off', 'Off'], ['auto', 'Auto'], ['natural', 'Natural'], ['cas', 'Fast Sharpen'],
+        ['deblock', 'Compression cleanup'], ['anime4k', 'Animation'], ['anime4k-hq', 'Animation HQ'], ['color', 'Custom Color Studio']
     ].map(Object.freeze));
 
     function normalizeGraphicsPreset(value) {
@@ -157,11 +157,12 @@
         // Audio
         audio: {
             boost: 100,              // percent, 100-300
-            preset: 'normal',        // normal | voice | bass | night | custom
+            preset: 'normal',        // normal (Flat) | cinema | voice | bass | night | music | custom
             eq: [0, 0, 0, 0, 0],     // custom 5-band gains in dB (60Hz, 230Hz, 910Hz, 3.6kHz, 14kHz)
             delayMs: 0,              // 0-1000ms, delays audio relative to video
             preservesPitch: true,    // keep voice pitch when changing speed
             channels: 'stereo',      // stereo | mono | left | right
+            silenceDb: -48, silenceMs: 1500, speechPadMs: 250,
             loudnessNorm: false,     // smart loudness: slow auto-gain toward a target level + peak limiter
             width: 100,              // stereo width %, 0 (mono) - 200 (extra wide); 100 = as recorded
             crossfeed: false,        // headphone crossfeed: a little of each side, delayed + low-passed, into the other
@@ -249,6 +250,11 @@
         out.pausedBufferMB = Math.min(8192, Math.max(0, out.pausedBufferMB));
         out.memory.volume = Math.min(1, Math.max(0, out.memory.volume));
         out.autoSites = out.autoSites.filter(h => typeof h === 'string' && h.length < 256).slice(0, 500);
+        for (const [key, min, max] of [['silenceDb', -65, -30], ['silenceMs', 500, 4000], ['speechPadMs', 100, 500]]) {
+            const value = out.audio[key];
+            out.audio[key] = Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : DEFAULT_SETTINGS.audio[key];
+        }
+        out.audio.eq = Array.from({ length: 5 }, (_, i) => Math.max(-12, Math.min(12, Number(out.audio.eq?.[i]) || 0)));
         out.audio.boost = Math.min(300, Math.max(100, out.audio.boost));
         out.audio.delayMs = Math.min(1000, Math.max(0, out.audio.delayMs));
         out.audio.width = Math.min(200, Math.max(0, out.audio.width));
@@ -495,12 +501,18 @@
         return { favorites: cleanKeys(src.favorites), collections };
     }
 
-    const httpUrl = (u) => typeof u === 'string' && u.length < 4096 && /^https?:\/\//i.test(u) ? u : '';
+    const httpUrl = u => {
+        if (typeof u !== 'string' || u.length >= 4096) return '';
+        try {
+            const url = new URL(u);
+            return /^https?:$/.test(url.protocol) && !url.username && !url.password ? u : '';
+        } catch (_) { return ''; }
+    };
     const withoutResumeTime = value => typeof value === 'string' ? value.replace(/[#&?]velostream-t=\d+(?:\.\d+)?$/, '') : '';
     const finiteNum = (n) => (typeof n === 'number' && Number.isFinite(n) ? n : null);
 
     const LIBRARY_TYPES = Object.freeze({
-        series: 'Series', movie: 'Movie', anime: 'Anime', donghua: 'Donghua', cartoon: 'Cartoon', video: 'Other video'
+        series: 'Series', movie: 'Movie', anime: 'Anime', donghua: 'Donghua', cartoon: 'Cartoon', education: 'Educational', video: 'Other video'
     });
     const DONGHUA_SITES = new Set(['animexin', 'luciferdonghua', 'lmanime', 'donghuastream', 'cksub', 'animekhor', 'crimsonsubs']);
     const ANIME_SITES = new Set(['9anime', 'hianime', 'animepahe', 'crunchyroll', 'animeonsen', 'animesnatch', 'anisnatch', 'animeparadise', 'anikura', 'anikage', 'animekisa', 'animedex', 'watchanimex', 'anilover', 'animelover', 'anihq', 'anify', 'animekai', 'animegogo', 'gogoanime', 'anichan', 'anistream', 'animestream', 'kawaiianime', 'meguanimes', 'yumezone', 'yenime', 'aniclover', 'kotoplay', 'anisuge', 'reanime', 'anidream', 'miruro', 'anivault', 'gotaku', 'animex', 'anilight', 'nekowatch', 'anidap', 'anixo', 'justanime', 'weebtube', 'kickassanime', 'animenexus', 'zanix', 'kuroko', 'animey', 'aniwave', '123anime', 'anizone', 'animo', 'animotvslash', 'animetvplus', 'anihost', '2dhive', 'tsukuyomi', 'kyren', 'shonen', 'tatakai', 'enma', 'pahenime', 'banime', 'sakusaku', 'kototv', 'zenbu']);
@@ -523,18 +535,19 @@
         const numbered = episodic.match(/\bs(\d{1,3})[\s._/-]*e(\d+(?:\.\d+)?)/i);
         const season = numbered?.[1] || episodic.match(/\bseason[\s._/-]*(\d+)/i)?.[1];
         const episode = numbered?.[2] || episodic.match(/\b(?:episodes?|ep)[\s._/-]*(\d+(?:\.\d+)?)/i)?.[1];
+        const special = episodic.match(/\b(?:special|ova|oad)[\s._/-]*(\d+(?:\.\d+)?)(?!\w)/i);
         let format = kind === 'series' || kind === 'movie' ? kind : 'video';
         if (/^(?:video\.movie|movie)$/i.test(type || '')) format = 'movie';
         else if (/^(?:video\.(?:episode|tv_show)|TVEpisode|TVSeries)$/i.test(type || '')) format = 'series';
         else if (format === 'video') {
             if (/(?:^|\/)(?:movies?|films?)(?:\/|$)/i.test(route)) format = 'movie';
-            else if (episode || season || /(?:^|\/)(?:tv|series|shows?|episodes?)(?:\/|$)/i.test(route)) format = 'series';
+            else if (episode || season || special || /(?:^|\/)(?:tv|series|shows?|episodes?)(?:\/|$)/i.test(route)) format = 'series';
         }
         const animation = ['anime', 'donghua', 'cartoon'].includes(medium) ? medium :
             /\bdonghua\b|中国动画|国产动画|chinese animation/i.test(evidence) || site(DONGHUA_SITES) ? 'donghua' :
             /\banime\b|japanese animation/i.test(evidence) || site(ANIME_SITES) ? 'anime' :
             /\bcartoons?\b/i.test(evidence) || site(CARTOON_SITES) ? 'cartoon' : '';
-        return { kind: format, medium: animation, season: season ? Number(season) : null, episode: episode ? Number(episode) : null };
+        return { kind: format, medium: animation, season: season ? Number(season) : special ? 0 : null, episode: episode ? Number(episode) : special ? Number(special[1]) : null };
     }
 
     function sanitizePageMeta(raw) {
@@ -542,6 +555,7 @@
         return {
             pageUrl: httpUrl(withoutResumeTime(raw.pageUrl)),
             siteName: String(raw.siteName || '').slice(0, 200),
+            seriesIdentity: httpUrl(typeof raw.seriesIdentity === 'string' ? raw.seriesIdentity : ''),
             showTitle: String(raw.showTitle || '').slice(0, 200),
             kind: ['series', 'movie'].includes(raw.kind) ? raw.kind : 'video',
             medium: ['anime', 'donghua', 'cartoon'].includes(raw.medium) ? raw.medium : '',
@@ -633,6 +647,7 @@
         GRAPHICS_PRESETS,
         normalizeGraphicsPreset,
         graphicsBudget,
+        DEEP_SETTINGS: Object.freeze(['audio', 'subtitles', 'gestures', 'mouse', 'memory']),
         DEFAULT_SETTINGS,
         DEFAULT_KEYMAP,
         SETTINGS_KEY: 'fs_settings',
@@ -640,7 +655,7 @@
         ACCENTS: Object.freeze({
             blue: { label: 'Celestial Blue', fill: 'var(--accent-default)', strong: 'var(--accent-active)' },
             green: { label: 'Green', fill: '#30D158', strong: '#1E7A36' },
-            indigo: { label: 'Indigo', fill: '#5E5CE6', strong: '#4643C9' },
+            indigo: { label: 'Indigo', fill: 'var(--accent-secondary)', strong: '#4643C9' },
             amber: { label: 'Amber', fill: '#FF9F0A', strong: '#9A5B00' },
             rose: { label: 'Rose', fill: '#FF375F', strong: '#C21E45' }
         }),

@@ -487,7 +487,7 @@
             const res = await doFetch(url, method, headers, controller.signal, 'same-origin');
             const outHeaders = {};
             res.headers.forEach((v, k) => { outHeaders[k] = v; });
-            const buffer = (method === 'HEAD') ? new ArrayBuffer(0) : await res.arrayBuffer();
+            const buffer = (method === 'HEAD') ? new ArrayBuffer(0) : await globalThis.AethvyrReadLimitedBody(res,64 * 1024 ** 2);
             emit('FETCH_RESULT', { id, nonce: msg.nonce, ok: true, status: res.status, headers: outHeaders, url: res.url || url, buffer }, [buffer]);
         } catch (err) {
             emit('FETCH_RESULT', {
@@ -526,8 +526,8 @@
         const msg = event.data;
         if (!msg || msg.source !== TAG_IN || typeof msg.nonce !== 'string' || !/^[0-9a-f]{32}$/i.test(msg.nonce)) return;
         if (msg.type === 'RESCAN') { resetDetection(); return; }
-        if (typeof msg.id !== 'string') return;
-        if (msg.type === 'FS_FETCH' && typeof msg.url === 'string' && /^https?:\/\//i.test(msg.url) && ['GET', 'HEAD'].includes(msg.method) && !controllers.has(msg.id)) {
+        if (typeof msg.id !== 'string' || msg.id.length > 64) return;
+        if (msg.type === 'FS_FETCH' && typeof msg.url === 'string' && /^https?:\/\//i.test(msg.url) && ['GET', 'HEAD'].includes(msg.method) && msg.url.length <= 16384 && controllers.size < 64 && !controllers.has(msg.id)) {
             handleFetch(msg);
         } else if (msg.type === 'FS_ABORT') {
             const c = controllers.get(msg.id);

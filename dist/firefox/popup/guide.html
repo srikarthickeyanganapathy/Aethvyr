@@ -27,23 +27,32 @@
             <a href="#guide-library">Library</a>
         </nav>
 
-        <section class="card guide-start" id="guide-start">
+        <section class="card guide-start" id="guide-start" tabindex="-1">
             <h2>Start watching</h2>
             <ol>
                 <li><strong>On a website</strong> Start its video, then choose <strong>Play in Aethvyr</strong> or pick a stream in the toolbar popup.</li>
                 <li><strong>On your device</strong> Drop a file onto the overlay or choose <strong>Open Local File</strong> in the popup on a supported website tab.</li>
                 <li><strong>While watching</strong> Open <strong>Studio</strong> with the sliders button. Use <kbd>?</kbd> on a keyboard for the current shortcuts.</li>
             </ol>
+            <p>If the stream list is empty, play the video on its website, reopen the extension and choose <strong>Rescan tab</strong>. To return to the website player after launching Aethvyr, close the overlay.</p>
         </section>
 
         <div class="guide-grid">
             <section class="card" id="guide-watch">
                 <h2>Playback and subtitles</h2>
                 <dl>
+                    <dt>Choose a playback mode</dt>
+                    <dd>Open a detected stream for the full player, or keep the site player and select <strong>Lightweight shortcuts</strong> in the popup. <strong>Enhancement only</strong> adds a modest contrast and color boost. Both website modes use the existing video and skip the prefetch engine. Select <strong>Original website player</strong> to restore your settings.</dd>
+                    <dt>Control playback across tabs</dt>
+                    <dd>In the popup, select an open full-player session or this tab's enabled website player. Play, pause, mute, or jump to the selected tab. In a website mode use K to play or pause, M to mute, [ and ] for speed, and - and = for volume.</dd>
+                    <dt>Dim the website around its video</dt>
+                    <dd>Choose <strong>Cinema mode</strong> in the popup when the extension finds a visible video. On embedded players, dimming applies inside the video frame. Its controls stay usable. Press <kbd>Escape</kbd> or choose Cinema mode again to restore the page.</dd>
                     <dt>Seek or find a chapter</dt>
                     <dd>Drag the seekbar or hover for time and a preview when available. Open <strong>Studio → Tools → Chapters</strong> to jump to a chapter or load a WebVTT chapter file.</dd>
                     <dt>Load subtitles</dt>
                     <dd>Open <strong>Subtitles &amp; Audio</strong> with the captions button. Pick a track or load SRT, VTT, or ASS. Open the transcript to search and jump to a line.</dd>
+                    <dt>Study a subtitle line</dt>
+                    <dd>Open <strong>Transcript &amp; search → Whisper</strong> to practice a sentence, save a word with its context, or export flashcards. Choose the source and target languages for local translation. Local transcription requires a playing audio track and an installed speech pack.</dd>
                     <dt>Loop or watch in a small window</dt>
                     <dd>Use <strong>Studio → Tools</strong> for A–B loop, Mini player, and Picture in Picture where the browser supports it.</dd>
                 </dl>

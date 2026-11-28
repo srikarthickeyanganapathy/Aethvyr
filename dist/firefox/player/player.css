@@ -76,6 +76,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 .root.audio-only .vbox video { visibility: hidden; }
 .vbox .gl-canvas { position: absolute; left: 0; top: 0; pointer-events: none; display: block; }
 .vbox .gl-canvas[hidden], .root.audio-only .vbox .gl-canvas { display: none; }
+.vbox.gl-on.graphics-split .gl-canvas { clip-path: inset(0 0 0 50%); }
 .vbox.gl-on { overflow: hidden; }
 .audio-poster { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px; color: var(--fs-text-2); }
 .audio-poster svg { width: 64px; height: 64px; color: var(--fs-accent); }
@@ -96,7 +97,7 @@ button:disabled { opacity: 0.4; cursor: default; }
 .tr-row:focus-visible { outline: 2px solid var(--fs-accent); outline-offset: -2px; }
 .tr-row.active { background: rgba(255, 255, 255, 0.14); color: var(--fs-text); }
 .tr-row .tr-time { font-variant-numeric: tabular-nums; color: var(--fs-accent); font-size: 12px; padding-top: 2px; }
-.tr-row mark { background: var(--fs-accent); color: #fff; border-radius: 4px; padding: 0 2px; }
+.tr-row mark { background: var(--fs-accent); color: var(--bg-base); border-radius: 4px; padding: 0 2px; }
 .audio-viz { width: min(280px, 70%); height: 80px; }
 .audio-viz[hidden] { display: none; }
 .gesture { position: absolute; inset: 0; touch-action: none; }
@@ -112,6 +113,8 @@ button:disabled { opacity: 0.4; cursor: default; }
 .chrome { position: absolute; inset: 0; pointer-events: none; z-index: var(--z-dock); transition: opacity 280ms var(--fs-spring), visibility 280ms; }
 .root.controls-hidden .chrome { opacity: 0; visibility: hidden; }
 .root.controls-hidden { cursor: none; }
+.root.controls-hidden:has(.chrome :focus-visible) .chrome { opacity: 1; visibility: visible; }
+.root.controls-hidden:has(.chrome :focus-visible) { cursor: auto; }
 .root.locked .chrome, .root.mini .chrome { display: none; }
 
 /* ---------- Component A: floating header islands ---------- */
@@ -527,7 +530,10 @@ input[type="text"] { width: 100%; min-width: 0; }
 /* Studio controls are grouped by task and remain legible in embedded players. */
 .studio .pop-head { padding-block: 0 8px; }
 .studio .pop-body > .segmented { position: sticky; top: 0; z-index: 2; background: var(--bg-elevated); }
-.studio .segmented [aria-selected="true"] { background: var(--fs-accent-strong); color: white; }
+.studio .segmented [aria-selected="true"] { background: var(--accent-default); color: var(--bg-base); font-weight: 700; }
+@media (pointer: coarse) {
+    .studio .segmented [role="tab"], .studio summary { min-height: 44px; }
+}
 .display-section { margin: 0 0 8px; border: 1px solid var(--glass-border); border-radius: var(--radius-panel); background: #ffffff06; }
 .display-section > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 52px; padding: 8px 12px; cursor: pointer; font-weight: 650; }
 .display-section > summary::after { content: ''; inline-size: 8px; block-size: 8px; flex: none; margin-right: 3px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg); }
@@ -632,3 +638,5 @@ button.local-control, summary.local-control, a.local-control, select.local-contr
 .tip-thumb canvas { display: block; max-width: 100%; height: auto; }
 
 .pop-guide { margin-inline-start: auto; text-decoration: none; white-space: nowrap; font-size: 12px; }
+.next-offer { position:absolute; inset:auto 5% 24%; z-index:30; display:flex; flex-wrap:wrap; align-items:center; gap:.75rem; padding:1rem; background:#141927; color:white; border-radius:.75rem; } .next-offer button { padding:.5rem .75rem; color:inherit; background:#343e56; border-radius:.4rem; }
+.study { padding:.4rem .65rem; overflow:auto; max-height:48%; flex-shrink:0; } .study summary { cursor:pointer; } .study-controls { display:flex; gap:.45rem; flex-wrap:wrap; align-items:center; padding:.5rem 0; } .study-controls input:not([type=checkbox]), .study-controls select, .study-controls button { color:inherit; background:#233046; padding:.35rem; border:1px solid #65748a; border-radius:.35rem; } .study-controls input { max-width:9rem; } .study-controls output { width:100%; }

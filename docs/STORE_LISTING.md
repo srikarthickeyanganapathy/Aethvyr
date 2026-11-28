@@ -43,6 +43,8 @@ unmodified third-party library Shaka Player, which reviewers verify against its 
 **Description:**
 
 ```
+Experience the unseen.
+
 Aethvyr finds the video a page is playing and opens it in its own player, placed exactly over the site's video.
 
 FAST
@@ -95,8 +97,8 @@ The 8 UNSUPPORTED_API warnings (cast.*, webview.hostObjects) come from that unmo
 
 Permissions:
 - content/interceptor.js runs in the MAIN world to observe the page's own fetch/XHR/Worker/MediaSource calls for stream detection, and to perform fetches with the page's own identity when the background asks for a segment the server only serves to the page.
-- webRequest is used read-only (no blocking) to detect manifests requested by workers and remember the Referer/Origin a video host expects.
-- declarativeNetRequest: one static rule exposes Content-Range/Content-Length on media responses; session rules add the site's Referer/Origin to the extension's own media requests.
+- webRequest is used read-only (no blocking) to detect manifests requested by workers and scope short-lived media authentication to observed resources.
+- declarativeNetRequest: session rules apply to the selected progressive media URL, extension initiator and tab. The static response-header rule was removed.
 - downloads: saving videos the user chooses to download.
 
 No remote code, no eval, no analytics; data_collection_permissions is "none".

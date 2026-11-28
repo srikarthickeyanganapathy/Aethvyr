@@ -2,20 +2,19 @@
     "manifest_version": 3,
     "name": "Aethvyr — Universal Video Player",
     "short_name": "Aethvyr",
-    "version": "2.7.1",
-    "description": "Accessible, customizable HLS/DASH/MP4 player with parallel prefetching for mobile and desktop browsers.",
+    "version": "2.10.0",
+    "description": "Aethvyr plays HLS, DASH and MP4 video in an accessible player with adaptive buffering and a personal library.",
     "permissions": [
         "downloads",
-        "declarativeNetRequest",
         "declarativeNetRequestWithHostAccess",
         "webRequest",
         "storage",
         "unlimitedStorage",
-        "scripting",
-        "activeTab"
+        "scripting"
     ],
     "host_permissions": [
-        "<all_urls>"
+        "http://*/*",
+        "https://*/*"
     ],
     "background": {
         "service_worker": "background/engine.js",
@@ -24,9 +23,11 @@
     "content_scripts": [
         {
             "matches": [
-                "<all_urls>"
+                "http://*/*",
+                "https://*/*"
             ],
             "js": [
+                "common/limited-body.js",
                 "content/interceptor.js"
             ],
             "run_at": "document_start",
@@ -36,10 +37,13 @@
         },
         {
             "matches": [
-                "<all_urls>"
+                "http://*/*",
+                "https://*/*"
             ],
             "js": [
                 "common/shared.js",
+                "content/media-elements.js",
+                "content/episode-adapters.js",
                 "content/sniffer.js"
             ],
             "run_at": "document_start",
@@ -50,29 +54,14 @@
     "web_accessible_resources": [
         {
             "resources": [
-                "player/player.html",
-                "player/player.js",
-                "player/player-ui.js",
-                "player/mp4-mux.js",
-                "player/anime4k.js",
-                "player/shader-pipeline.js",
-                "lib/shaka-player.compiled.js",
-                "common/shared.js"
+                "player/player.html"
             ],
             "matches": [
-                "<all_urls>"
+                "http://*/*",
+                "https://*/*"
             ]
         }
     ],
-    "declarative_net_request": {
-        "rule_resources": [
-            {
-                "id": "stream_rules",
-                "enabled": true,
-                "path": "rules/stream_rules.json"
-            }
-        ]
-    },
     "icons": {
         "16": "icons/icon-16.png",
         "32": "icons/icon-32.png",
@@ -88,5 +77,8 @@
             "48": "icons/icon-48.png",
             "128": "icons/icon-128.png"
         }
+    },
+    "content_security_policy": {
+        "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
     }
 }

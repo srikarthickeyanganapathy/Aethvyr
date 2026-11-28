@@ -19,7 +19,7 @@
     },
     "overrides": [
         {
-            "files": ["background/**/*.js", "scripts/**/*.js"],
+            "files": ["background/**/*.js", "player/**/*.js", "common/**/*.js", "scripts/**/*.js"],
             "parserOptions": { "sourceType": "module" }
         },
         {

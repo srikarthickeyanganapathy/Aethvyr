@@ -40,7 +40,31 @@ async function run() {
     const job = await downloadStore.get('fixture');
     const chunk = await downloadStore.read('fixture', 'seg:0');
     expect(job.completedCount === 1 && String(new Uint8Array(chunk.data)) === '7,13', 'Download checkpoint lost');
-    if (options.get('stage') === 'verify') return 'upgrade-verified';
+    if (options.get('stage') === 'verify') {
+        if (Number(runtime.getManifest().version.split('.')[1]) >= 9) {
+            const frame = document.createElement('iframe');
+            frame.src = runtime.getURL('popup/library.html#recent');
+            document.body.append(frame);
+            const find = async selector => {
+                for (let i=0;i<100;i++) {
+                    const el = frame.contentDocument?.querySelector(selector);
+                    if (el) return el;
+                    await new Promise(resolve=>setTimeout(resolve,50));
+                }
+                throw Error('Library control missing: '+selector);
+            }
+            (await find('[data-action="queue-add"][data-key="fixture"]')).click();
+            (await find('[data-view="queue"]')).click();
+            await find('[data-action="queue-remove"][data-key="fixture"]');
+            (await find('[data-view="statistics"]')).click();
+            (await find('[data-action="stats-toggle"]')).click();
+            (await find('[data-view="offline"]')).click();
+            (await find('[data-batch="fixture"]')).click();
+            await find('[data-batch-start]:enabled');
+            frame.remove();
+        }
+        return 'upgrade-verified';
+    }
     const regular = await runtime.sendMessage({ action: 'HISTORY_SAVE', key: 'regularfixture',
         entry: { url: 'https://fixture.invalid/regular.mp4', t: 11 } });
     expect(regular?.ok, 'Regular history request failed');

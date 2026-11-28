@@ -163,8 +163,9 @@ Studio is the settings panel inside the player (sliders button). It has five tab
 
 ### Audio
 
-- **Equalizer** presets (Normal, Voice, Bass, Night) or a custom 5-band EQ, and **boost** up to
+- **Equalizer** presets (Flat, Cinema, Voice, Night, Music, Bass) or a custom 5-band EQ, and **boost** up to
   300 %.
+- **Accelerate silent lecture passages** in Studio → Audio is off each time you open a player. Enable it for a lecture or podcast and adjust the threshold, minimum quiet time and speech padding. Quiet runs play at 2×. Turn it off to cancel immediately. Quiet music can also trigger it.
 - **Audio delay (lip sync)**: 0–1000 ms.
 - **Output**: stereo, mono downmix, left only or right only, and *Keep voice pitch when speeding up*.
 - **Smart loudness normalization**: keeps the volume even across scenes and videos. It slowly lifts
@@ -253,39 +254,9 @@ Open the **CC** button (*Subtitles & Audio*).
 
 ## GPU enhancement
 
-Studio → Display → **GPU enhancement** processes every frame with WebGL2 shaders on a canvas laid
-exactly over the video.
+In **Studio → Display → Graphics**, choose Off, Auto, Natural, Fast Sharpen, Animation, Animation HQ, Compression Cleanup or Custom Color Studio. Natural applies low-strength contrast-adaptive sharpening. Animation selects the bundled Anime4K networks with a lighter fallback. Custom Color Studio uses the grading controls below the preset selector. Neutral grading adds no pass. Off disables preset enhancement; independent picture controls still apply.
 
-| Preset | What it does | Best for |
-|--------|--------------|----------|
-| **Off** | Native browser rendering | Battery |
-| **Fast Sharpen** (CAS) | Contrast-adaptive sharpening in one pass | Soft or low-bitrate video |
-| **FSR upscale** | Lanczos-2 upscale with anti-ringing, then RCAS sharpening | Low resolution shown on a big screen |
-| **Anime4K (fast)** | The real Anime4K neural networks (Restore S + Upscale ×2 S): cleans up compression and blur, then doubles the resolution | Animation on phones and laptops |
-| **Anime4K HQ** | The larger Anime4K networks (Restore M + Upscale ×2 M), noticeably sharper line art | Animation on a dedicated or recent integrated GPU |
-| **De-block + sharpen** | Smooths the 8×8 block edges of low-bitrate video where both sides are flat, then lightly sharpens | 360p–720p web video |
-| **Denoise** | Edge-preserving (bilateral) noise removal; *grain* can be kept | Old, dark or noisy video |
-| **Deband** | Smooths colour banding in flat areas, with dithering | Gradients, skies, dark scenes |
-
-Measured on an Intel integrated GPU (848×480 source shown at 1080p): Fast Sharpen 0.3 ms per frame,
-De-block 0.3 ms, Deband 0.6 ms, Denoise 1.5 ms, FSR 2.6 ms, Anime4K 3.1 ms, Anime4K HQ 5.5 ms.
-
-- **Strength** scales the effect. **Max render resolution** caps the canvas size; lower it on
-  weak GPUs.
-- FSR and Anime4K only upscale when the video is shown **larger than its source** (Anime4K: more
-  than 1.2×). Otherwise FSR runs a single sharpening pass and Anime4K runs only its Restore network.
-- Anime4K needs half-float render targets. Where the GPU does not offer them it automatically uses
-  the older *Anime4K-lite* shader instead; *Stats for nerds* shows which path is running. The
-  networks compile in the background the first time, with Anime4K-lite shown meanwhile.
-- The **thermal guard** watches frame time and dropped frames. If the GPU cannot keep up for about
-  6 s, it steps down (Anime4K HQ → Anime4K → Fast Sharpen → Off; FSR → Fast Sharpen → Off;
-  De-block, Denoise, Deband → Off) for this session only and tells you. Your saved choice is kept.
-  Color Studio grading is never stepped down (it is very cheap).
-- When the sharpness slider is above 0 and no preset is chosen, Fast Sharpen is used
-  automatically. Colour filters apply on top.
-- GPU enhancement is unavailable when WebGL2 is missing, and for **direct files from another
-  site served without CORS**: the browser does not let any page read those pixels. Streams (HLS
-  and DASH) always work.
+Use **Show original** for a persistent comparison, **Preview original** for two seconds, or **Split view** to show the unprocessed video on the left and active GPU output on the right. Reset in Color Studio restores neutral picture and grading values. Auto considers device class and source height. Eco and software rendering suppress Auto sharpening. See the [Vision measurements and compatibility report](PHASE6-VISION.md).
 
 ---
 
@@ -397,3 +368,7 @@ Aethvyr is built to be fully usable without a mouse or without sight:
 - **high contrast**, **reduced motion** (follows your system by default), **interface size** up to
   150 %, and a **simple mode** that hides advanced controls;
 - subtitle fonts for dyslexia and low vision, with adjustable size, colours and background.
+See the [player and Studio experience guide](PHASE5-EXPERIENCE.md) for playback modes, theater shading, settings search and restoring individual defaults.
+
+
+For library shelves, season and episode corrections, queue restoration and optional artwork, see the [personal library guide](PHASE8-LIBRARY.md).

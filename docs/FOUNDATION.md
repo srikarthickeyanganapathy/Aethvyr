@@ -139,7 +139,36 @@ Reproduce the scheduler run with `node scripts/benchmark-seek.js --compare-prior
 - **Completed** — repository and version inventory, local test baseline, display-name changes, package naming, CI artifact glob, current documentation copy, backup round trip and browser-specific packages.
 - **Completed · Phase 1** — shared celestial palette, contrast regression, toolbar states at 16/32/48/128 px, monochrome mark, promotional artwork, real screenshots and a short demo. Edge 158 preserved the same unpacked identity, a real origin-private file handle, bookmarks, history, collection and cached download bytes across an upgrade. A generated progressive MP4 exercised detection, mounting, playback, seeking, closing and native playback restoration. Edge InPrivate checks covered a session-only bookmark, local-file record, media cache and export. Firefox 160 passed both upgrade scenarios, private watch history and local-file isolation. Store-signed delivery, Android and live browser-account sync remain release qualification work.
 - **Completed (Phase 2)**. All seven implementation areas and local checks are recorded in the [completion report](#phase-2-completion-report).
-- **Proposed · Phase 3** — test native restoration, then implement lightweight and enhancement-only modes, reversible cinema controls and global session controls.
-- **Proposed · Phase 4** — improve episode identity, next-episode confirmation, watch queues and persistent download management.
+- **Completed (Phase 3)**. Edge 158 exercised lightweight shortcuts, CSS enhancement and restoration, cinema dimming, Escape, help focus, session selection and remote play/pause. Firefox 160 exercised upgrades and private storage. Embedded cinema dimming stays inside the selected frame.
+- **Completed (Phase 4)**. See the [Library and Vault browser checks](#phase-4-library-and-vault).
 - **Proposed · Phases 5–6** — subtitle learning controls first, opt-in local language processing and graphics experiments after core reliability gates.
 - **Blocked on external prerequisites** — repository rename, store listing changes, signing and publication need owner access and explicit approval. Device-specific benchmark claims need corresponding hardware and test runs.
+
+### Phase 4 Library and Vault
+
+Version 2.9.0 was checked on Windows on 26 November 2026. The Edge 158 integration runner installed the unpacked extension, upgraded the disposable legacy profile and opened the actual Library, player and Vault pages. It used local fixture media and controlled input data. Firefox 160 ran the Library UI and upgrade checks in disposable copies of the Firefox packages with a test probe.
+
+| Area | Observed in the browser |
+|---|---|
+| Episodes and queue | Added three episode cards, reordered two, removed one, enabled repeat, reloaded the Library and checked the exact order. Opened the episode list and switched the layout. |
+| Up next | Played a real MP4 to its end. The player offered the queued title. Cancel dismissed it. With an empty queue, the player found an explicit next-episode link and opened the expected URL after confirmation. |
+| Vault | Selected two paused jobs in the Library and started the batch. Paused and resumed the first transfer from the export UI. The second job started automatically. Both final files matched the 31,064-byte local MP4 byte for byte. |
+| Statistics | Enabled recording in the Library, observed watch time increase during playback, disabled recording, accepted the delete dialog and verified removal from local storage. |
+| Firefox | Added a saved title to the queue, found the queued row, enabled statistics and selected a Vault item. Upgrade and private-storage checks passed with browser sync enabled and disabled. |
+
+The runner captures [the queue](media/phase4-queue.png), [Vault](media/phase4-vault.png) and [the in-player offer](media/phase4-up-next.png). Reproduce the Edge run with `node scripts/chromium-foundation.mjs "<Edge executable>" dist/velostream-chrome-2.7.1.zip --library`. Reproduce Firefox with `python scripts/firefox-upgrade.py --firefox "<Firefox executable>" dist/velostream-firefox-2.7.1.zip dist/aethvyr-firefox-2.9.0.zip`.
+
+Queue entries reference local watch history. Cross-site grouping requires shared publisher series identifiers. Countdown playback is opt-in and requires a visible player and an explicit queue item or high-confidence next-episode link. Statistics cover full-player sessions. The desktop fixtures do not establish coverage of Android, every website, expiring URLs, or interrupted transfers on real CDNs.
+
+
+### Phase 5 Whisper
+
+Version 2.10.0 adds language learning in the player transcript. Open Subtitles and audio tracks, choose Transcript & search, then expand Whisper. Previous and Next follow subtitle lines. Play sentence respects subtitle speed and delay and either pauses or repeats at the line boundary. Bookmark sentence adds a timed player bookmark. WebVTT ruby readings remain readable in parentheses. The secondary subtitle color and primary visibility can be adjusted separately.
+
+Select or enter a word and save it with the current line and source language. The UTF-8 flashcard export contains three tab-separated fields per card (term, context, language). Saved words stay in the browser profile. In private playback, words are held in the player session. Open Wiktionary sends the selected term to that site only when clicked.
+
+Translation uses the installed browser Translator API and language pair. It translates loaded cues to the secondary track. Transcription uses on-device SpeechRecognition and an audio track captured from the playing video. Seeking, pausing, stopping processing or closing the player ends recognition. Speech times are approximate. Both features require the browser to report an installed model. The browser manages model storage, and the extension requests no microphone permission or model downloads.
+
+On Windows, Edge 158 imported a WebVTT file, displayed its Japanese reading, navigated sentences, paused at the line end, created a timed bookmark and exported a flashcard. The test read the downloaded file and verified the term, cue context and language. Edge reported missing packs for English speech and English-to-Spanish translation. Controlled provider responses in the same browser verified secondary subtitle rendering, color and visibility, transcription cue insertion and cancellation. Real recognition accuracy, translation quality, latency and device resource use remain unmeasured. Firefox 160 verified package upgrade and private storage with sync on and off.
+
+Reproduce with `node scripts/chromium-foundation.mjs "<Edge executable>" dist/velostream-chrome-2.7.1.zip --whisper`. [Browser screenshot](media/phase5-whisper.png).

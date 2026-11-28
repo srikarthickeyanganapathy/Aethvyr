@@ -1,13 +1,27 @@
 /** Durable download checkpoints. Chunk writes and their progress update commit together. */
 let connection;
+export const VAULT_LIMIT = 4 * 1024 ** 3;
+export function hasVaultSpace(used, extra) {
+    return Number.isSafeInteger(used) && Number.isSafeInteger(extra) && extra >= 0 && used >= 0 && used + extra <= VAULT_LIMIT;
+}
 
 function database() {
     if (connection) return connection;
     connection = new Promise((resolve, reject) => {
-        const request = indexedDB.open('VelostreamDownloads', 1);
-        request.onupgradeneeded = () => {
+        const request = indexedDB.open('VelostreamDownloads', 2);
+        request.onupgradeneeded = event => {
+            if (event.oldVersion < 1) {
             request.result.createObjectStore('jobs', { keyPath: 'id' });
             request.result.createObjectStore('chunks', { keyPath: ['streamId', 'segmentIndex'] });
+            }
+            const totals = request.result.createObjectStore('usage');
+            let used = 0;
+            const rows = request.transaction.objectStore('jobs').openCursor();
+            rows.onsuccess = () => {
+                const row = rows.result;
+                if (row) { used += row.value.bytes || 0; row.continue(); }
+                else totals.put(used, 'bytes');
+            };
         };
         request.onsuccess = () => {
             const db = request.result;
@@ -26,7 +40,7 @@ async function transaction(stores, mode, body) {
         const tx = db.transaction(stores, mode);
         const result = body(tx);
         tx.oncomplete = () => resolve(result?.result);
-        tx.onabort = () => reject(tx.error || new Error('Download transaction aborted.'));
+        tx.onabort = () => reject(tx.vaultError || tx.error || new Error('Download transaction aborted.'));
     });
 }
 
@@ -41,7 +55,7 @@ export const downloadStore = {
                 const job = cursor.value;
                 summaries.push({
                     id: job.id, name: job.base, bytes: job.bytes, totalBytes: job.totalBytes,
-                    total: job.totalSegments, completed: job.completedCount, status: job.status
+                    total: job.totalSegments, completed: job.completedCount, status: job.status, savedAt: job.savedAt, failure: job.failure
                 });
                 cursor.continue();
             };
@@ -50,8 +64,13 @@ export const downloadStore = {
     },
     get: id => transaction('jobs', 'readonly', tx => tx.objectStore('jobs').get(id)),
     save: job => transaction('jobs', 'readwrite', tx => tx.objectStore('jobs').put(job)),
+    update: (id, patch) => transaction('jobs', 'readwrite', tx => {
+        const store = tx.objectStore('jobs');
+        const row = store.get(id);
+        row.onsuccess = () => { if (row.result) store.put({ ...row.result, ...patch }); };
+    }),
     read: (id, index) => transaction('chunks', 'readonly', tx => tx.objectStore('chunks').get([id, index])),
-    commit: (id, index, chunk) => transaction(['jobs', 'chunks'], 'readwrite', tx => {
+    commit: (id, index, chunk) => transaction(['jobs', 'chunks','usage'], 'readwrite', tx => {
         const jobs = tx.objectStore('jobs');
         const chunks = tx.objectStore('chunks');
         const req = jobs.get(id);
@@ -61,6 +80,16 @@ export const downloadStore = {
             const existing = chunks.getKey([id, index]);
             existing.onsuccess = () => {
                 if (existing.result) return;
+                const usage = tx.objectStore('usage');
+                const size = usage.get('bytes');
+                size.onsuccess = () => {
+                    if (!hasVaultSpace(size.result, chunk.data.byteLength)) {
+                        tx.vaultError = new Error('Vault storage limit reached. Delete cached jobs before retrying.');
+                        tx.abort();
+                        return;
+                    }
+                    usage.put(size.result + chunk.data.byteLength, 'bytes');
+                };
                 chunks.put({ ...chunk, streamId: id, segmentIndex: index });
                 job.bytes = (job.bytes || 0) + chunk.data.byteLength;
                 if (index.startsWith('seg:')) job.completedCount = (job.completedCount || 0) + 1;
@@ -72,9 +101,17 @@ export const downloadStore = {
             };
         };
     }),
-    remove: id => transaction(['jobs', 'chunks'], 'readwrite', tx => {
+    remove: id => transaction(['jobs', 'chunks','usage'], 'readwrite', tx => {
         tx.objectStore('chunks').delete(IDBKeyRange.bound([id], [id, []]));
-        tx.objectStore('jobs').delete(id);
+        const jobs = tx.objectStore('jobs');
+        const row = jobs.get(id);
+        row.onsuccess = () => {
+            if (!row.result) return;
+            const usage = tx.objectStore('usage');
+            const size = usage.get('bytes');
+            size.onsuccess = () => usage.put(Math.max(0, size.result - (row.result.bytes || 0)), 'bytes');
+            jobs.delete(id);
+        };
     })
 };
 

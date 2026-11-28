@@ -430,7 +430,7 @@
             const patch = {};
             for (const [key, value] of Object.entries(next)) {
                 if (JSON.stringify(value) === JSON.stringify(base[key])) continue;
-                if (['audio', 'subtitles', 'gestures', 'mouse', 'memory'].includes(key) && value && typeof value === 'object') {
+                if (S.DEEP_SETTINGS.includes(key) && value && typeof value === 'object') {
                     patch[key] = Object.fromEntries(Object.entries(value).filter(([field, v]) =>
                         JSON.stringify(v) !== JSON.stringify(base[key]?.[field])));
                 } else patch[key] = value;
@@ -514,6 +514,35 @@
         renderHistory();
 
         $('empty-rescan').addEventListener('click', () => $('rescan-btn').click());
+        const categories = [...$('settings-form').querySelectorAll('fieldset')];
+        for (const category of categories) {
+            const group = document.createElement('optgroup');
+            group.label = category.querySelector('legend').textContent;
+            for (const input of category.querySelectorAll('[name]')) {
+                const label = input.labels?.[0]?.textContent.trim() || input.name;
+                group.append(new Option(label, input.name));
+            }
+            if (category.querySelector('.swatches')) group.append(new Option('Accent', 'theme'));
+            $('restore-field').append(group);
+        }
+        $('restore-default').addEventListener('click', async () => {
+            const choice = $('restore-field').selectedOptions[0];
+            const path = choice.value.split('.');
+            await saveSettings(next => {
+                const target = path.slice(0, -1).reduce((obj, key) => obj[key], next);
+                target[path.at(-1)] = readPath(S.DEFAULT_SETTINGS, choice.value);
+            }, choice.textContent);
+            fillForm();
+        });
+        $('settings-search').addEventListener('input', event => {
+            const query = event.target.value.trim().toLowerCase();
+            let count = 0;
+            for (const category of categories) {
+                category.hidden = !category.textContent.toLowerCase().includes(query);
+                if (!category.hidden) count++;
+            }
+            $('settings-results').textContent = query ? (count ? count + ' matching categories' : 'No matching settings') : '';
+        });
         $('settings-form').addEventListener('change', (e) => { if (e.target.name) saveField(e.target); });
         document.querySelectorAll('.swatch').forEach((b, i, all) => {
             b.addEventListener('click', () => saveSettings(next => { next.theme = b.dataset.accent; }, `${b.getAttribute('aria-label')} accent`));
@@ -642,6 +671,17 @@
             showMessage(friendlyError(res && res.error));
             input.focus();
         });
+        for (const [id, action, label] of [
+            ['clear-bookmarks', 'CLEAR_BOOKMARKS', 'all saved bookmarks'],
+            ['clear-library', 'CLEAR_LIBRARY', 'all favorites and collections']
+        ]) {
+            $(id).addEventListener('click', async () => {
+                if (!window.confirm('Delete ' + label + '? Deletions can sync to your other devices.')) return;
+                const result = await send({ action });
+                if (result?.ok) announce('Deleted ' + label);
+                else showMessage('Could not delete ' + label);
+            });
+        }
         $('history-clear').addEventListener('click', async () => {
             const res = await send({ action: 'HISTORY_CLEAR' });
             if (!res?.ok) { showMessage(res?.error || 'Could not clear history.'); return; }
@@ -707,6 +747,67 @@
             for (const id of ['rescan-btn', 'empty-rescan', 'clear-btn']) $(id).disabled = true;
             return;
         }
+        const cinemaButton = $('cinema');
+        let frameId = 0;
+        const frameMessage = message => api.tabs.sendMessage(tabId, message, { frameId }).catch(() => null);
+        async function refreshModes() {
+            const info = await send({ action: 'GET_STREAMS', tabId });
+            let state;
+            for (const id of new Set([frameId, 0, ...(info.videoFrames || [])])) {
+                const candidate = await api.tabs.sendMessage(tabId, { action: 'CINEMA_STATE' }, { frameId: id }).catch(() => null);
+                if (candidate?.available && !info.player) { state = candidate; frameId = id; break; }
+            }
+            const list = await send({ action: 'PLAYBACK_SESSIONS', privateContext: !!tab.incognito });
+            const targets = (list.sessions || []).map(s => [String(s.tabId), s.title + ' (tab ' + s.tabId + ', ' + (s.paused ? 'paused' : 'playing') + ')']);
+            if (state && state.mode !== 'original') targets.unshift(['native', 'Website player on this tab']);
+            const select = $('session-target');
+            const sig = JSON.stringify(targets);
+            if (sig !== select.dataset.targets) {
+                const previous = select.value;
+                select.replaceChildren(...targets.map(([value, label]) => new Option(label, value)));
+                if (targets.some(([id]) => id === previous)) select.value = previous;
+                select.dataset.targets = sig;
+            }
+            $('playback-modes').hidden = !state && !targets.length;
+            $('native-mode-label').hidden = !state;
+            $('native-mode').value = state?.mode || 'original';
+            $('mode-help').textContent = !state ? 'Control an open Aethvyr player.' : state.mode === 'original'
+                ? 'Choose a detected stream below for the full Aethvyr player.'
+                : 'K plays or pauses, M mutes, [ and ] change speed, and - and = change volume. Choose Original to restore.';
+            $('session-label').hidden = !targets.length;
+            $('media-actions').hidden = !targets.length;
+            $('cinema-light-label').hidden = !state?.active;
+            if (state?.shade) $('cinema-light').value = state.shade;
+            cinemaButton.hidden = !state;
+            cinemaButton.setAttribute('aria-pressed', String(!!state?.active));
+        }
+        $('native-mode').addEventListener('change', async e => {
+            const res = await frameMessage({ action: 'NATIVE_MODE', mode: e.target.value });
+            if (!res?.ok) showMessage('The website video is no longer available.');
+            await refreshModes();
+        });
+        for (const command of ['toggle','mute','jump']) $('media-' + command).addEventListener('click', async () => {
+            const target = $('session-target').value;
+            if (command === 'jump') {
+                const t = await api.tabs.update(target === 'native' ? tabId : Number(target), { active: true }).catch(() => null);
+                if (t) await api.windows.update(t.windowId, { focused: true }).catch(() => {});
+                return;
+            }
+            const r = target === 'native' ? await frameMessage({ action: 'NATIVE_CONTROL', command })
+                : await send({ action: 'PLAYER_CONTROL', tabId: Number(target), command, privateContext: !!tab.incognito });
+            if (!r?.ok) showMessage('The player could not apply that control.');
+            await refreshModes();
+        });
+        async function updateCinema(action) {
+            const state = await api.tabs.sendMessage(tabId, { action, shade: $('cinema-light').value }, { frameId }).catch(() => null);
+            $('cinema-light-label').hidden = !state?.active;
+            cinemaButton.hidden = !state?.available;
+            cinemaButton.setAttribute('aria-pressed', String(!!state?.active));
+        }
+        $('cinema-light').addEventListener('change', () => updateCinema('CINEMA_SHADE'));
+        cinemaButton.addEventListener('click', () => updateCinema('CINEMA_TOGGLE'));
+        await refreshModes();
+        timers.push(setInterval(refreshModes, 2500));
         await Promise.all([refreshStreams(), refreshStats()]);
         timers.push(setInterval(refreshStreams, 1500));
         timers.push(setInterval(refreshStats, 1000));

@@ -49,11 +49,11 @@
     let videoReported = false;
 
     function reportStream(payload) {
-        if (!payload || !payload.url) return;
+        if (!payload || typeof payload.url !== 'string' || payload.url.length > 16384 || reportedUrls.size >= 256) return;
         const key = S.normalizeUrl(payload.url, location.href);
         if (!key || reportedUrls.has(key)) return;
         reportedUrls.add(key);
-        send({ action: 'STREAM_FOUND', payload: { ...payload, url: key, title: IS_TOP ? document.title : '' } });
+        send({ action: 'STREAM_FOUND', payload: { url: key, type: String(payload.type || '').slice(0, 24), mime: String(payload.mime || '').slice(0, 128), method: String(payload.method || '').slice(0, 32), title: IS_TOP ? document.title.slice(0, 240) : '' } });
     }
 
     // Subtitles: sidecar files seen on the network or as <track>, and in-memory cues that a
@@ -245,14 +245,15 @@
         });
         const season = structured?.partOfSeason?.seasonNumber;
         const episode = structured?.episodeNumber;
-        if (typeof season === 'number' && Number.isFinite(season)) classification.season = season;
-        if (typeof episode === 'number' && Number.isFinite(episode)) classification.episode = episode;
+        if (/^\d{1,3}$/.test(String(season))) classification.season = Number(season);
+        if (/^\d{1,5}(?:\.\d+)?$/.test(String(episode))) classification.episode = Number(episode);
         const titleFromPath = path.match(/\/(?:series|shows?|anime|donghua|cartoons?|movies?)\/([^/]+)/i)?.[1]?.replace(/[-_]/g, ' ') || '';
         const showTitle = [structured?.partOfSeries?.name, structured?.name, ...titles, titleFromPath].filter(title => typeof title === 'string').map(title => title.replace(/\s*(?:[-–—:|]\s*)?(?:\b(?:season|episodes?|ep)[\s._-]*\d|\bs\d+e\d).*$/i, '').trim()).find(Boolean) || '';
         const poster = meta('image') ? S.normalizeUrl(meta('image'), location.href) : '';
         const pageMeta = {
             pageUrl: location.href,
             siteName: siteName.slice(0, 200),
+            seriesIdentity: structured?.partOfSeries?.sameAs || structured?.partOfSeries?.["@id"],
             showTitle: showTitle.slice(0, 200),
             ...classification,
             poster: /^https?:/i.test(poster || '') ? poster : ''
@@ -313,7 +314,7 @@
                 break;
             case 'FETCH_RESULT': {
                 const pending = pendingFetches.get(msg.id);
-                if (pending?.nonce === msg.nonce) pending.complete(msg);
+                if (pending && pending.nonce === msg.nonce) pending.complete(msg);
                 break;
             }
             default:
@@ -322,7 +323,7 @@
     });
 
     function proxyFetch(message, sendResponse) {
-        if (frameOrigin === 'null') {
+        if (frameOrigin === 'null' || (message.frameOrigin && message.frameOrigin !== frameOrigin)) {
             sendResponse({ ok: false, status: 0, error: 'Page fetch is unavailable in an opaque frame.' });
             return;
         }
@@ -338,6 +339,12 @@
         pendingFetches.set(id, { nonce, complete(result) {
             pendingFetches.delete(id);
             clearTimeout(timer);
+            if (result.ok && (!(result.buffer instanceof ArrayBuffer) || result.buffer.byteLength > 64 * 1024 * 1024 ||
+                !Number.isInteger(result.status) || result.status < 100 || result.status > 599 ||
+                typeof result.url !== 'string' || !/^https?:\/\//i.test(result.url))) {
+                sendResponse({ ok: false, status: 0, error: 'Invalid media response.' });
+                return;
+            }
             if (!result.ok) {
                 sendResponse({ ok: false, status: result.status || 0, error: result.error || 'Page fetch failed', aborted: !!result.aborted });
                 return;
@@ -346,7 +353,9 @@
                 sendResponse({
                     ok: true,
                     status: result.status,
-                    headers: result.headers || {},
+                    headers: Object.fromEntries(Object.entries(result.headers || {}).filter(([name, value]) =>
+                        /^(content-(type|length|range)|accept-ranges|retry-after|etag|last-modified)$/i.test(name) &&
+                        typeof value === 'string' && value.length <= 1024)),
                     url: result.url,
                     data: S.packBinary(result.buffer)
                 });
@@ -370,18 +379,7 @@
     // ------------------------------------------------------------------
     let scanTimer = null;
 
-    function collectMedia(root, out) {
-        root.querySelectorAll('video, audio').forEach(el => out.push(el));
-        // Walk open shadow roots (custom player elements) except Velostream's own host.
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-        let node = walker.nextNode();
-        let budget = 5000; // bound the cost on huge DOMs
-        while (node && budget-- > 0) {
-            if (node.shadowRoot && node.id !== 'velostream-host') collectMedia(node.shadowRoot, out);
-            node = walker.nextNode();
-        }
-        return out;
-    }
+    const { collectMedia, pickVideo, largestVideo } = globalThis.AethvyrMediaElements;
 
     function scanMedia() {
         scanTimer = null;
@@ -495,6 +493,8 @@
     }
 
     function suspendMedia() {
+        restoreNativeMode();
+        endCinema();
         if (!suspended) {
             suspended = new Map();
             document.addEventListener('play', onNativePlay, true);
@@ -541,21 +541,6 @@
         const list = collectMedia(document, []);
         if (lastLiveVideo && lastLiveVideo.isConnected && !list.includes(lastLiveVideo)) list.push(lastLiveVideo);
         return list;
-    }
-
-    function pickVideo(streamUrl) {
-        let best = null;
-        let bestScore = 0;
-        for (const v of allVideos()) {
-            if (v.tagName !== 'VIDEO') continue;
-            const r = v.getBoundingClientRect();
-            if (r.width < 120 || r.height < 68) continue;
-            let score = r.width * r.height;
-            if (!v.paused) score *= 2;
-            if (streamUrl && (v.currentSrc === streamUrl || v.src === streamUrl)) score *= 4;
-            if (score > bestScore) { bestScore = score; best = v; }
-        }
-        return best;
     }
 
     function setFrameStyle(css) {
@@ -664,7 +649,7 @@
         if (!v || !v.isConnected) {
             // The site replaced its <video> (SPA re-render): follow the new one; give it a moment
             // to appear before falling back to full page.
-            const next = pickVideo(null);
+            const next = pickVideo(allVideos(), null);
             if (next) { mount.lostAt = 0; attachToVideo(next); return; }
             if (!mount.lostAt) mount.lostAt = Date.now();
             if (Date.now() - mount.lostAt < VIDEO_LOST_GRACE_MS) { hideInline(); return; }
@@ -788,7 +773,7 @@
         if (mode === 'inline') {
             lockPage(false);
             let v = mount.video && mount.video.isConnected ? mount.video : null;
-            if (!v) v = pickVideo(null); // the site re-rendered its player while we floated
+            if (!v) v = pickVideo(allVideos(), null); // the site re-rendered its player while we floated
             if (v) attachToVideo(v);
             else setMode('page');
             return;
@@ -847,7 +832,7 @@
 
     function onLayoutMessage(e) {
         const d = e.data;
-        if (!mount.frame || e.source !== mount.frame.contentWindow || !d || d.__velostream !== 'layout' || d.session !== mount.session) return;
+        if (e.origin !== api.runtime.getURL('').replace(/\/$/, '') || !mount.frame || e.source !== mount.frame.contentWindow || !d || d.__velostream !== 'layout' || d.session !== mount.session) return;
         switch (d.cmd) {
             case 'close':
                 unmountPlayer();
@@ -896,10 +881,11 @@
     window.addEventListener('message', onLayoutMessage);
 
     function mountPlayer(message) {
+        endCinema();
         const base = api.runtime.getURL('player/player.html');
         if (typeof message.url !== 'string' || !message.url.startsWith(base)) return { ok: false, error: 'Bad player URL' };
         if (mount.frame) unmountPlayer();
-        const video = message.forcePage ? null : pickVideo(message.streamUrl);
+        const video = message.forcePage ? null : pickVideo(allVideos(), message.streamUrl);
         if (!video && !IS_TOP && !message.allowPageInFrame) return { ok: false, reason: 'no-video' };
 
         suspendMedia();
@@ -917,7 +903,7 @@
         frame.src = url.href;
         frame.title = 'Aethvyr player';
         // `allow` covers fullscreen; adding `allowfullscreen` too only triggers a console warning.
-        frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write');
+        frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture; encrypted-media; clipboard-write; translator; on-device-speech-recognition');
         mount.frame = frame;
         mount.session = message.sessionId;
         // Styled before insertion (no flash), then parented to <html> once and for all: modes
@@ -1010,10 +996,10 @@
 :host { all: initial; }
 .pill {
   position: fixed; z-index: 2147483646; display: inline-flex; align-items: center; height: 44px; padding: 0 4px 0 0;
-  border-radius: 9999px; background: rgba(28, 28, 30, 0.78); color: #fff;
-  -webkit-backdrop-filter: blur(28px) saturate(190%); backdrop-filter: blur(28px) saturate(190%);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 16px 40px rgba(0, 0, 0, 0.55), 0 2px 10px rgba(0, 0, 0, 0.3);
+  border-radius: 9999px; background: #0C1424; color: #EAF6FF;
+
+  border: 1px solid #91A4BA;
+  box-shadow: 0 2px 8px #0005;
   font: 500 13px/1 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, system-ui, sans-serif;
   letter-spacing: -0.01em; transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms; touch-action: none; user-select: none;
 }
@@ -1021,30 +1007,15 @@
 button { all: unset; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: inherit; height: 44px; border-radius: 9999px; }
 .play { gap: 8px; padding: 0 12px 0 14px; font-weight: 600; }
 .play:active { transform: scale(0.96); }
-.meta { color: rgba(235, 235, 245, 0.82); font-variant-numeric: tabular-nums; font-weight: 500; }
+.meta { color: #91A4BA; font-variant-numeric: tabular-nums; font-weight: 500; }
 .divider { width: 1px; height: 20px; background: rgba(255, 255, 255, 0.12); }
 .close { width: 44px; height: 44px; margin-left: 4px; }
 .close:hover, .play:hover { background: rgba(255, 255, 255, 0.10); }
-button:focus-visible { outline: 2px solid #0A84FF; outline-offset: 2px; }
+button:focus-visible { outline: 2px solid #74D6EE; outline-offset: 2px; }
 svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
-.bolt { color: #0A84FF; stroke: none; fill: currentColor; }
+.brand-mark { color: #74D6EE; stroke: none; fill: currentColor; }
 @media (prefers-reduced-motion: reduce) { .pill { transition: none; } }
 `;
-
-    function largestVideo() {
-        let best = null;
-        let bestArea = 0;
-        for (const el of allVideos()) {
-            if (el.tagName !== 'VIDEO') continue;
-            const r = el.getBoundingClientRect();
-            const visW = Math.min(r.right, innerWidth) - Math.max(r.left, 0);
-            const visH = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
-            if (visW < 160 || visH < 90) continue;
-            const area = visW * visH;
-            if (area > bestArea) { bestArea = area; best = el; }
-        }
-        return best;
-    }
 
     function ensureBadge() {
         if (badge.host || !document.documentElement) return;
@@ -1054,7 +1025,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         S.setHTML(shadow, `
 <div class="pill" role="group" aria-label="Aethvyr" hidden>
   <button type="button" class="play" aria-label="Play this video in Aethvyr">
-    <svg class="bolt" viewBox="0 0 128 128" aria-hidden="true"><path d="M64 17 113 104 78 94 69 78 84 83 64 47 32 103 15 109Z"/><circle cx="59" cy="89" r="8"/></svg>
+    <svg class="brand-mark" viewBox="0 0 128 128" aria-hidden="true"><path d="M64 18 105 94 75 83 68 69 82 74 64 42 33 96 19 102Z"/><circle cx="61" cy="83" r="9"/></svg>
     <span class="label">Aethvyr</span><span class="meta" aria-hidden="true"></span>
   </button>
   <span class="divider" aria-hidden="true"></span>
@@ -1088,6 +1059,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
         // stolen): without this, `drag` stayed set and later hover moves dragged the pill.
         play.addEventListener('pointercancel', () => { drag = null; });
         play.addEventListener('click', (e) => {
+            if (!e.isTrusted) return;
             if (drag && drag.moved) { e.preventDefault(); return; }
             launchFromBadge();
         });
@@ -1144,7 +1116,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
     function renderBadge() {
         const s = badge.state;
         const show = IS_TOP && badge.enabled && !badge.dismissed && !s.playerOpen && s.count > 0;
-        badge.target = show ? largestVideo() : null;
+        badge.target = show ? largestVideo(allVideos()) : null;
         if (!show) {
             if (badge.shadow) badge.shadow.querySelector('.pill').hidden = true;
             return;
@@ -1198,12 +1170,129 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
     // ------------------------------------------------------------------
     // Engine -> frame commands
     // ------------------------------------------------------------------
+    let nativeMode = null;
+    function restoreNativeMode() {
+        if (!nativeMode) return;
+        const { video, rate, volume, muted, filter, priority, applied } = nativeMode;
+        nativeMode = null;
+        document.removeEventListener('keydown', nativeShortcut, true);
+        window.removeEventListener('pagehide', restoreNativeMode);
+        if (applied && video.style.filter === applied) video.style.setProperty('filter', filter, priority);
+        if (video.playbackRate !== rate) video.playbackRate = rate;
+        if (video.volume !== volume) video.volume = volume;
+        if (video.muted !== muted) video.muted = muted;
+    }
+    function nativeShortcut(event) {
+        if (event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey ||
+            event.composedPath().some(el => el.isContentEditable || el.matches?.('input,textarea,select,button,a[href],[role="button"]'))) return;
+        const v = nativeMode.video;
+        if (!v.isConnected) { restoreNativeMode(); return; }
+        switch (event.key.toLowerCase()) {
+            case 'k': if (v.paused) v.play().catch(() => {}); else v.pause(); break;
+            case 'm': v.muted = !v.muted; break;
+            case '[': v.playbackRate = Math.max(0.25, v.playbackRate - 0.25); break;
+            case ']': v.playbackRate = Math.min(4, v.playbackRate + 0.25); break;
+            case '-': v.volume = Math.max(0, v.volume - 0.1); break;
+            case '=': v.volume = Math.min(1, v.volume + 0.1); break;
+            default: return;
+        }
+        event.preventDefault();
+        event.stopImmediatePropagation();
+    }
+    function setNativeMode(mode) {
+        restoreNativeMode();
+        if (mode === 'original') return true;
+        const video = pickVideo(allVideos(), null);
+        if (!video || mount.frame || suspended || !['light','enhance'].includes(mode)) return false;
+        nativeMode = { video, mode, rate: video.playbackRate, muted: video.muted, volume: video.volume,
+            filter: video.style.filter, priority: video.style.getPropertyPriority('filter') };
+        if (mode === 'enhance') {
+            const base = getComputedStyle(video).filter;
+            video.style.setProperty('filter', (base === 'none' ? '' : base + ' ') + 'contrast(1.08) saturate(1.08)');
+            nativeMode.applied = video.style.filter;
+        }
+        document.addEventListener('keydown', nativeShortcut, true);
+        window.addEventListener('pagehide', restoreNativeMode);
+        return true;
+    }
+    let cinema = null;
+    const cinemaOpacity = { dim: 0.55, dark: 0.85, black: 1 };
+    let cinemaShade = 'dark';
+    function applyCinemaShade() {
+        if (cinema) cinema.mask.style.boxShadow = '0 0 0 200vmax rgba(0,0,0,' + cinemaOpacity[cinemaShade] + ')';
+    }
+    function endCinema() {
+        if (!cinema) return;
+        cancelAnimationFrame(cinema.frame);
+        cinema.mask.remove();
+        window.removeEventListener('keydown', cinemaKey, true);
+        window.removeEventListener('pagehide', endCinema);
+        cinema = null;
+    }
+    function cinemaKey(event) {
+        if (event.key === 'Escape') endCinema();
+    }
+    function toggleCinema() {
+        if (cinema) { endCinema(); return; }
+        const video = pickVideo(allVideos(), null);
+        if (!video || mount.frame) return;
+        const mask = document.createElement('div');
+        mask.setAttribute('aria-hidden', 'true');
+        mask.style.cssText = 'all:initial;position:fixed;pointer-events:none;z-index:2147483646';
+        document.documentElement.append(mask);
+        cinema = { mask, frame: 0 };
+        applyCinemaShade();
+        let previous = '';
+        function position() {
+            const r = video.getBoundingClientRect();
+            if (!video.isConnected || !r.width || !r.height || document.fullscreenElement) { endCinema(); return; }
+            const geometry = [r.left, r.top, r.width, r.height].join(',');
+            if (geometry !== previous) {
+                Object.assign(mask.style, { left: r.left+'px', top: r.top+'px', width: r.width+'px', height: r.height+'px' });
+                previous = geometry;
+            }
+            cinema.frame = requestAnimationFrame(position);
+        }
+        window.addEventListener('keydown', cinemaKey, true);
+        window.addEventListener('pagehide', endCinema);
+        position();
+    }
     api.runtime.onMessage.addListener((message, sender, sendResponse) => {
-        if (!message || typeof message.action !== 'string') return false;
+        if (sender.id !== api.runtime.id || !message || typeof message.action !== 'string') return false;
         switch (message.action) {
+            case 'NEXT_EPISODE': {
+                sendResponse(globalThis.AethvyrEpisodes.findNext(document, location.href));
+                return false;
+            }
+            case 'NATIVE_MODE':
+                sendResponse({ ok: setNativeMode(message.mode) });
+                return false;
+            case 'NATIVE_CONTROL': {
+                const v = nativeMode?.video;
+                if (!v?.isConnected) { restoreNativeMode(); sendResponse({ ok: false }); return false; }
+                if (message.command === 'mute') v.muted = !v.muted;
+                else if (message.command === 'toggle' && !v.paused) v.pause();
+                else if (message.command === 'toggle') {
+                    v.play().then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
+                    return true;
+                }
+                sendResponse({ ok: true });
+                return false;
+            }
+            case 'CINEMA_STATE':
+            case 'CINEMA_SHADE':
+            case 'CINEMA_TOGGLE':
+                if (message.action === 'CINEMA_SHADE' && Object.hasOwn(cinemaOpacity, message.shade)) {
+                    cinemaShade = message.shade;
+                    applyCinemaShade();
+                }
+                if (message.action === 'CINEMA_TOGGLE') toggleCinema();
+                if (nativeMode && !nativeMode.video.isConnected) restoreNativeMode();
+                sendResponse({ mode: nativeMode?.mode || 'original', active: !!cinema, shade: cinemaShade, available: !!cinema || (!mount.frame && !!pickVideo(allVideos(), null)) });
+                return false;
             case 'PING':
                 // Lets the engine choose the frame that really shows the video.
-                sendResponse({ ok: true, top: IS_TOP, hasVideo: !!pickVideo(null) });
+                sendResponse({ ok: true, top: IS_TOP, hasVideo: !!pickVideo(allVideos(), null) });
                 return false;
             case 'FETCH_PROXY':
                 proxyFetch(message, sendResponse);

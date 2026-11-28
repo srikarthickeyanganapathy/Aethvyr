@@ -85,3 +85,24 @@ test('admission cannot exceed the byte limit when every existing segment is prot
     assert.equal(await buffer._admit('small', 100), true);
     assert.equal(await buffer._admit('next', 1), false);
 });
+
+test('a saturated prefetch origin reserves its next slot for demand', async () => {
+    const budget = new NetworkBudget(3, 2);
+    const url = 'https://fixture.invalid/video';
+    const order = [];
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    const first = budget.run(url, null, () => pending, true);
+    const second = budget.run(url, null, () => order.push('prefetch'), true);
+    await budget.run(url, null, () => order.push('playback'));
+    assert.deepEqual(order, ['playback']);
+    release();
+    await Promise.all([first, second]);
+    assert.deepEqual(order, ['playback', 'prefetch']);
+});
+
+test('conservation limits speculative work without changing stored profile settings', () => {
+    const settings = { resourceProfile: 'max', maxWorkers: 8, maxBufferSec: 900 };
+    assert.deepEqual(prefetchPolicy(settings, 1, false, true), { workers: 1, windowSeconds: 30 });
+    assert.deepEqual(prefetchPolicy(settings), { workers: 8, windowSeconds: 900 });
+});

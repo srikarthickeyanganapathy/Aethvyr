@@ -20,11 +20,24 @@ and caching, and the **player** is an extension page mounted as an iframe over t
                 │ <iframe src=player.html>     └───────────────▲────────────────────────────┘
 ┌───────────────▼──────────────────┐   runtime port            │
 │ player/player.html               │   "velostream-player"     │
-│  player.js   (EnginePort)        ├───────────────────────────┘
+│  engine-port.js (EnginePort)     ├───────────────────────────┘
 │  player-ui.js (UI + Shaka)       │   IndexedDB read (zero-copy segments)
 │  shader-pipeline.js, mp4-mux.js  │
 └──────────────────────────────────┘
 ```
+
+## Module boundaries
+
+The engine and the player bootstrap are ES module entry points. Leaf modules receive data or resource handles from their owner. The isolated-world scripts load synchronously in manifest order so detection is available at document start. The page bridge, popup and existing integrations retain the shared classic-script API.
+
+| Owner | Responsibilities and dependencies |
+| --- | --- |
+| Background engine | Owns sessions, transport, persistence scheduling and message listeners. Delegates snapshot/restore and stream ranking to `tab-state.js`, export planning to `export-plan.js`, retries to the downloader and `http-retry.js`. ABR, cache, resource budgets, checkpoints and sync retain their dedicated modules. |
+| Player bootstrap and controls | `engine-port.js` owns browser reconnection and request replay. `port-client.js` owns UI request timeouts. The player owns Shaka and composes audio, subtitles, GPU processing, controls and export sinks. |
+| Isolated content script | `media-elements.js` finds media and selects a candidate from the supplied elements. The sniffer owns scanning schedules, native-state restoration and iframe mounting. The MAIN-world interceptor lives for the document lifetime. |
+| Shared contracts | `common/ports.js` defines the existing port names. `common/shared.js` owns normalized settings, nested patch fields, browser API selection and binary encoding. `common/tokens.css` owns design tokens. |
+
+The build walks relative project imports, checks referenced resources and rejects static cycles. See the [Phase 2 report](PHASE2.md) for lifecycle owners, regression evidence and remaining architectural debt.
 
 ## Components
 
@@ -108,12 +121,13 @@ is cleared when the session ends.
 
 ### `player/player.js` + `player/player-ui.js`
 
-- `player.js` owns the **EnginePort**: a runtime port named `velostream-player` with automatic
+- `player.js` selects local, vault or streaming startup. `engine-port.js` owns the **EnginePort**: a runtime port named `velostream-player` with automatic
   reconnection. Requests in flight when the engine goes away (MV3 service workers are stopped by
   the browser) are **kept and resent** after reconnecting. Settings and history are read from
   `storage.local` directly.
 - `player-ui.js` is the player: Shadow-DOM UI, Shaka Player integration, gestures, keyboard,
-  subtitles engine, Web Audio graph, tools. Shaka's `http`/`https` schemes are replaced by a plugin
+  and tools. It delegates audio processing to `audio-fx.js`, subtitle display to `subtitle-engine.js`,
+  file parsing to `subtitle-parser.js`, and settings overlays to `settings-overlay.js`. Shaka's `http`/`https` schemes are replaced by a plugin
   (`schemeRequest`) that sends every request to the engine, so all traffic gets the pre-buffer, the
   transport fallbacks and the cache.
 
@@ -163,21 +177,9 @@ from the engine. Content scripts relay to and from the interceptor with `window.
 
 ## Network transport
 
-Every request (manifest, segment, key, subtitle) goes through `makeTransport` in the engine:
+The engine routes media requests through `makeTransport`. It validates HTTP(S), bounded headers and GET/HEAD. Passive probes, private requests and destinations outside the selected media origin use the owning frame. The direct route omits cookies, rejects redirects and only replays allowlisted headers from an exact resource capture. Failed direct requests may retry in the page under browser CORS rules. A disconnected Vault job can resume direct reads from its saved stream origin.
 
-1. **Direct fetch from the extension.** Host permissions mean no CORS. The site's Referer and
-   Origin are applied by a per-host session DNR rule (`ensureRefererRule`), and custom headers
-   the site's player sent to that host (tokens) are replayed. This is the fastest path: no
-   content-script hop and no base64 round trip.
-2. **In-page proxy.** If the server refuses (401/403/407/451) or the request fails, it is retried
-   through `FETCH_PROXY` in the frame that owns the stream, with the page's cookies and session. A
-   host that only works this way is remembered (`pageOnlyHosts`) and goes straight to the proxy
-   next time.
-3. When both fail, the error carries both reasons (`direct: …; in page: …`) and the player shows
-   it with the server name.
-
-The static rule in `rules/stream_rules.json` appends `Access-Control-Expose-Headers` for media
-responses so the proxy path can read `Content-Range` and `Content-Length`.
+A progressive player can install an exact-URL media rule for its tab and extension initiator. Native media and engine fetches have different credential behavior. See the [security assessment](PHASE3.md) and [permission inventory](PERMISSIONS.md).
 
 **Failure handling in the player:**
 
@@ -267,7 +269,7 @@ rotation and mirroring apply identically.
   discarded. GPU time comes from `EXT_disjoint_timer_query_webgl2` (CPU time when it is missing),
   together with dropped-frame counts. Two overloaded windows in a row step the preset down for the
   session: `anime4k-hq` → `anime4k` → `cas` → `off`; `fsr` → `cas` → `off`; `deblock`,
-  `denoise`, `deband` → `off`. Colour-only grading is never stepped down.
+  `denoise`, `deband` → `off`. Sustained overload can also disable colour-only grading for the session.
 - Context loss hides the canvas; restore rebuilds every program and render target. `destroy()`
   frees all textures, framebuffers, programs, shaders, buffers and vertex arrays.
 - Cross-origin direct files without CORS make `texImage2D` throw `SecurityError`. The pipeline

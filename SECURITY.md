@@ -1,4 +1,6 @@
-# Security policy
+# Aethvyr security policy
+
+The [Phase 3 assessment](docs/PHASE3.md) describes trust boundaries, validation and remaining risks.
 
 ## Supported versions
 

@@ -1,11 +1,12 @@
 :root {
     --bg-base: #070B14;
+    --bg-secondary: #0C1424;
     --bg-elevated: #131E30;
-    --glass-surface: rgba(12, 20, 36, .95);
+    --glass-surface: var(--bg-secondary);
     --glass-border: #25364A;
-    --glass-blur: blur(24px) saturate(180%);
+    --glass-blur: blur(12px);
     --text-primary: #EAF6FF;
-    --text-secondary: #B8CBDB;
+    --text-secondary: #91A4BA;
     --text-tertiary: #91A4BA;
     --control-fill: #ffffff18;
     --control-hover: #ffffff29;

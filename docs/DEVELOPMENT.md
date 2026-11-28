@@ -7,7 +7,7 @@ Requirements: **Node.js 18+** and npm. Development uses Chromium 111+ or Firefox
 ```bash
 git clone https://github.com/srikarthickeyanganapathy/Velostream.git
 cd Velostream
-npm install
+npm ci
 npm run build
 ```
 
@@ -17,13 +17,14 @@ npm run build
 | `npm run build:chrome` / `build:firefox` | One target |
 | `npm run watch` | Rebuilds on every source change |
 | `npm run lint` | ESLint over all sources (must pass with zero warnings before a PR) |
+| `python scripts/validate-packages.py` | Verifies both release archives against their builds after packaging |
 | `npm run package` | Zips each built target into `dist/aethvyr-<browser>-<version>.zip` |
-| `npm test` | Placeholder: there is no automated test suite in the repository yet (see [Testing](#testing)) |
+| `npm test` | Runs the Node regression suite |
 
 ### What the build does
 
 `scripts/build.js` copies `background/`, `common/`, `content/`, `player/`, `popup/`, `icons/` and
-`rules/` into each target, and copies `node_modules/shaka-player/dist/shaka-player.compiled-es2021.js`
+the extension assets into each target, and copies `node_modules/shaka-player/dist/shaka-player.compiled-es2021.js`
 to `lib/shaka-player.compiled.js` with its license. It then writes the browser-specific
 `manifest.json`, with the version taken from `package.json`:
 
@@ -51,7 +52,7 @@ Always load the **built** folder; the source folder has no `lib/`.
 | Context | Where to look |
 |---------|---------------|
 | Engine | `chrome://extensions` → *Inspect views: service worker* (Firefox: *Inspect* in about:debugging). The global `VelostreamEngine` exposes `tabs`, `sessions` and `launchPlayer(tabId, streamId)`. |
-| Player | DevTools on the page → frame selector → `player.html`. Errors are logged as `[Velostream] Shaka error <code> (severity <level>)`. |
+| Player | DevTools on the page → frame selector → `player.html`. Errors are logged as `[Aethvyr] Shaka error <code> (severity <level>)`. |
 | Content scripts | Page DevTools; the interceptor runs in the page's world, the sniffer under the extension's content-script context. |
 | Popup | Right-click the popup → *Inspect*. |
 
@@ -70,8 +71,8 @@ for (const s of VelostreamEngine.sessions.values()) { const p = s.port; s.port =
 
 ## Code style
 
-- Plain ES2021, no framework and no bundler. Each player file is an IIFE that exports one global
-  (`VelostreamShaders`, `VelostreamMux`, `VelostreamPlayer`); the background uses ES modules.
+- Plain ES2021, no framework and no bundler. The player and background use native ES modules. Keep the existing
+  shared and content-script adapters synchronous, and preserve legacy integration globals.
 - ESLint config in `.eslintrc.json`. Keep `npm run lint` clean.
 - **Never load remote code.** No CDN, no `eval`/`new Function`, no remote config. Both stores
   reject it and it breaks the privacy promise.
@@ -87,10 +88,7 @@ for (const s of VelostreamEngine.sessions.values()) { const p = s.port; s.port =
 
 ## Testing
 
-There is no automated suite in the repository yet. Contributions of a `puppeteer-core` end-to-end
-harness are welcome; the current release was verified with an ad-hoc one (headless Edge + the
-built extension + a local test site). The scenarios below are what it covered and what to
-re-check before a release.
+Run `npm test` for the module and compatibility regressions. The Chromium and Firefox runners below exercise installed extensions in disposable profiles. The table also includes release scenarios for manual testing.
 
 **Local test pages** to recreate with a tiny Node server:
 

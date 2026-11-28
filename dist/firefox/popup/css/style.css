@@ -1,6 +1,6 @@
-/* Velostream - Popup (macOS / iOS Control Center inspired)
+/* Aethvyr popup
  * 4/8px grid, frosted cards, 1.8px-stroke SVG icons, tabular numerals.
- * Text contrast: primary 17:1, secondary >= 7:1 on the card colour; status shown as text + dot. */
+ * Status is shown with text and a dot. */
 
 :root {
     --scale: 1;
@@ -23,7 +23,7 @@
 }
 
 #app[data-accent="green"] { --accent: #30D158; --accent-strong: #1E7A36; }
-#app[data-accent="indigo"] { --accent: #5E5CE6; --accent-strong: #4643C9; }
+#app[data-accent="indigo"] { --accent: var(--accent-secondary); --accent-strong: #4643C9; }
 #app[data-accent="amber"] { --accent: #FF9F0A; --accent-strong: #9A5B00; }
 #app[data-accent="rose"] { --accent: #FF375F; --accent-strong: #C21E45; }
 
@@ -250,3 +250,7 @@ select, option { color-scheme: dark; background: #1c1c1e; color: #fff; }
 .popup-panel .empty p { margin: 0 0 var(--space-2); }
 
 .field input[type="number"] { width: 7ch; min-height: 44px; padding: 0 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--text); font: inherit; }
+
+.settings-search { display: grid; gap: .4rem; margin-block: .75rem; }
+.settings-search input { font: inherit; color: var(--text); background: var(--fill); border: 1px solid var(--border); border-radius: .5rem; padding: .65rem; }
+#settings-results:empty { display: none; }
