@@ -19,7 +19,7 @@ const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const DIST = path.join(ROOT, 'dist');
 
-const SHARED_FILES = ['background', 'common', 'content', 'player', 'popup', 'icons', 'rules'];
+const SHARED_FILES = ['background', 'common', 'content', 'player', 'popup', 'icons'];
 const SHAKA_PATH = path.join(ROOT, 'node_modules', 'shaka-player', 'dist', 'shaka-player.compiled-es2021.js');
 const SHAKA_LICENSE = path.join(ROOT, 'node_modules', 'shaka-player', 'LICENSE');
 // Firefox add-on ID. AMO ties the add-on to it forever and never accepts an ID again after the
@@ -59,6 +59,7 @@ function verifyManifestFiles(manifest, targetDir) {
     (manifest.content_scripts || []).forEach(cs => cs.js.forEach(f => files.add(f)));
     ((manifest.declarative_net_request || {}).rule_resources || []).forEach(r => files.add(r.path));
     ((manifest.web_accessible_resources || [])).forEach(w => w.resources.forEach(f => files.add(f)));
+    const dependencies = new Map();
     for (const file of files) {
         const absolute = path.join(targetDir, file);
         if (!fs.existsSync(absolute)) continue;
@@ -68,10 +69,29 @@ function verifyManifestFiles(manifest, targetDir) {
             }
         }
         if (!file.endsWith('.js')) continue;
+        if (file.startsWith('lib/')) continue; // Vendor bundle has no project module imports.
         const source = fs.readFileSync(absolute, 'utf8');
-        const imports = source.matchAll(/(?:^\s*import\s+(?:[^'";\n]+\s+from\s+)?|\bimport\(\s*)['"](\.{1,2}\/[^'"]+)['"]/gm);
-        for (const [, dependency] of imports) files.add(path.posix.normalize(path.posix.join(path.posix.dirname(file), dependency)));
+        const imports = source.matchAll(/(?:^\s*import\s+(?:[\w\s{},*$]+\s+from\s*)?|^\s*export\s+(?:\*|\{[^}]*\})\s+from\s*|\bimport\(\s*)['"](\.{1,2}\/[^'"]+)['"]/gm);
+        const eager = [];
+        for (const [statement, dependency] of imports) {
+            const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(file), dependency));
+            files.add(resolved);
+            if (!statement.trimStart().startsWith('import(')) eager.push(resolved);
+        }
+        dependencies.set(file, eager);
     }
+    // Follow static imports from first-party ES modules. Dynamic imports can load lazily.
+    const visited = new Set();
+    const visiting = new Set();
+    function verifyAcyclic(file) {
+        if (visiting.has(file)) throw new Error('Circular module dependency: ' + [...visiting, file].join(' -> '));
+        if (visited.has(file)) return;
+        visiting.add(file);
+        for (const dependency of dependencies.get(file) || []) verifyAcyclic(dependency);
+        visiting.delete(file);
+        visited.add(file);
+    }
+    for (const file of dependencies.keys()) verifyAcyclic(file);
     const missing = [...files].filter(f => !fs.existsSync(path.join(targetDir, f)));
     if (missing.length) throw new Error(`Missing files in ${targetDir}: ${missing.join(', ')}`);
 
@@ -109,7 +129,7 @@ function buildTarget(browser, shaka) {
     }
 
     if (browser === 'firefox') {
-        manifest.permissions = manifest.permissions.filter(p => p !== 'declarativeNetRequestWithHostAccess');
+        manifest.permissions = manifest.permissions.map(p => p === 'declarativeNetRequestWithHostAccess' ? 'declarativeNetRequest' : p);
         manifest.browser_specific_settings = {
             gecko: {
                 id: GECKO_ID,

@@ -1,3 +1,12 @@
+import { PortClient } from './port-client.js';
+import { VAULT_PORT } from '../common/ports.js';
+import { clamp } from './numbers.js';
+import { esc } from './escape-html.js';
+import { AudioFx, EQ_BANDS, AUDIO_PRESETS, lectureSilenceStep } from './audio-fx.js';
+import { SubtitleEngine } from './subtitle-engine.js';
+import { parseSubtitleFile } from './subtitle-parser.js';
+import { isPlainObject, cloneValue, sameValue, hasOwn, cloneSettings, overlaySettings, profileFields } from './settings-overlay.js';
+
 /**
  * Velostream - Player UI
  *
@@ -34,7 +43,7 @@
     const PREBUFFER_WINDOWS = [[30, '30 seconds'], [60, '1 minute'], [300, '5 minutes'], [900, '15 minutes'], [1800, '30 minutes'], [86400, 'Whole video']];
     const CACHE_CAPS = [[256, '256 MB'], [512, '512 MB'], [1024, '1 GB'], [2048, '2 GB'], [4096, '4 GB'], [5120, '5 GB']];
     /** Settings sub-objects that are merged field by field (never replaced wholesale). */
-    const DEEP_SETTINGS = ['audio', 'subtitles', 'gestures', 'mouse', 'memory'];
+    const { DEEP_SETTINGS } = window.VelostreamShared;
     const TAP_ACTIONS = [['seekBack', 'Seek back'], ['seekFwd', 'Seek forward'], ['playPause', 'Play / pause'], ['fullscreen', 'Full screen'], ['pip', 'Picture in Picture'], ['none', 'Nothing']];
     const QUALITY_CAPS = [[0, 'No limit'], [2160, '2160p'], [1440, '1440p'], [1080, '1080p'], [720, '720p'], [480, '480p'], [360, '360p']];
     const FONTS = {
@@ -45,17 +54,6 @@
         hyperlegible: { label: 'Hyperlegible', css: '"Atkinson Hyperlegible", Verdana, Tahoma, sans-serif' }
     };
     const SUB_COLORS = [['#ffffff', 'White'], ['#ffd60a', 'Yellow'], ['#64d2ff', 'Cyan'], ['#30d158', 'Green'], ['#ff9f0a', 'Amber']];
-    const EQ_BANDS = [
-        { type: 'lowshelf', f: 60, label: '60' }, { type: 'peaking', f: 230, label: '230' }, { type: 'peaking', f: 910, label: '910' },
-        { type: 'peaking', f: 3600, label: '3.6k' }, { type: 'highshelf', f: 14000, label: '14k' }
-    ];
-    const AUDIO_PRESETS = {
-        normal: { label: 'Normal', meta: 'Flat', eq: [0, 0, 0, 0, 0], compress: false },
-        voice: { label: 'Voice clarity', meta: '+5 dB', eq: [-4, -2, 3, 5, 1], compress: true },
-        bass: { label: 'Bass boost', meta: '+7 dB', eq: [7, 4, 0, -1, 0], compress: false },
-        night: { label: 'Night mode', meta: 'Compressor', eq: [1, 0, 1, 2, 0], compress: true },
-        custom: { label: 'Custom EQ', meta: '5-band', eq: null, compress: false }
-    };
     const FIT_MODES = [['contain', 'Fit', 'Default'], ['cover', 'Fill', 'Crop edges'], ['fill', 'Stretch', 'Distort'], ['16:9', '16:9', 'Force'], ['4:3', '4:3', 'Force'], ['21:9', '21:9', 'Ultrawide crop']];
     const DEFAULT_FILTERS = { brightness: 100, contrast: 100, saturate: 100, hue: 0, warmth: 0, sharpness: 0 };
     const ACTIONS = {
@@ -69,7 +67,7 @@
     const LOOK_ORDERABLE = window.VelostreamShared.LOOK_ORDERABLE;
     const LOOK_BUTTONS = window.VelostreamShared.LOOK_BUTTONS;
     const LOOK_LABELS = {
-        back: 'Seek back', fwd: 'Seek forward', volume: 'Volume', speed: 'Speed', cc: 'Subtitles & audio', studio: 'Studio',
+        back: 'Seek back', fwd: 'Seek forward', volume: 'Volume', speed: 'Speed', cc: 'Subtitles & audio', studio: 'Aethvyr Studio',
         pip: 'Picture in Picture', fs: 'Full screen', lock: 'Lock touch controls', info: 'Stream statistics', dl: 'Download',
         audioOnly: 'Audio-only', mini: 'Mini player', frameBack: 'Previous frame', frameFwd: 'Next frame', loop: 'A–B loop',
         snapshot: 'Snapshot', eq: 'Audio & EQ', gpu: 'Picture & GPU'
@@ -132,7 +130,6 @@
     // =====================================================================
     // Helpers
     // =====================================================================
-    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
     /** Escaped text with case-insensitive matches of q wrapped in <mark>. */
     const highlight = (text, q) => {
         if (!q) return esc(text);
@@ -189,10 +186,6 @@
         return `<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${arc}<text x="12" y="15.2" text-anchor="middle" font-size="7.4" font-weight="700" fill="currentColor" stroke="none" font-family="-apple-system, system-ui, sans-serif">${seconds}</text></svg>`;
     }
 
-    function esc(s) {
-        return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    }
-
     function fmtTime(sec) {
         if (!Number.isFinite(sec) || sec < 0) sec = 0;
         const s = Math.floor(sec % 60);
@@ -243,85 +236,6 @@
             h = Math.imul(h, 0x01000193) >>> 0;
         }
         return h.toString(16);
-    }
-
-    function parseTimestamp(t) {
-        const m = /^(?:(\d+):)?(\d{1,2}):([0-5]?\d)[.,](\d{1,3})$/.exec(t.trim());
-        if (!m) return NaN;
-        return (+m[1] || 0) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4].padEnd(3, '0')) / 1000;
-    }
-
-    const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
-    /** Code point -> string; NUL, surrogates and anything beyond U+10FFFF become U+FFFD. */
-    function safeCodePoint(cp) {
-        if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return '\ufffd';
-        return String.fromCodePoint(cp);
-    }
-
-    /** Single pass, so "&amp;lt;" stays the literal text "&lt;". Unknown names are kept as is. */
-    function decodeEntities(s) {
-        return String(s).replace(/&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([a-zA-Z]+));/g, (m, dec, hex, name) => {
-            if (dec) return safeCodePoint(dec.length > 8 ? Infinity : parseInt(dec, 10));
-            if (hex) return safeCodePoint(hex.length > 6 ? Infinity : parseInt(hex, 16));
-            return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, name) ? NAMED_ENTITIES[name] : m;
-        });
-    }
-
-    /** Parse SRT or WebVTT text into [{start, end, text}]. */
-    /** SubStation Alpha (.ass/.ssa): "Dialogue:" lines of the [Events] section; styling is dropped. */
-    function parseAss(text) {
-        const cues = [];
-        let fields = null;
-        for (const raw of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
-            const line = raw.trim();
-            if (/^Format:/i.test(line) && !fields) {
-                const f = line.slice(7).split(',').map(x => x.trim().toLowerCase());
-                if (f.includes('text')) fields = f;
-                continue;
-            }
-            if (!/^Dialogue:/i.test(line)) continue;
-            const f = fields || ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text'];
-            const parts = line.slice(9).split(',');
-            const textIdx = f.indexOf('text');
-            const val = k => (parts[f.indexOf(k)] || '').trim();
-            // {\...} override blocks, \N / \n line breaks, \h hard space; then inline HTML-ish
-            // tags (some encoders emit <i>), and finally entities on the plain text.
-            const body = decodeEntities(parts.slice(textIdx).join(',')
-                .replace(/\{[^}]*\}/g, '')
-                .replace(/\\[Nn]/g, '\n')
-                .replace(/\\h/g, ' ')
-                .replace(/<[^>]+>/g, ''))
-                .split('\n').map(l => l.replace(/^[ \t]+|[ \t]+$/g, '')).join('\n');
-            const start = parseTimestamp(val('start'));
-            const end = parseTimestamp(val('end'));
-            if (Number.isFinite(start) && Number.isFinite(end) && body.trim()) cues.push({ start, end, text: body.trim() });
-        }
-        return cues.sort((x, y) => x.start - y.start);
-    }
-
-    function parseSubtitleFile(text) {
-        if (/^\s*\[Script Info\]/i.test(text.replace(/^\uFEFF/, '')) || /\n\[Events\]/i.test(text)) return parseAss(text);
-        const cues = [];
-        const blocks = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split(/\n{2,}/);
-        for (const block of blocks) {
-            const lines = block.split('\n').filter(l => l.length);
-            const idx = lines.findIndex(l => l.includes('-->'));
-            if (idx < 0) continue;
-            const [a, b] = lines[idx].split('-->');
-            const start = parseTimestamp(a);
-            const end = parseTimestamp(b.trim().split(/\s+/)[0]);
-            if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
-            const body = lines.slice(idx + 1).join('\n').replace(/<[^>]+>/g, '').replace(/\{\\[^}]*\}/g, '');
-            if (body.trim()) cues.push({ start, end, text: decodeEntities(body) });
-        }
-        return cues.sort((x, y) => x.start - y.start);
-    }
-
-    function cueText(cue) {
-        if (cue.nestedCues && cue.nestedCues.length) {
-            return cue.nestedCues.map(n => (n.lineBreak ? '\n' : cueText(n))).join('');
-        }
-        return cue.payload || '';
     }
 
     const extApi = (window.VelostreamShared && window.VelostreamShared.api) || null;
@@ -393,6 +307,7 @@
             this.container = container;
             this.filename = safeFilename(filename);
             this.mime = mime;
+            this.confirmed = false;
             this.parts = [];
             this.writable = null;
             this.temp = null;
@@ -435,6 +350,12 @@
         async write(chunk) {
             if (!this.writable && !this.bytes) await this.openTemporaryFile();
             this.bytes += chunk.byteLength || chunk.size || 0;
+            if (this.temp && this.bytes > (this.nextSpaceCheck || 0)) {
+                const size = await navigator.storage.estimate?.().catch(() => null);
+                if (size && size.quota - size.usage < 32 * 1024 ** 2) throw new Error('Too little temporary storage. Free space or save directly to a file.');
+                this.nextSpaceCheck = this.bytes + 16 * 1024 ** 2;
+            }
+            if (this.temp && this.bytes > 4 * 1024 ** 3) throw new Error('Temporary export limit reached. Use a direct file destination.');
             if (!this.writable && this.bytes > 128 * 1024 * 1024) throw new Error('This browser can only save up to 128 MB per export without a file picker.');
             if (this.writable) await this.writable.write(chunk);
             else this.parts.push(chunk instanceof Blob ? chunk : new Blob([chunk]));
@@ -449,6 +370,7 @@
             if (this.writable) {
                 await this.writable.close();
                 this.writable = null;
+                this.confirmed = !this.temp;
                 if (this.temp) {
                     let finished = true;
                     try {
@@ -456,6 +378,7 @@
                         finished = await downloadBlob(this.container, new Blob([file], { type: this.mime }), this.filename);
                     }
                     finally {
+                        this.confirmed = finished;
                         if (finished) await this.removeTemporaryFile();
                         else {
                             const { dir, key } = this.temp;
@@ -468,7 +391,7 @@
             }
             const blob = new Blob(this.parts, { type: this.mime });
             this.parts = [];
-            await downloadBlob(this.container, blob, this.filename);
+            this.confirmed = await downloadBlob(this.container, blob, this.filename);
         }
 
         async removeTemporaryFile() {
@@ -486,52 +409,6 @@
     }
 
     // ---- Settings layering: raw (storage) -> site profile -> session overrides ----
-    const isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
-    const cloneValue = v => (Array.isArray(v) ? v.slice() : isPlainObject(v) ? { ...v } : v);
-    const sameValue = (a, b) => a === b || (typeof a === 'object' && typeof b === 'object' && JSON.stringify(a) === JSON.stringify(b));
-    const hasOwn = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
-
-    /** Copy whose sub-objects (and their arrays, e.g. audio.eq) are not shared with the source. */
-    function cloneSettings(s) {
-        const out = { ...(s || {}) };
-        for (const k of DEEP_SETTINGS) {
-            if (!isPlainObject(out[k])) continue;
-            const sub = {};
-            for (const [sk, sv] of Object.entries(out[k])) sub[sk] = cloneValue(sv);
-            out[k] = sub;
-        }
-        return out;
-    }
-
-    /** Overlay a partial settings object; sub-objects of DEEP_SETTINGS merge per field. */
-    function overlaySettings(target, partial, only) {
-        for (const [k, v] of Object.entries(partial || {})) {
-            if (DEEP_SETTINGS.includes(k) && isPlainObject(v)) {
-                const sub = { ...(target[k] || {}) };
-                for (const [sk, sv] of Object.entries(v)) {
-                    if (!only || (only[k] && hasOwn(only[k], sk))) sub[sk] = cloneValue(sv);
-                }
-                target[k] = sub;
-            } else if (!only || hasOwn(only, k)) {
-                target[k] = cloneValue(v);
-            }
-        }
-        return target;
-    }
-
-    /** The fields a site profile controls, as a partial settings object. */
-    function profileFields(p) {
-        const out = {};
-        if (!p) return out;
-        if (Number.isFinite(p.defaultSpeed)) out.defaultSpeed = p.defaultSpeed;
-        if (Number.isFinite(p.qualityCap)) out.qualityCap = p.qualityCap;
-        if (typeof p.shader === 'string') out.shader = window.VelostreamShared.normalizeGraphicsPreset(p.shader);
-        if (Number.isFinite(p.shaderStrength)) out.shaderStrength = p.shaderStrength;
-        if (typeof p.audioPreset === 'string') out.audio = { preset: p.audioPreset };
-        if (Number.isFinite(p.subSize)) out.subtitles = { size: p.subSize };
-        return out;
-    }
-
     /** Options for a <select>, plus the stored value when it is not one of them (never blank). */
     function withCurrentOption(pairs, value, label) {
         if (value == null || value === '' || pairs.some(([v]) => String(v) === String(value))) return pairs;
@@ -540,479 +417,6 @@
 
     const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
     const wait = ms => new Promise(r => setTimeout(r, ms));
-
-    // =====================================================================
-    // Port client (MAIN world side of the private MessagePort)
-    // =====================================================================
-    class PortClient {
-        constructor(port, handler) {
-            this.port = port;
-            this.waiters = new Map();
-            this.seq = 0;
-            port.onmessage = (e) => {
-                const m = e.data;
-                if (!m) return;
-                if (m.reqId && this.waiters.has(m.reqId) && (m.type === 'SETTINGS' || m.type === 'STORE_VALUE' || m.type === 'HISTORY_SAVED')) {
-                    const w = this.waiters.get(m.reqId);
-                    this.waiters.delete(m.reqId);
-                    w(m);
-                    return;
-                }
-                handler(m);
-            };
-        }
-
-        send(msg, transfer) {
-            try { this.port.postMessage(msg, transfer || []); } catch (_) { /* closed */ }
-        }
-
-        request(type, extra = {}, timeoutMs = 8000) {
-            const reqId = `q${++this.seq}`;
-            return new Promise((resolve, reject) => {
-                const t = setTimeout(() => { this.waiters.delete(reqId); reject(new Error(`${type} timed out`)); }, timeoutMs);
-                this.waiters.set(reqId, (m) => { clearTimeout(t); resolve(m); });
-                this.send({ type, reqId, ...extra });
-            });
-        }
-
-        close() {
-            try { this.port.onmessage = null; this.port.close(); } catch (_) { /* ignore */ }
-        }
-    }
-
-    // =====================================================================
-    // Audio engine: Web Audio booster, 5-band EQ, compressor, delay, analyser
-    // =====================================================================
-    class AudioFx {
-        constructor(video) {
-            this.video = video;
-            this.ctx = null;
-            this.nodes = null;
-            this.levels = null;
-            /** Set by the player once a crossorigin="anonymous" file loaded its metadata with CORS. */
-            this.corsOk = false;
-        }
-
-        get active() { return !!this.ctx; }
-
-        /**
-         * Web Audio taps a cross-origin, non-CORS media element as silence: only allow when safe.
-         * MSE (blob:) is always same-origin; a direct file is safe when it was fetched with CORS
-         * (the engine adds Access-Control-Allow-Origin for media requests from the extension).
-         */
-        allowed() {
-            const v = this.video;
-            const src = v.currentSrc || '';
-            if (!src) return false;
-            if (src.startsWith('blob:')) return true;
-            if (this.corsOk && v.getAttribute('crossorigin') !== null) return true;
-            try { return new URL(src).origin === location.origin; } catch (_) { return false; }
-        }
-
-        /** Must run inside a user-activation event, otherwise the context starts suspended. */
-        ensure() {
-            if (this.ctx) {
-                if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => { });
-                return true;
-            }
-            if (this.sourceBound || !this.allowed()) return false;
-            const AC = window.AudioContext || window.webkitAudioContext;
-            if (!AC) return false;
-            let context;
-            try {
-                context = new AC({ latencyHint: 'playback' });
-                const ctx = context;
-                const delay = ctx.createDelay(2);
-                const eq = EQ_BANDS.map(b => {
-                    const f = ctx.createBiquadFilter();
-                    f.type = b.type;
-                    f.frequency.value = b.f;
-                    if (b.type === 'peaking') f.Q.value = 1.1;
-                    return f;
-                });
-                const comp = ctx.createDynamicsCompressor();
-                const gain = ctx.createGain();
-                const analyser = ctx.createAnalyser();
-                analyser.fftSize = 512;
-                analyser.smoothingTimeConstant = 0.75;
-                // Loudness normalizer: slow auto-gain (driven from tickLoudness) + a peak limiter
-                // after it, so lifted quiet dialogue never clips and explosions are tamed.
-                const normGain = ctx.createGain();
-                const normLimit = ctx.createDynamicsCompressor();
-                normLimit.threshold.value = -12;
-                normLimit.knee.value = 8;
-                normLimit.ratio.value = 6;
-                normLimit.attack.value = 0.004;
-                normLimit.release.value = 0.3;
-                const out = ctx.createGain(); // processing exit; the spatial stage reads from it
-                const post = ctx.createGain(); // after the spatial stage; channel routing hangs off it
-                const source = ctx.createMediaElementSource(this.video);
-                this.sourceBound = true;
-                this.ctx = ctx;
-                this.nodes = { source, delay, eq, comp, gain, analyser, normGain, normLimit, out, post, compressing: null, normalizing: null, spatialKey: null };
-                source.connect(delay);
-                delay.connect(eq[0]);
-                for (let i = 0; i < eq.length - 1; i++) eq[i].connect(eq[i + 1]);
-                gain.connect(analyser);           // measured before the normalizer (no feedback)
-                normGain.connect(normLimit);
-                this._routeNorm(false);
-                this._routeSpatial({ width: 100, crossfeed: false, dialogue: 0 });
-                this.loud = { energy: 0, primed: false };
-                this.channels = null;
-                this._routeChannels('stereo');
-                this._route(false);
-                if (ctx.state === 'suspended') ctx.resume().catch(() => { });
-                return true;
-            } catch (e) {
-                console.warn('[Velostream] Audio graph unavailable:', e);
-                context?.close().catch(() => { });
-                this.ctx = null;
-                return false;
-            }
-        }
-
-        _route(compress) {
-            const n = this.nodes;
-            if (n.compressing === compress) return;
-            const last = n.eq[n.eq.length - 1];
-            try { last.disconnect(); } catch (_) { /* first time */ }
-            try { n.comp.disconnect(); } catch (_) { /* first time */ }
-            if (compress) { last.connect(n.comp); n.comp.connect(n.gain); } else { last.connect(n.gain); }
-            n.compressing = compress;
-        }
-
-        /** gain -> out directly, or gain -> normGain -> normLimit -> out. */
-        _routeNorm(on) {
-            const n = this.nodes;
-            if (!n || n.normalizing === on) return;
-            try { n.gain.disconnect(n.out); } catch (_) { /* not connected */ }
-            try { n.gain.disconnect(n.normGain); } catch (_) { /* not connected */ }
-            try { n.normLimit.disconnect(); } catch (_) { /* not connected */ }
-            if (on) {
-                n.gain.connect(n.normGain);
-                n.normLimit.connect(n.out);
-            } else {
-                n.gain.connect(n.out);
-                n.normGain.gain.value = 1;
-                if (this.loud) this.loud.primed = false;
-            }
-            n.normalizing = on;
-        }
-
-        /**
-         * Smart loudness, called ~4×/s: track the programme level (energy average over ~3 s, gated
-         * below -45 dBFS so silence and pauses do not pull the gain up) and steer normGain toward a
-         * -20 dBFS RMS target (≈ -16 LUFS for typical dialogue), within ±12 dB, with a slow time
-         * constant so speech does not "pump". The limiter after it catches transients.
-         */
-        tickLoudness() {
-            const n = this.nodes;
-            if (!n || !n.normalizing || !this.ctx || this.video.paused) return;
-            const level = this.rms();
-            const db = 20 * Math.log10(Math.max(level, 1e-6));
-            if (!Number.isFinite(db) || db < -45) return; // silence / pause: hold the current gain
-            const L = this.loud;
-            const e = level * level;
-            L.energy = L.primed ? L.energy * 0.92 + e * 0.08 : e;
-            L.primed = true;
-            const progDb = 10 * Math.log10(Math.max(L.energy, 1e-12));
-            const wantDb = clamp(-20 - progDb, -12, 12);
-            n.normGain.gain.setTargetAtTime(Math.pow(10, wantDb / 20), this.ctx.currentTime, 1.2);
-        }
-
-        /**
-         * Spatial stage between `out` and `post`:
-         *   width     L' = a·L + b·R, R' = a·R + b·L with a = (1+w)/2, b = (1-w)/2 (mid/side scaling;
-         *             w = 0 mono, 1 as recorded, 2 extra wide);
-         *   dialogue  the centre (mid = (L+R)/2) band-passed around 2 kHz and added back to both
-         *             sides, so voices lift without touching music/effects panned to the sides;
-         *   crossfeed each side delayed 0.3 ms, low-passed at 700 Hz and mixed into the other at
-         *             -9 dB (Bauer-style), so hard-panned headphone mixes stop sounding "inside the head".
-         * Neutral settings bypass the stage entirely (out -> post), costing nothing.
-         */
-        _routeSpatial(a) {
-            const n = this.nodes;
-            if (!n) return;
-            const w = clamp((+a.width || 100) / 100, 0, 2);
-            const dlg = clamp(+a.dialogue || 0, 0, 100) / 100;
-            const cf = !!a.crossfeed;
-            const neutral = Math.abs(w - 1) < 0.005 && !dlg && !cf;
-            const key = neutral ? 'bypass' : 'spatial';
-            const ctx = this.ctx;
-            if (n.spatialKey !== key) {
-                try { n.out.disconnect(n.post); } catch (_) { /* not connected */ }
-                if (n.sp) { for (const node of Object.values(n.sp)) { try { node.disconnect(); } catch (_) { /* ignore */ } } }
-                n.sp = null;
-                if (neutral) {
-                    n.out.connect(n.post);
-                } else {
-                    const up = ctx.createGain(); // upmix mono sources to L=R before splitting
-                    up.channelCount = 2;
-                    up.channelCountMode = 'explicit';
-                    up.channelInterpretation = 'speakers';
-                    const split = ctx.createChannelSplitter(2);
-                    const merge = ctx.createChannelMerger(2);
-                    const ll = ctx.createGain();
-                    const rl = ctx.createGain();
-                    const rr = ctx.createGain();
-                    const lr = ctx.createGain();
-                    const midL = ctx.createGain();
-                    const midR = ctx.createGain();
-                    const mid = ctx.createGain();
-                    mid.channelCount = 1;
-                    mid.channelCountMode = 'explicit';
-                    const band = ctx.createBiquadFilter();
-                    band.type = 'bandpass';
-                    band.frequency.value = 2000;
-                    band.Q.value = 0.8;
-                    const dGain = ctx.createGain();
-                    const dL = ctx.createDelay(0.01);
-                    const dR = ctx.createDelay(0.01);
-                    dL.delayTime.value = 0.0003;
-                    dR.delayTime.value = 0.0003;
-                    const lpL = ctx.createBiquadFilter();
-                    const lpR = ctx.createBiquadFilter();
-                    lpL.type = lpR.type = 'lowpass';
-                    lpL.frequency.value = lpR.frequency.value = 700;
-                    const cfL = ctx.createGain();
-                    const cfR = ctx.createGain();
-                    n.out.connect(up);
-                    up.connect(split);
-                    split.connect(ll, 0); split.connect(rl, 1); ll.connect(merge, 0, 0); rl.connect(merge, 0, 0);
-                    split.connect(rr, 1); split.connect(lr, 0); rr.connect(merge, 0, 1); lr.connect(merge, 0, 1);
-                    split.connect(midL, 0); split.connect(midR, 1); midL.connect(mid); midR.connect(mid);
-                    mid.connect(band); band.connect(dGain); dGain.connect(merge, 0, 0); dGain.connect(merge, 0, 1);
-                    split.connect(dL, 0); dL.connect(lpL); lpL.connect(cfL); cfL.connect(merge, 0, 1);
-                    split.connect(dR, 1); dR.connect(lpR); lpR.connect(cfR); cfR.connect(merge, 0, 0);
-                    merge.connect(n.post);
-                    n.sp = { up, split, merge, ll, rl, rr, lr, midL, midR, mid, band, dGain, dL, dR, lpL, lpR, cfL, cfR };
-                }
-                n.spatialKey = key;
-            }
-            if (!n.sp) return;
-            const t = ctx.currentTime;
-            const sp = n.sp;
-            const A = (1 + w) / 2;
-            const B = (1 - w) / 2;
-            sp.ll.gain.setTargetAtTime(A, t, 0.05);
-            sp.rr.gain.setTargetAtTime(A, t, 0.05);
-            sp.rl.gain.setTargetAtTime(B, t, 0.05);
-            sp.lr.gain.setTargetAtTime(B, t, 0.05);
-            sp.midL.gain.value = 0.5;
-            sp.midR.gain.value = 0.5;
-            sp.dGain.gain.setTargetAtTime(dlg * 2.5, t, 0.05); // up to about +9 dB at 2 kHz on the centre
-            const c = cf ? 0.35 : 0;
-            sp.cfL.gain.setTargetAtTime(c, t, 0.05);
-            sp.cfR.gain.setTargetAtTime(c, t, 0.05);
-        }
-
-        /** Frequency magnitudes (0-255) for the visualizer, or null without an audio graph. */
-        spectrum() {
-            if (!this.nodes) return null;
-            const a = this.nodes.analyser;
-            if (!this.freq || this.freq.length !== a.frequencyBinCount) this.freq = new Uint8Array(a.frequencyBinCount);
-            a.getByteFrequencyData(this.freq);
-            return this.freq;
-        }
-
-        /** Output channel mode: stereo (as is), mono (downmix), left / right only (on both speakers). */
-        _routeChannels(mode) {
-            const n = this.nodes;
-            if (!n || this.channels === mode) return;
-            const ctx = this.ctx;
-            try { n.post.disconnect(ctx.destination); } catch (_) { /* not connected */ }
-            if (n.chan) { for (const node of Object.values(n.chan)) { try { node.disconnect(); } catch (_) { /* ignore */ } } }
-            n.chan = null;
-            if (mode === 'mono') {
-                const down = ctx.createGain();
-                down.channelCount = 1;
-                down.channelCountMode = 'explicit';
-                down.channelInterpretation = 'speakers';
-                n.post.connect(down);
-                down.connect(ctx.destination);
-                n.chan = { down };
-            } else if (mode === 'left' || mode === 'right') {
-                const split = ctx.createChannelSplitter(2);
-                const merge = ctx.createChannelMerger(2);
-                const ch = mode === 'left' ? 0 : 1;
-                n.post.connect(split);
-                split.connect(merge, ch, 0);
-                split.connect(merge, ch, 1);
-                merge.connect(ctx.destination);
-                n.chan = { split, merge };
-            } else {
-                n.post.connect(ctx.destination);
-            }
-            this.channels = mode;
-        }
-
-        apply(audio) {
-            if (!this.ctx) return;
-            this._routeChannels(audio.channels || 'stereo');
-            this._routeNorm(!!audio.loudnessNorm);
-            this._routeSpatial({ width: audio.width ?? 100, crossfeed: !!audio.crossfeed, dialogue: audio.dialogue || 0 });
-            const preset = AUDIO_PRESETS[audio.preset] || AUDIO_PRESETS.normal;
-            const gains = audio.preset === 'custom' ? (audio.eq || [0, 0, 0, 0, 0]) : preset.eq;
-            const n = this.nodes;
-            const t = this.ctx.currentTime;
-            gains.forEach((db, i) => n.eq[i].gain.setTargetAtTime(clamp(+db || 0, -12, 12), t, 0.05));
-            const boost = audio.boost / 100;
-            const compress = preset.compress || boost > 1.5;
-            if (compress) {
-                n.comp.threshold.value = audio.preset === 'night' ? -45 : -28;
-                n.comp.knee.value = 30;
-                n.comp.ratio.value = audio.preset === 'night' ? 10 : 4;
-                n.comp.attack.value = 0.003;
-                n.comp.release.value = 0.25;
-            }
-            this._route(compress);
-            n.gain.gain.setTargetAtTime(boost * (audio.preset === 'night' ? 1.6 : 1), t, 0.05);
-            n.delay.delayTime.setTargetAtTime(clamp(audio.delayMs, 0, 1000) / 1000, t, 0.02);
-        }
-
-        /** Root-mean-square output level (0..1), used by smart skip to detect silence. */
-        rms() {
-            if (!this.nodes) return 1;
-            const a = this.nodes.analyser;
-            if (!this.levels) this.levels = new Float32Array(a.fftSize);
-            a.getFloatTimeDomainData(this.levels);
-            let sum = 0;
-            for (let i = 0; i < this.levels.length; i++) sum += this.levels[i] * this.levels[i];
-            return Math.sqrt(sum / this.levels.length);
-        }
-
-        destroy() {
-            if (this.ctx) this.ctx.close().catch(() => { });
-            this.ctx = null;
-            this.nodes = null;
-        }
-    }
-
-    // =====================================================================
-    // Subtitle engine (Shaka text displayer + external SRT/VTT)
-    // =====================================================================
-    class SubtitleEngine {
-        constructor(layer, topLayer) {
-            this.layer = layer;
-            this.topLayer = topLayer;     // secondary (dual) subtitles, shown at the top
-            this.shakaCues = [];
-            this.shakaKeys = new Set();
-            this.externalCues = null;
-            this.externalName = '';
-            this.secondaryCues = null;
-            this.secondaryName = '';
-            this.secondaryIndex = null;
-            this.source = 'off';  // off | shaka | external
-            this.offset = 0;
-            this.speed = 1;       // cue timing scale (0.9-1.1) for frame-rate mismatched files
-            this.shakaVisible = false;
-            this.lastHtml = '';
-            this.lastTopHtml = '';
-        }
-
-        clearExternal() {
-            this.externalCues = null;
-            this.externalName = '';
-            this.capturedIndex = null;
-            this.secondaryCues = null;
-            this.secondaryName = '';
-            this.secondaryIndex = null;
-            this.lastHtml = this.lastTopHtml = null;
-            if (this.source === 'external') this.source = 'off';
-        }
-
-        activeCues() {
-            return this.source === 'external' ? this.externalCues : this.source === 'shaka' ? this.shakaCues : null;
-        }
-
-        /** Media time -> subtitle file time. */
-        cueTime(time) { return (time - this.offset) / (this.speed || 1); }
-
-        /** The next cue that has not started yet (for "sync to current voice"). */
-        nextCueStart(time) {
-            const cues = this.activeCues();
-            if (!cues || !cues.length) return null;
-            const t = this.cueTime(time);
-            for (const c of cues) if (c.start > t - 0.2) return c.start;
-            return null;
-        }
-
-        static linesHtml(texts) {
-            return texts.join('\n').split('\n').map(line => `<span class="cue-line">${esc(line)}</span>`).join('');
-        }
-
-        static activeAt(cues, t) {
-            const active = [];
-            if (!cues) return active;
-            for (const c of cues) {
-                if (c.start > t) break;
-                if (t < c.end) active.push(c.text);
-            }
-            return active;
-        }
-
-        createDisplayer() {
-            const self = this;
-            const keyOf = c => `${c.start.toFixed(3)}|${c.end.toFixed(3)}|${c.text}`;
-            return {
-                configure() { },
-                setTextLanguage() { },
-                enableTextDisplayer() { },
-                append(cues) {
-                    for (const c of cues) {
-                        const text = cueText(c).trim();
-                        if (!text) continue;
-                        const cue = { start: c.startTime, end: c.endTime, text };
-                        const key = keyOf(cue);
-                        if (self.shakaKeys.has(key)) continue;
-                        self.shakaKeys.add(key);
-                        self.shakaCues.push(cue);
-                    }
-                    self.shakaCues.sort((a, b) => a.start - b.start);
-                },
-                remove(start, end) {
-                    self.shakaCues = self.shakaCues.filter(c => c.end <= start || c.start >= end);
-                    self.shakaKeys = new Set(self.shakaCues.map(keyOf));
-                    return true;
-                },
-                isTextVisible() { return self.shakaVisible; },
-                setTextVisibility(on) { self.shakaVisible = !!on; },
-                destroy() {
-                    self.shakaCues = [];
-                    self.shakaKeys.clear();
-                    return Promise.resolve();
-                }
-            };
-        }
-
-        clearShaka() {
-            this.shakaCues = [];
-            this.shakaKeys.clear();
-        }
-
-        render(time) {
-            const t = this.cueTime(time);
-            const active = SubtitleEngine.activeAt(this.activeCues(), t);
-            const html = active.length ? SubtitleEngine.linesHtml(active) : '';
-            if (html !== this.lastHtml) {
-                this.lastHtml = html;
-                setHTML(this.layer, html);
-            }
-            if (this.topLayer) {
-                const top = this.secondaryCues ? SubtitleEngine.activeAt(this.secondaryCues, t) : [];
-                const topHtml = top.length ? SubtitleEngine.linesHtml(top) : '';
-                if (topHtml !== this.lastTopHtml) {
-                    this.lastTopHtml = topHtml;
-                    setHTML(this.topLayer, topHtml);
-                }
-            }
-        }
-    }
-
-    // =====================================================================
-    // Styles - glass design system
-    // =====================================================================
-
 
     // =====================================================================
     // Player
@@ -1105,6 +509,9 @@
                 this.resolveInit({ stream: { id: 'local', type: 'progressive', title: 'Open Local File', url: '' } });
                 this.resolveInit = null;
             }
+            navigator.getBattery?.().then(battery => {
+                if (!this.closed) this.battery = battery;
+            }).catch(() => {});
             this.ready = this.start();
             this.ready.catch(err => this.showError('Could not start the player', String((err && err.message) || err)));
             bindLocalFiles(this, host.fileId, !!host.local);
@@ -1677,6 +1084,7 @@
             if (this.closed) return;
             const saved = this.saveHistory(true, true);
             this.closed = true;
+            this.stopWhisper?.();
             for (const t of this.timers) { clearInterval(t); clearTimeout(t); }
             this.timers.clear();
             clearTimeout(this.hideTimer);
@@ -1809,6 +1217,7 @@
                     break;
                 case 'STATS':
                     this.engineStats = msg.stats;
+                    this.recordingSince = msg.stats.recording || 0;
                     break;
                 case 'SUBTITLES':
                     if (this.setCaptured(msg.subtitles)) this.loadChapters();
@@ -1835,9 +1244,47 @@
                 case 'FATAL':
                     this.showError('Connection problem', msg.error);
                     break;
+                case 'UP_NEXT': {
+                    if (!this.video.ended || this.closed) break;
+                    this.root.querySelector('.next-offer')?.remove();
+                    const panel = document.createElement('section');
+                    panel.className = 'next-offer';
+                    panel.setAttribute('aria-label','Up next');
+                    const label = document.createElement('span');
+                    label.textContent = 'Up next: ' + msg.title;
+                    const start = document.createElement('button');
+                    start.textContent = 'Play next';
+                    const cancel = document.createElement('button');
+                    cancel.textContent = 'Cancel';
+                    panel.append(label,start,cancel);
+                    this.root.append(panel);
+                    const close = () => { clearInterval(timer); panel.remove(); };
+                    const play = () => { close(); if (!this.closed && this.video.ended) this.port.send({type:'OPEN_NEXT'}); };
+                    let remaining = 8;
+                    const timer = setInterval(() => {
+                        if (!panel.isConnected || this.closed || !this.video.ended) return close();
+                        if (msg.autoplay && !document.hidden) {
+                            remaining--;
+                            if (!remaining) return play();
+                            start.textContent = 'Play next (' + remaining + ')';
+                        }
+                    },1000);
+                    start.onclick = play;
+                    cancel.onclick = close;
+                    cancel.focus();
+                    break;
+                }
                 case 'COMMAND':
                     if (msg.command === 'close') this.destroy();
+                    else if (msg.command === 'toggle') this.togglePlay();
+                    else if (msg.command === 'mute') this.toggleMute();
                     else if (msg.command === 'export') this.onDownloadButton();
+                    break;
+                case 'RECORD_DISCARDED':
+                    this.recordingSince = 0;
+                    this.updateDownloadButton();
+                    this.refreshPopover();
+                    this.announce('Recording discarded', 'record');
                     break;
                 case 'RECORD_STARTED':
                     this.recordingSince = msg.startedAt || Date.now();
@@ -1897,6 +1344,7 @@
       <button type="button" class="ib tr-copy" aria-label="Copy transcript text">${icon('copy', 18)}</button>
       <button type="button" class="ib tr-export" aria-label="Save transcript as .srt">${icon('download', 18)}</button>
     </div>
+    ${window.AethvyrWhisper.markup}
     <ol class="tr-list" aria-label="Transcript lines"></ol>
     <p class="tr-empty hint" hidden></p>
   </aside>
@@ -1968,7 +1416,7 @@
         <div class="zone-right">
           <button type="button" class="pillbtn speed-pill adv narrow-hide" data-look="speed" aria-haspopup="menu" aria-expanded="false" aria-label="Playback speed 1.0×"><span class="num">1.0×</span></button>
           <button type="button" class="ib btn-cc" data-look="cc" aria-haspopup="dialog" aria-expanded="false" aria-label="Subtitles and audio tracks">${icon('captions')}</button>
-          <button type="button" class="ib btn-studio" data-look="studio" aria-haspopup="dialog" aria-expanded="false" aria-label="Studio settings">${icon('studio')}</button>
+          <button type="button" class="ib btn-studio" data-look="studio" aria-haspopup="dialog" aria-expanded="false" aria-label="Aethvyr Studio settings">${icon('studio')}</button>
           <button type="button" class="ib btn-pip adv narrow-hide" data-look="pip" aria-label="Picture in Picture">${icon('pip')}</button>
           <button type="button" class="ib btn-fs" data-look="fs" aria-label="Enter full screen">${icon('fullscreen')}</button>
         </div>
@@ -2053,8 +1501,7 @@
             setHTML(this.$('.btn-fwd'), skipIcon(1, s.seekStep));
             this.$('.btn-back').setAttribute('aria-label', `Seek back ${s.seekStep} seconds`);
             this.$('.btn-fwd').setAttribute('aria-label', `Seek forward ${s.seekStep} seconds`);
-            this.root.classList.toggle('ambient', !!s.ambientMode);
-            if (s.ambientMode) this.later(0, () => this.updateAmbient(true));
+            this.applyAmbientPreference();
             const skip = this.$('.skip-intro');
             if (!skip.dataset.mode) { // a chapter skip ("Skip intro") owns the label while shown
                 skip.querySelector('span').textContent = `+${s.skipSeconds}s`;
@@ -2228,7 +1675,7 @@
             const ranges = [];
             for (let i = 0; i < v.buffered.length; i++) ranges.push([v.buffered.start(i), v.buffered.end(i)]);
             if (this.engineStats && this.stream && this.stream.type === 'hls') for (const cr of this.engineStats.cachedRanges || []) ranges.push([cr.start, cr.end]);
-            const accent = getComputedStyle(this.root).getPropertyValue('--fs-accent').trim() || '#0a84ff';
+            const accent = getComputedStyle(this.root).getPropertyValue('--fs-accent').trim() || '#74D6EE';
             const bw = W / N;
             const gap = Math.max(1, Math.round(dpr));
             for (let i = 0; i < N; i++) {
@@ -2332,7 +1779,7 @@
                 sheet.id = 'fs-sub-style';
                 this.shadow.appendChild(sheet);
             }
-            const rule = `font-family:${font};font-size:${(size / 100) * 1.45}em;color:${st.color};background:${bg};text-shadow:${edge};font-weight:600;line-height:1.3;letter-spacing:0;`;
+            const rule = `font-family:${font};font-size:${(size / 100) * 1.45}em;color:var(--study-secondary,${st.color});background:${bg};text-shadow:${edge};font-weight:600;line-height:1.3;letter-spacing:0;`;
             sheet.textContent = `.subs .cue-line, .sub-preview .cue-line { ${rule} } .subs { font-size: calc(clamp(12px, 3.4vmin, 22px) * var(--fs-scale)); }`;
         }
 
@@ -2340,6 +1787,8 @@
         // UI wiring
         // -----------------------------------------------------------------
         bindUi() {
+            this.motionPreference = matchMedia('(prefers-reduced-motion: reduce)');
+            this.listen(this.motionPreference, 'change', () => this.applyAmbientPreference());
             const v = this.video;
             const on = (sel, ev, fn) => { const el = this.$(sel); if (el) this.listen(el, ev, fn); };
 
@@ -2425,10 +1874,16 @@
             media('canplay', () => this.setBuffering(false));
             media('ended', () => {
                 this.setStatus('ended');
+                if (!this.sleep) this.port?.send({type:'UP_NEXT'});
                 this.showControls(true);
                 this.updatePlayButtons();
                 this.saveHistory(true);
                 if (this.sleep && this.sleep.mode === 'eov') this.finishSleep();
+            });
+            media('seeking', () => {
+                if (this.smart.boostFrom != null) this.video.playbackRate = this.smart.boostFrom;
+                this.smart.boostFrom = null;
+                this.smart.darkSince = 0;
             });
             media('ratechange', () => this.updateSpeedUi());
             media('volumechange', () => {
@@ -2453,6 +1908,8 @@
             });
             media('durationchange', () => this.renderMarks());
             media('resize', () => { this.layoutVideo(); this.updateQualityBadge(); });
+            media('encrypted', () => { this.protectedSource = true; this.destroyGpu(); });
+            media('emptied', () => { this.protectedSource = false; });
             media('seeked', () => { this.subs.render(v.currentTime); if (this.gpu) this.gpu.renderOnce(); this.updateAmbient(true); this.saveHistory(true); });
             media('loadeddata', () => { if (this.gpu) this.gpu.renderOnce(); });
             this.listen(document, 'visibilitychange', () => { if (!document.hidden && this.gpu && this.gpu.active && !v.paused && !this.audioOnly) this.gpu.start(); });
@@ -2471,7 +1928,7 @@
                 // / snapshots stay unavailable for this session (allowed() is false).
                 if (!this.nativeMetaOk && !this.corsUnavailable && v.getAttribute('crossorigin') !== null) {
                     this.corsUnavailable = true;
-                    console.warn('[Velostream] Direct file failed with CORS; reloading without it');
+                    console.warn('[Aethvyr] Direct file failed with CORS; reloading without it');
                     this.load(this.nativeStart || undefined).catch(err => this.showError('Could not load this file', String((err && err.message) || err)));
                     return;
                 }
@@ -2660,6 +2117,7 @@
             for (const b of this.$$('.btn-play, .mini-play')) {
                 setHTML(b, icon(paused ? 'play' : 'pause'));
                 b.setAttribute('aria-label', paused ? 'Play' : 'Pause');
+                b.title = paused ? 'Play' : 'Pause';
             }
         }
 
@@ -2711,6 +2169,8 @@
 
         setRate(rate, announce = true) {
             const r = Math.round(clamp(rate, 0.25, 4) * 100) / 100;
+            this.smart.boostFrom = null;
+            this.smart.darkSince = 0;
             this.video.playbackRate = r;
             if (announce) this.announce(`Speed ${fmtRate(r)}`, 'speed');
             // The chosen speed becomes the starting speed of the next video.
@@ -2764,6 +2224,7 @@
             const b = this.$('.btn-mute');
             setHTML(b, icon(v.muted || v.volume === 0 ? 'mute' : v.volume < 0.5 ? 'volumeLow' : 'volume'));
             b.setAttribute('aria-label', v.muted ? 'Unmute' : 'Mute');
+            b.title = v.muted ? 'Unmute' : 'Mute';
         }
 
         stepFrame(dir, announce = true) {
@@ -3072,7 +2533,7 @@
             const netUrl = code >= 1000 && code < 2000 && typeof data[0] === 'string' ? data[0] : '';
             const reason = code === 1002 && data[1] ? String(data[1].message || data[1]) : '';
             const httpStatus = code === 1001 && typeof data[1] === 'number' ? ` HTTP ${data[1]}` : '';
-            console.warn(`[Velostream] Shaka error ${code}${httpStatus} (severity ${err.severity})`);
+            console.warn(`[Aethvyr] Shaka error ${code}${httpStatus} (severity ${err.severity})`);
             if (code === 3017) {
                 // QUOTA_EXCEEDED_ERROR: mobile SourceBuffer limits. Shrink buffers and keep going.
                 this.player.configure({ streaming: { bufferBehind: 8, bufferingGoal: 15 } });
@@ -3511,6 +2972,8 @@
                 const budget = window.VelostreamShared.graphicsBudget(hardware.tier, mobile, this.video.videoHeight);
                 return { preset: budget.preset, strength: this.settings.shaderStrength, maxHeight: budget.maxHeight, mobile };
             }
+            if (chosen === 'natural') return { preset: 'cas', strength: this.settings.shaderStrength * 0.35, maxHeight: 1080 };
+            if (chosen === 'color') return { preset: 'off', strength: 0 };
             if (chosen !== 'off') {
                 const maxHeight = mobile ? (this.settings.hwTier === 'low' ? 720 : 1080) : undefined;
                 return { preset: chosen, strength: this.settings.shaderStrength, maxHeight };
@@ -3538,8 +3001,12 @@
         }
 
         applyGpu() {
+            if (this.video.mediaKeys || this.protectedSource) {
+                this.destroyGpu();
+                return;
+            }
             const want = this.effectiveShader();
-            const color = this.gpuBlocked || this.graphicsOriginal ? null : this.gpuColor();
+            const color = this.gpuBlocked || this.graphicsOriginal || this.gpuOverride === 'off' ? null : this.gpuColor();
             if (want.preset === 'off' && !color && !this.gpu) return;
             if (!this.gpu) {
                 if (!window.VelostreamShaders || !this.glCanvas) { this.gpuBlocked = 'unavailable'; return; }
@@ -3864,7 +3331,16 @@
                 if (sm.boostFrom != null) { v.playbackRate = sm.boostFrom; sm.boostFrom = null; this.hideIsland(); }
                 sm.darkSince = 0;
             };
-            if (!this.settings.smartSkip || v.paused || sm.blocked || this.isLive() || this.loop.b != null) { restore(); return; }
+            const audio = this.settings.audio;
+            if (this.lectureSilence) {
+                if (v.paused || v.seeking || v.muted || v.volume === 0 || this.isLive() || this.loop.b != null ||
+                    !this.audio.allowed() || this.audio.ctx?.state !== 'running' || v.readyState < 3) { restore(); return; }
+                const action = lectureSilenceStep(sm, audio, v, this.audio.rms(), performance.now());
+                if (action?.rate != null) v.playbackRate = action.rate;
+                if (action?.seek != null) v.currentTime = action.seek;
+                return;
+            }
+            if (this.audioOnly || !this.settings.smartSkip || v.paused || sm.blocked || this.isLive() || this.loop.b != null) { restore(); return; }
             const luma = this.frameLuma();
             if (luma === null) {
                 if (v.videoWidth) { sm.blocked = true; this.announce('Smart skip is unavailable for this video', 'warn'); }
@@ -4288,7 +3764,7 @@
                 await this.handleExportMessage(st, msg);
                 if (msg.sequence != null) this.port.send({ type: 'EXPORT_ACK', jobId: msg.jobId, sequence: msg.sequence });
             }).catch((err) => {
-                console.warn('[Velostream] Export failed', err);
+                console.warn('[Aethvyr] Export failed', err);
                 this.port.send({ type: 'EXPORT_CANCEL' });
                 return this.handleExportMessage(st, { type: 'EXPORT_ERROR', error: `Saving failed: ${(err && err.message) || err}` });
             });
@@ -4341,12 +3817,13 @@
                         this.updateDownloadButton();
                         if (f.muxer) await f.muxer.finish();
                         else await f.sink.close();
+                        if (!f.sink.confirmed) st.unconfirmed = true;
                         f.sink = null;
                         this.announce(`Saved ${f.filename}`, 'check');
                     }
                     break;
                 }
-                case 'EXPORT_COMPLETE':
+                case 'EXPORT_COMPLETE': {
                     if (st.toMp4 && st.muxer) {
                         st.status = 'Writing MP4…';
                         this.updateDownloadButton();
@@ -4356,8 +3833,11 @@
                     }
                     st.running = false;
                     st.pct = 100;
-                    st.status = 'Saved';
+                    const confirmed = !st.unconfirmed && (!st.toMp4 || st.sink?.confirmed);
+                    st.status = confirmed ? 'Saved' : 'Sent to browser downloads';
+                    if (confirmed) this.port.send({type:'EXPORT_SAVED',jobId:msg.jobId});
                     break;
+                }
                 case 'EXPORT_ERROR':
                     st.running = false;
                     st.status = msg.error;
@@ -4406,7 +3886,7 @@
             this.updateViz();
             if (this.transcriptOpen) { this.renderTranscript(false); this.updateTranscriptActive(false); }
             this.tickCount = (this.tickCount || 0) + 1;
-            if (this.tickCount % 2 === 0 && this.settings) this.checkSmartSkip();
+            if (this.settings && (this.lectureSilence || this.tickCount % 2 === 0)) this.checkSmartSkip();
         }
 
         /**
@@ -4415,8 +3895,19 @@
          * after a seek, pause or setting change). Drawing a cross-origin frame only taints this
          * canvas, which is fine: it is displayed, never read.
          */
+        applyAmbientPreference() {
+            const s = this.settings;
+            if (!s) return;
+            const ambient = s.ambientMode && s.resourceProfile !== 'eco'
+                && s.reducedMotion !== 'on'
+                && !(s.reducedMotion !== 'off' && this.motionPreference.matches)
+                && (this.graphicsHardware ||= this.detectHardwareTier()).tier !== 'low';
+            this.root.classList.toggle('ambient', !!ambient);
+            if (ambient) this.later(0, () => this.updateAmbient(true));
+        }
+
         updateAmbient(force) {
-            if (!this.settings || !this.settings.ambientMode || this.audioOnly || document.hidden) return;
+            if (!this.root.classList.contains('ambient') || this.audioOnly || document.hidden) return;
             const v = this.video;
             if (!force && v.paused) return;
             if (v.readyState < 2 || !v.videoWidth) return;
@@ -4434,6 +3925,7 @@
         bindTranscript() {
             const d = this.$('.transcript');
             if (!d) return;
+            this.stopWhisper = window.AethvyrWhisper.bind(this,(blob,name)=>downloadBlob(this.shadow,blob,name));
             this.trFollow = true;
             this.listen(d.querySelector('.tr-close'), 'click', () => this.toggleTranscript(false));
             const search = d.querySelector('.tr-search');
@@ -4622,7 +4114,7 @@
             const ctx = this.vizCtx || (this.vizCtx = c.getContext('2d'));
             ctx.clearRect(0, 0, W, H);
             if (!this.vizColor || this.vizColorAt !== this.settings.theme) {
-                this.vizColor = getComputedStyle(this.root).getPropertyValue('--fs-accent').trim() || '#0A84FF';
+                this.vizColor = getComputedStyle(this.root).getPropertyValue('--fs-accent').trim() || '#74D6EE';
                 this.vizColorAt = this.settings.theme;
             }
             ctx.fillStyle = this.vizColor;
@@ -4717,7 +4209,9 @@
         sendTelemetry(withVariants) {
             if (this.localPlayback) return;
             const v = this.video;
-            const msg = { type: 'TELEMETRY', currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, hidden: document.hidden && !document.pictureInPictureElement, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
+            const conserve = navigator.connection?.saveData === true ||
+                (this.battery?.charging === false && this.battery.level <= 0.2);
+            const msg = { type: 'TELEMETRY', conserve, ended:v.ended, currentTime: v.currentTime, bufferAhead: this.bufferAhead(), paused: v.paused, hidden: document.hidden && !document.pictureInPictureElement, qualityCap: this.qualityCap, seekRangeStart: this.seekRange().start, seeking: v.seeking };
             if (this.player && this.mode === 'mse') {
                 const tracks = this.currentVariants();
                 const active = tracks.find(t => t.active);
@@ -5735,7 +5229,7 @@
 
         renderPopover() {
             const kind = this.popKind;
-            const titles = { speed: 'Playback Speed', captions: 'Subtitles & Audio', studio: 'Studio', help: 'Shortcuts & Gestures' };
+            const titles = { speed: 'Playback Speed', captions: 'Subtitles & Audio', studio: 'Aethvyr Studio', help: 'Shortcuts & Gestures' };
             const body = {
                 speed: () => this.popSpeed(),
                 captions: () => this.popCaptions(),
@@ -5967,6 +5461,7 @@ ${this.switchField('bf-pause', 'Pause background prefetch', !!this.prefetchPause
             let html = allowed ? '' : '<p class="hint">This file comes from another site without CORS, so the browser blocks audio processing. Boost, EQ and delay are unavailable.</p>';
             html += this.rangeField('au-vol', 'Volume', 0, 100, 1, vol, `${vol}%`);
             html += this.rangeField('au-boost', 'Boost', 100, 300, 5, a.boost, `${a.boost}%`);
+            html += '<p class="hint" id="boost-warning" role="status"' + (a.boost > 150 ? '' : ' hidden') + '>High boost can make sudden sounds uncomfortable. Lower your listening volume before increasing boost.</p>';
             html += '<div class="section-label" id="lbl-eq">Equalizer</div><div role="menu" aria-labelledby="lbl-eq">';
             for (const [k, p] of Object.entries(AUDIO_PRESETS)) {
                 html += this.row({ id: `au-p-${k}`, label: p.label, meta: p.meta, checked: a.preset === k, data: `data-preset="${k}"${allowed ? '' : ' disabled'}` });
@@ -5989,6 +5484,12 @@ ${this.rangeField('au-width', 'Stereo width', 0, 200, 5, a.width ?? 100, `${a.wi
 ${this.rangeField('au-dialogue', 'Dialogue boost', 0, 100, 5, a.dialogue || 0, `${a.dialogue || 0}%`)}
 ${this.switchField('au-crossfeed', 'Headphone crossfeed', !!a.crossfeed)}
 <p class="hint">Width: 0% is mono, 100% as recorded, 200% extra wide. Dialogue boost lifts voices in the centre of the mix. Crossfeed blends the sides a little for a more natural sound on headphones.</p>`;
+            html += this.switchField('au-silence', 'Accelerate silent lecture passages (2×)', !!this.lectureSilence);
+            if (this.lectureSilence) {
+                html += this.rangeField('au-threshold', 'Silence threshold', -65, -30, 1, a.silenceDb, a.silenceDb + ' dBFS');
+                html += this.rangeField('au-minimum', 'Minimum silence', 500, 4000, 100, a.silenceMs, a.silenceMs + ' ms');
+                html += this.rangeField('au-padding', 'Speech padding', 100, 500, 50, a.speechPadMs, a.speechPadMs + ' ms');
+            }
             return html;
         }
 
@@ -6016,9 +5517,9 @@ ${this.switchField('au-crossfeed', 'Headphone crossfeed', !!a.crossfeed)}
             html += `</div></details>${this.displaySection('graphics', 'Graphics', 'Enhancement and original preview')}
 ${this.selectField('dp-shader', 'Enhancement', GPU_PRESETS, s.shader)}
 ${showStrength ? this.rangeField('dp-shader-str', 'Strength', 0, 100, 5, s.shaderStrength, `${s.shaderStrength}%`) : ''}
-<div class="graphics-compare"><button type="button" class="pillbtn" id="dp-original" aria-pressed="${!!this.graphicsOriginal}">${this.graphicsOriginal ? 'Show enhanced' : 'Show original'}</button></div>
+<div class="graphics-compare"><button type="button" class="pillbtn" id="dp-original" aria-pressed="${!!this.graphicsOriginal}">${this.graphicsOriginal ? 'Show enhanced' : 'Show original'}</button><button type="button" class="pillbtn" id="dp-preview">Preview original for 2 seconds</button><button type="button" class="pillbtn" id="dp-split" aria-pressed="${!!this.graphicsSplit}">Split view</button></div>
 ${this.selectField('dp-maxres', 'Max render resolution', [[1080, '1080p'], [1440, '1440p'], [2160, '2160p (4K)']], s.maxRenderRes)}
-<p class="hint">${esc(gpuState)} Auto adjusts rendering cost for your device. Try Detail sharpening for soft footage, Compression cleanup for blocky video, or Anime4K for animation. Heavy presets step down if playback struggles.</p>`;
+<p class="hint">${esc(gpuState)} Auto adjusts rendering cost for your device. Natural uses gentle sharpening. Custom Color Studio applies your grading below. Split view shows original on the left when GPU processing is active. Heavy presets step down if playback struggles.</p>`;
             const cs = s.color || {};
             const CP = window.VelostreamShared.COLOR_PRESETS;
             html += `</div></details>${this.displaySection('color', 'Color Studio', 'Looks and fine color adjustments')}
@@ -6030,7 +5531,8 @@ ${this.rangeField('dp-c-tint', 'Tint', -100, 100, 5, cs.tint || 0, `${cs.tint ||
 ${this.rangeField('dp-c-shadows', 'Shadows', -100, 100, 5, cs.shadows || 0, `${cs.shadows || 0}`)}
 ${this.rangeField('dp-c-highlights', 'Highlights', -100, 100, 5, cs.highlights || 0, `${cs.highlights || 0}`)}
 <p class="hint">${this.gpuBlocked ? `Needs GPU enhancement, which is unavailable here (${esc(this.gpuBlocked)}).` : 'Graded on the GPU, on top of the colour sliders above. Vibrance boosts dull colours more than vivid ones; Temperature warms or cools; Shadows and Highlights lift or recover the dark and bright parts.'}</p>`;
-            html += this.switchField('dp-ambient', 'Ambient glow behind the video', !!s.ambientMode);
+            html += '<details class="look-more"><summary>Experimental lighting</summary><p class="hint">Samples video frames to light the space around the picture. Eco, reduced motion and low-end devices suspend the effect.</p>'
+                + this.switchField('dp-ambient', 'Ambient video lighting', !!s.ambientMode) + '</details>';
             html += '<div class="inline"><label class="sr-only" for="dp-preset-name">Preset name</label><input type="text" id="dp-preset-name" placeholder="Preset name" maxlength="40"><button type="button" class="pillbtn primary" id="dp-preset-save">Save</button><button type="button" class="pillbtn" id="dp-reset">Reset</button></div>';
             (this.settings.filterPresets || []).forEach((p, i) => {
                 html += `<div class="list-row"><span>${esc(p.name)}</span><button type="button" class="pillbtn" id="dp-apply-${i}" data-fp-apply="${i}">Apply</button><button type="button" class="ib" id="dp-del-${i}" data-fp-del="${i}" aria-label="Delete preset ${esc(p.name)}">${icon('trash', 18)}</button></div>`;
@@ -6082,6 +5584,7 @@ ${this.row({ id: 'tl-ff', label: 'Next frame', meta: '.', role: 'menuitem', lead
                     html += this.row({ id: 'tl-cancel', label: st.isClip ? 'Cancel clip export' : 'Pause download', role: 'menuitem', lead: 'stop' });
                 } else if (live) {
                     html += this.row({ id: 'tl-rec', label: this.recordingSince ? 'Stop & save recording' : 'Record from now', role: 'menuitem', lead: this.recordingSince ? 'stop' : 'record' });
+                    if (this.recordingSince) html += this.row({id:'tl-discard-recording',label:'Discard recording',meta:fmtTime((Date.now()-this.recordingSince)/1000),role:'menuitem',lead:'stop'});
                     html += this.row({ id: 'tl-export', label: 'Save DVR buffer', meta: fmtTime((this.engineStats && this.engineStats.dvrSeconds) || 0), role: 'menuitem', lead: 'download' });
                 } else {
                     const dash = this.stream.type === 'dash';
@@ -6395,8 +5898,20 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                     if (this.audio.ensure()) this.audio.apply(next);
                     this.saveSettings({ audio: next });
                 };
+                sw('au-silence', enabled => {
+                    if (this.smart.boostFrom != null) this.video.playbackRate = this.smart.boostFrom;
+                    this.smart.boostFrom = null;
+                    this.smart.darkSince = 0;
+                    this.lectureSilence = enabled && this.audio.ensure();
+                    if (this.lectureSilence) this.audio.apply(this.settings.audio);
+                    else if (enabled) this.announce('Silence detection is unavailable for this source', 'warn');
+                    this.refreshPopover();
+                });
+                range('au-threshold', v => audio({ silenceDb: v }), v => v + ' dBFS');
+                range('au-minimum', v => audio({ silenceMs: v }), v => v + ' ms');
+                range('au-padding', v => audio({ speechPadMs: v }), v => v + ' ms');
                 range('au-vol', v => this.setVolume(v / 100, false), v => `${v}%`);
-                range('au-boost', v => { audio({ boost: v }); this.island('volume', `${v}% Boost`, v / 300); }, v => `${v}%`);
+                range('au-boost', v => { audio({ boost: v }); byId('boost-warning').hidden = v <= 150; this.island('volume', `${v}% Boost`, v / 300); }, v => `${v}%`);
                 each('[data-preset]', el => { audio({ preset: el.dataset.preset }); this.announce(AUDIO_PRESETS[el.dataset.preset].label, 'wave'); this.refreshPopover(); });
                 EQ_BANDS.forEach((b, i) => range(`au-eq-${i}`, v => {
                     const eq = this.settings.audio.eq.slice();
@@ -6417,6 +5932,17 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
             } else if (tab === 'display') {
                 const filt = (key, suffix) => range(`dp-${key}`, v => { this.filters[key] = v; this.applyFilters(); }, v => `${v}${suffix}`);
                 filt('brightness', '%'); filt('contrast', '%'); filt('saturate', '%'); filt('sharpness', '%'); filt('hue', '°'); filt('warmth', '%');
+                click('dp-preview', () => {
+                    if (this.graphicsOriginal) return;
+                    this.graphicsOriginal = true;
+                    this.applyFilters();
+                    this.later(2000, () => { this.graphicsOriginal = false; this.applyFilters(); this.refreshPopover(); });
+                });
+                click('dp-split', () => {
+                    this.graphicsSplit = !this.graphicsSplit;
+                    this.vbox.classList.toggle('graphics-split', this.graphicsSplit);
+                    byId('dp-split').setAttribute('aria-pressed', String(this.graphicsSplit));
+                });
                 click('dp-original', () => {
                     this.graphicsOriginal = !this.graphicsOriginal;
                     this.applyFilters();
@@ -6453,7 +5979,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                     }, v => (k === 'gamma' ? (v / 100).toFixed(2) : String(v)));
                 }
                 sw('dp-ambient', v => { this.saveSettings({ ambientMode: v }); this.announce(v ? 'Ambient glow on' : 'Ambient glow off', 'sun'); });
-                click('dp-reset', () => { this.filters = { ...DEFAULT_FILTERS }; this.applyFilters(); this.refreshPopover(); this.announce('Display reset', 'sun'); });
+                click('dp-reset', () => { this.filters = { ...DEFAULT_FILTERS }; this.saveSettings({ color: { ...window.VelostreamShared.DEFAULT_SETTINGS.color } }); this.applyFilters(); this.refreshPopover(); this.announce('Display reset', 'sun'); });
                 click('dp-preset-save', () => {
                     const name = byId('dp-preset-name').value.trim() || `Preset ${(this.settings.filterPresets || []).length + 1}`;
                     this.saveSettings({ filterPresets: (this.settings.filterPresets || []).concat([{ name: name.slice(0, 40), values: { ...this.filters } }]).slice(-20) });
@@ -6515,6 +6041,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 click('tl-fb', () => this.stepFrame(-1));
                 click('tl-ff', () => this.stepFrame(1));
                 click('tl-cancel', () => this.port.send({ type: 'EXPORT_CANCEL' }));
+                click('tl-discard-recording', () => this.port.send({type:'RECORD_DISCARD'}));
                 click('tl-rec', () => this.onDownloadButton());
                 click('tl-export', () => this.startExport());
                 click('tl-clip-in', () => this.setClipPoint('start'));
@@ -6880,6 +6407,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         root.className = 'local-player vault-player';
         setHTML(root, `<section class="vault-panel" aria-labelledby="vault-title">
           <header class="local-heading"><h1 id="vault-title">Offline download</h1><a class="local-control" href="../popup/library.html#offline">Offline / Cached</a></header>
+          <label>Export filename <input data-filename maxlength="100" placeholder="Use saved name"></label>
           <p class="local-status" role="status">Ready to open the cached download.</p>
           <progress aria-label="Download progress" max="100" hidden></progress>
           <div class="local-actions">
@@ -6893,6 +6421,9 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
         const pause = root.querySelector('[data-pause]');
         const status = root.querySelector('[role="status"]');
         const progress = root.querySelector('progress');
+        const batchParams = new URLSearchParams(location.search);
+        const batchNext = batchParams.getAll('next');
+        if (batchNext.length) status.textContent = 'Ready to export ' + (batchNext.length+1) + ' selected downloads in order.';
         let port;
         const exportUi = Object.create(VelostreamPlayer.prototype);
         Object.assign(exportUi, {
@@ -6908,13 +6439,21 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 progress.hidden = !state.running && state.status !== 'Saved';
                 if (state.pct || !state.running) progress.value = state.pct;
                 else progress.removeAttribute('value');
-                if (!state.running) { port?.disconnect(); port = null; }
+                if (!state.running) {
+                    port?.disconnect(); port = null;
+                    if (state.status === 'Saved' && batchNext.length) {
+                        const params = new URLSearchParams({mode:'offline',id:batchNext.shift(),batch:'1'});
+                        batchNext.forEach(key=>params.append('next',key));
+                        sessionStorage.setItem('aethvyr-vault-next',params.toString());
+                        location.replace('?'+params);
+                    }
+                }
             }
         });
         start.onclick = async () => {
             start.disabled = true;
             try {
-                port = extApi.runtime.connect({ name: 'velostream-vault' });
+                port = extApi.runtime.connect({ name: VAULT_PORT });
                 const st = exportUi.exportState = { running: true, files: {}, status: '', pct: 0 };
                 exportUi.updateDownloadButton();
                 port.onMessage.addListener(msg => {
@@ -6932,7 +6471,7 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                         exportUi.onExportMessage({ type: 'EXPORT_ERROR', error: 'Export paused. Resume to continue.' });
                     }
                 });
-                port.postMessage({ type: 'EXPORT_RESUME', id });
+                port.postMessage({ type: 'EXPORT_RESUME', id, filename:root.querySelector('[data-filename]').value });
             } catch (error) {
                 if (exportUi.exportState) exportUi.exportState.running = false;
                 port?.disconnect();
@@ -6942,6 +6481,9 @@ ${this.rangeField('pf-scrim', 'Control background darkness', -5, 95, 5, lk.scrim
                 pause.disabled = true;
             }
         };
+        const continuation = sessionStorage.getItem('aethvyr-vault-next');
+        sessionStorage.removeItem('aethvyr-vault-next');
+        if (batchParams.get('batch') === '1' && continuation === batchParams.toString()) start.click();
         pause.onclick = () => {
             exportUi.port.send({ type: 'EXPORT_CANCEL' });
             exportUi.exportState.pausing = true;

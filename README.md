@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="icons/icon-128.png" width="96" height="96" alt="">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/icon.svg">
+  <img src="assets/brand/icon-light.svg" width="96" height="96" alt="">
+</picture>
 
 # Aethvyr
 
@@ -14,7 +17,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
 [Features](#features) · [Install](#install) · [Usage](#usage) · [Docs](#documentation) ·
-[Build from source](#build-from-source) · [Foundation audit](docs/FOUNDATION.md) · [Roadmap](docs/ROADMAP.md) · [Privacy](PRIVACY.md) · [Contributing](CONTRIBUTING.md)
+[Build from source](#build-from-source) · [Security assessment](docs/PHASE3.md) · [Architecture report](docs/PHASE2.md) · [Phase 1 brand report](docs/PHASE1.md) · [Foundation audit](docs/FOUNDATION.md) · [Roadmap](docs/ROADMAP.md) · [Privacy](PRIVACY.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -153,7 +156,6 @@ browser-specific manifest. Details in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 │   └── mp4-mux.js           TS→fMP4 remux and audio/video merge for downloads
 ├── popup/                   Toolbar popup: streams, telemetry, site settings
 ├── common/shared.js         Settings schema/migration, URL classification, binary codec
-├── rules/stream_rules.json  Static DNR rule exposing range headers to the page proxy
 └── scripts/                 build.js, package.js
 ```
 

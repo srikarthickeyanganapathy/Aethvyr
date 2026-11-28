@@ -1,4 +1,4 @@
-Anime4K CNN shaders used by Velostream (player/anime4k.js)
+Anime4K CNN shaders used by Aethvyr (player/anime4k.js)
 
 Source:  https://github.com/bloc97/Anime4K
 Release: tag v4.0.1, commit 4029bf701ecaa15f163cdc49cffe5501c1acf410

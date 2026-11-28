@@ -1,7 +1,7 @@
 # Troubleshooting
 
 Player errors show a title, a message and a **Retry** button. The browser console (DevTools on the
-page, `player.html` frame) has the details: `[Velostream] Shaka error <code> [HTTP status] <url> - <reason>`.
+page, `player.html` frame) has the details: `[Aethvyr] Shaka error <code> [HTTP status] <url> - <reason>`.
 Include that line when you report a problem.
 
 ## Nothing is detected

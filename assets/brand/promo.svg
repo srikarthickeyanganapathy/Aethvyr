@@ -6,8 +6,9 @@
     <ellipse cx="221" cy="110" rx="184" ry="59" transform="rotate(-18 221 110)"/>
   </g>
   <g transform="translate(156 39)">
-    <path d="M64 17 113 104 78 94 69 78 84 83 64 47 32 103 15 109Z" fill="#EAF6FF"/>
-    <circle cx="59" cy="89" r="7" fill="#74D6EE"/>
+    <circle cx="64" cy="64" r="55" fill="none" stroke="#8B7CFF" stroke-width="4"/>
+  <path d="M64 18 105 94 75 83 68 69 82 74 64 42 33 96 19 102Z" fill="#EAF6FF"/>
+  <circle cx="61" cy="83" r="7" fill="#74D6EE"/>
   </g>
   <text x="220" y="198" fill="#EAF6FF" font-family="system-ui,sans-serif" font-size="31" letter-spacing="6" text-anchor="middle">AETHVYR</text>
   <text x="220" y="230" fill="#91A4BA" font-family="system-ui,sans-serif" font-size="16" text-anchor="middle">Experience the unseen.</text>

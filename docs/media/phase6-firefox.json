@@ -1,0 +1,110 @@
+{
+  "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0",
+  "fixtureResolution": [
+    320,
+    180
+  ],
+  "restoration": {
+    "inputMAE": 9.877,
+    "filteredMAE": 0.644,
+    "cleanStrokeMAE": 41.765,
+    "medianMs": 2,
+    "samplesMs": [
+      2,
+      1,
+      2,
+      1,
+      2
+    ],
+    "temporal": {
+      "inputMAE": 10.304,
+      "filteredMAE": 1.119,
+      "spatialBaselineMAE": 10.077,
+      "cleanFlashMAE": 71.004,
+      "medianMs": 2,
+      "samplesMs": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    }
+  },
+  "motion": [
+    {
+      "scene": "single pan",
+      "holdMAE": 82.825,
+      "blendMAE": 71.846,
+      "motionMAE": 0,
+      "medianMs": 1
+    },
+    {
+      "scene": "opposing motion",
+      "holdMAE": 82.825,
+      "blendMAE": 71.846,
+      "motionMAE": 41.36,
+      "medianMs": 1
+    }
+  ],
+  "toneMap": {
+    "hdrDisplayReported": false,
+    "distinct8bitLevels": 255,
+    "samples": [
+      {
+        "code": 0,
+        "nits": 0,
+        "sdr": 0
+      },
+      {
+        "code": 256,
+        "nits": 5.172,
+        "sdr": 63
+      },
+      {
+        "code": 512,
+        "nits": 92.698,
+        "sdr": 184
+      },
+      {
+        "code": 768,
+        "nits": 990.014,
+        "sdr": 244
+      },
+      {
+        "code": 1023,
+        "nits": 10000,
+        "sdr": 254
+      }
+    ]
+  },
+  "local": {
+    "bytes": 31064,
+    "resolution": [
+      64,
+      48
+    ],
+    "seekMedianMs": 7,
+    "seekSamplesMs": [
+      7,
+      9,
+      9,
+      3,
+      3
+    ],
+    "webgpu": {
+      "available": false
+    }
+  },
+  "sync": {
+    "sameOriginOnly": true,
+    "medianAckMs": 7,
+    "samplesMs": [
+      7,
+      8,
+      8,
+      4,
+      3
+    ]
+  }
+}

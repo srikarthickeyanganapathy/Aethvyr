@@ -150,7 +150,7 @@ body.hc .lib-dialog { border: 2px solid #fff; }
 .lib .foot { margin-top: 8px; }
 
 .lib-page, .lib-page * { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.28) transparent; }
-.lib-page select, .lib-page option { color-scheme: dark; background: #1c1c1e; color: #fff; }
+.lib-page select, .lib-page option { color-scheme: dark; background: var(--card-solid); color: var(--text); }
 .website-link { color: var(--text); text-decoration: underline; overflow-wrap: anywhere; }
 .series-poster { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: var(--bg-elevated); border-radius: 8px; }
 .series-episodes { display: grid; gap: 8px; padding-inline-start: 24px; }
@@ -221,3 +221,9 @@ body.hc .lib-dialog { border: 2px solid #fff; }
 .guide-links { display: flex; flex-wrap: wrap; gap: 4px 16px; }
 .guide-links a { padding-block: 10px; }
 .guide-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); gap: 16px; }
+.library-list .lib-grid { grid-template-columns:1fr; } .library-list .library-cover { max-width:12rem; }
+
+[data-episode-edit] { display: grid; gap: .5rem; margin-block: .75rem; }
+[data-episode-edit] label { display: grid; grid-template-columns: minmax(5rem, 1fr) minmax(0, 2fr); align-items: center; gap: .5rem; }
+[data-episode-edit] :is(input,select) { min-width: 0; width: 100%; }
+.series-episodes + h4 { margin-block-start: 1rem; }

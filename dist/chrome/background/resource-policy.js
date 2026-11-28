@@ -5,13 +5,13 @@ const PROFILES = Object.freeze({
 });
 
 /** The profile supplies ceilings. User and device settings can always lower them. */
-export function prefetchPolicy(settings, sessions = 1, hidden = false) {
+export function prefetchPolicy(settings, sessions = 1, hidden = false, conserve = false) {
     const profile = PROFILES[settings.resourceProfile] || PROFILES.balanced;
     const custom = settings.resourceProfile === 'custom';
     const share = Math.max(1, Math.floor(8 / Math.max(1, sessions)));
     return {
-        windowSeconds: Math.min(settings.maxBufferSec || 90, custom ? 86400 : profile.windowSeconds, hidden ? 30 : Infinity),
-        workers: Math.min(settings.maxWorkers || 6, custom ? 8 : profile.workers, share, hidden ? 1 : Infinity)
+        windowSeconds: Math.min(settings.maxBufferSec || 90, custom ? 86400 : profile.windowSeconds, hidden || conserve ? 30 : Infinity),
+        workers: Math.min(settings.maxWorkers || 6, custom ? 8 : profile.workers, share, hidden || conserve ? 1 : Infinity)
     };
 }
 
@@ -66,11 +66,11 @@ export class NetworkBudget {
         this.queue = new Set();
     }
 
-    async run(url, signal, fetchResource) {
+    async run(url, signal, fetchResource, speculative = false) {
         const origin = new URL(url).origin;
         signal?.throwIfAborted();
         await new Promise((resolve, reject) => {
-            const entry = { origin, start: () => {
+            const entry = { origin, speculative, start: () => {
                 signal?.removeEventListener('abort', abort);
                 resolve();
             } };
@@ -99,6 +99,9 @@ export class NetworkBudget {
             if (this.active >= this.total) break;
             const n = this.byOrigin.get(entry.origin) || 0;
             if (n >= this.perOrigin) continue;
+            // Keep a slot available for playback even when all speculation targets one CDN.
+            if (entry.speculative && (this.active >= Math.max(1, this.total - 1) ||
+                n >= Math.max(1, this.perOrigin - 1))) continue;
             this.queue.delete(entry);
             this.active++;
             this.byOrigin.set(entry.origin, n + 1);

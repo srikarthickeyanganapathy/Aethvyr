@@ -27,8 +27,9 @@ test('foundation text and accent tokens meet normal-text contrast on panel backg
             .map(c => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
         return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
     }
-    for (const bg of ['bg-base', 'bg-elevated']) {
-        for (const fg of ['text-primary', 'text-secondary', 'text-tertiary', 'accent-default', 'accent-secondary']) {
+    assert.ok((luminance('text-primary') + 0.05) / (luminance('accent-active') + 0.05) >= 4.5);
+    for (const bg of ['bg-base', 'bg-secondary', 'bg-elevated']) {
+        for (const fg of ['text-primary', 'text-secondary', 'text-tertiary', 'accent-default', 'accent-secondary', 'success', 'warning', 'error']) {
             assert.ok((luminance(fg) + 0.05) / (luminance(bg) + 0.05) >= 4.5, fg + ' on ' + bg);
         }
     }

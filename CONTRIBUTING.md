@@ -11,7 +11,7 @@ Open an issue with:
    version;
 2. the page where it happens (or a description if it is private);
 3. what you expected and what happened;
-4. the console line starting with `[Velostream]` (DevTools → page → `player.html` frame), and for
+4. the console line starting with `[Aethvyr]` (DevTools → page → `player.html` frame), and for
    detection problems the popup's stream list.
 
 **Do not ask for, or submit, support for DRM-protected services.** Aethvyr will not circumvent

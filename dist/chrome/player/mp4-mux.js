@@ -751,6 +751,13 @@
             // Keep interleaving metadata in memory and spool media to disk where supported.
             const source = this.src[srcIndex];
             const spool = await this.openSpool(source);
+            const bytes = frags.reduce((total,f) => total + f.byteLength,0);
+            this.stagedBytes = (this.stagedBytes || 0) + bytes;
+            if (this.stagedBytes > 4 * 1024 ** 3) throw Error('The separate-track export exceeds the temporary storage limit.');
+            if (!spool) {
+                this.memoryBytes = (this.memoryBytes || 0) + bytes;
+                if (this.memoryBytes > 128 * 1024 ** 2) throw Error('This browser cannot stage more than 128 MiB of separate tracks in memory.');
+            }
             const blob = spool ? null : new Blob(frags);
             let p = spool?.size || 0;
             for (const f of frags) {

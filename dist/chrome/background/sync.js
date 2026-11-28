@@ -32,7 +32,7 @@
  * Every merge is deterministic (ties broken by content) so devices converge and never ping-pong.
  */
 
-const VERSION = 2;
+const VERSION = 3;
 const PREFIX = 'vs_';
 const META_KEY = 'vs_meta';
 const SECTIONS = ['set', 'hist', 'lib', 'bm'];
@@ -259,8 +259,10 @@ export function syncPageUrl(value) {
     if (!httpUrl(value)) return '';
     try {
         const url = new URL(value);
-        if (url.username || url.password || url.hostname === 'localhost' || url.hostname.endsWith('.local')) return '';
+        if (url.username || url.password || !url.hostname.includes('.') || /^(?:\d+\.){3}\d+$/.test(url.hostname) ||
+            /(?:^|\.)(?:localhost|local|internal|lan)$/.test(url.hostname)) return '';
         const path = decodeURIComponent(url.pathname);
+        if (/%[0-9a-f]{2}/i.test(path) || /\.(?:m3u8|mpd|mp4|webm|m4s|mkv|ts|vtt|srt)$/i.test(path)) return '';
         if (/(?:^|\/)(?:token|signature|auth|signed|session|secret|key|access[-_]?token)(?:\b|_)/i.test(path) ||
             path.split('/').some(segment => /^[\w+.-]{40,}$/.test(segment)) ||
             SENSITIVE_PATH.test(path)) return '';
@@ -274,13 +276,20 @@ export function syncPageUrl(value) {
 
 const SENSITIVE_PATH = /(?:[;?&]|%)(?:token|signature|sig|auth|jwt|session|key|password)=/i;
 
+function syncLabel(label, limit) {
+    return str(label, 2048).replace(/https?:\/\/\S+/gi, '[link]')
+        .replace(/\bBearer\s+[^\s,;]+/gi, '[redacted]')
+        .replace(/\b(?:token|access_token|api[_-]?key|signature|password|session)\s*[=:]\s*[^\s,;]+/gi, '[redacted]')
+        .replace(/\p{Cc}/gu, ' ').slice(0, limit);
+}
+
 export function sanitizeHistEntry(a) {
     if (!Array.isArray(a) || a.length < 8) return null;
     const [k, , page, title, t, d, done, updatedAt, subOffset, loopA, loopB] = a;
     if (typeof k !== 'string' || !KEY_RE.test(k) || ['__proto__', 'constructor', 'prototype'].includes(k) || !fin(updatedAt) || updatedAt <= 0) return null;
     const num = (n, lo, hi) => (fin(n) && n >= lo && n <= hi ? n : null);
     return [
-        k, '', syncPageUrl(page), str(title, 200).replace(/https?:\/\/\S+/gi, '[link]'),
+        k, '', syncPageUrl(page), syncLabel(title, 200),
         num(t, 0, 1e7) ?? 0, num(d, 0, 1e7) ?? 0, done ? 1 : 0, updatedAt,
         num(subOffset, -1e4, 1e4) ?? 0, num(loopA, 0, 1e7), num(loopB, 0, 1e7)
     ];
@@ -289,7 +298,7 @@ export function sanitizeHistEntry(a) {
 function sanitizeTimes(m, max) {
     const out = {};
     if (!isObj(m)) return out;
-    for (const [k, t] of Object.entries(m)) if (KEY_RE.test(k) && fin(t) && t >= 0) out[k] = t;
+    for (const [k, t] of Object.entries(m)) if (!['__proto__','constructor','prototype'].includes(k) && KEY_RE.test(k) && fin(t) && t >= 0) out[k] = t;
     return capTimes(out, max);
 }
 
@@ -301,7 +310,7 @@ function sanitizeBookmarkList(list) {
         const t = Array.isArray(b) ? b[0] : (isObj(b) ? b.t : null);
         const label = Array.isArray(b) ? b[1] : (isObj(b) ? b.label : '');
         if (!fin(t) || t < 0 || t > 1e7) continue;
-        out.push([round1(t), str(label == null ? '' : String(label), 120)]);
+        out.push([round1(t), syncLabel(label == null ? '' : String(label), 120)]);
     }
     return out;
 }
@@ -319,8 +328,8 @@ function cleanKeyList(arr, max) {
 }
 
 function sanitizeCollection(id, c) {
-    if (!COL_ID_RE.test(id) || !isObj(c)) return null;
-    const n = str(c.n, LIB_NAME_MAX).trim();
+    if (['__proto__','constructor','prototype'].includes(id) || !COL_ID_RE.test(id) || !isObj(c)) return null;
+    const n = syncLabel(c.n, LIB_NAME_MAX).trim();
     if (!n) return null;
     return { n, k: cleanKeyList(c.k, LIB_KEYS_MAX), c: fin(c.c) ? c.c : 0, at: fin(c.at) && c.at >= 0 ? c.at : 0 };
 }
@@ -377,6 +386,17 @@ const SANITIZE = {
 function syncedSubset(merged) {
     const o = clone(merged) || {};
     for (const p of DEVICE_SPECIFIC_SETTINGS) setPath(o, p, undefined);
+    const validHost = host => typeof host === 'string' && /^[a-z0-9.-]{1,253}$/i.test(host);
+    o.autoSites = (o.autoSites || []).filter(validHost);
+    o.siteProfiles = (o.siteProfiles || []).filter(profile => validHost(profile?.host)).map(profile =>
+        Object.fromEntries(Object.entries(profile).filter(([key, value]) =>
+            (key === 'host' || ['shader','audioPreset','fit'].includes(key) && typeof value === 'string' && /^[a-z0-9:-]{1,32}$/i.test(value)) ||
+            ['defaultSpeed','qualityCap','shaderStrength','subSize','skipSeconds'].includes(key) && Number.isFinite(value))));
+    o.filterPresets = (o.filterPresets || []).filter(p => isObj(p) && isObj(p.values)).slice(-20).map(p => ({
+        name: syncLabel(p.name, 40),
+        values: Object.fromEntries(Object.entries(p.values).filter(([k, v]) =>
+            ['brightness','contrast','saturate','hue','warmth','sharpness'].includes(k) && Number.isFinite(v)))
+    }));
     return o;
 }
 
@@ -473,7 +493,7 @@ function createSync(api, S, clock, writeStorage) {
         const msg = String((err && err.message) || err || 'unknown error').slice(0, 300);
         if (!loggedErrors.has(msg)) {
             loggedErrors.add(msg);
-            console.warn('[Velostream] Sync:', msg);
+            console.warn('[Aethvyr] Sync:', msg);
         }
         const now = clock.now();
         session.backoffKind = /quota|MAX_WRITE_OPERATIONS|MAX_ITEMS/i.test(msg) ? 'quota' : 'error';
@@ -637,7 +657,7 @@ function createSync(api, S, clock, writeStorage) {
     async function mergeRemoteLocked(remote) {
         const meta = parseMeta(remote[META_KEY]);
         if (!meta) return { meta: null, sections: {} };
-        if (meta.newer) throw new SyncError('Synced data comes from a newer Velostream. Update this device to keep syncing.', 'newer');
+        if (meta.newer) throw new SyncError('Synced data comes from a newer version of Aethvyr. Update this device to keep syncing.', 'newer');
         const sections = {};
         for (const sec of SECTIONS) sections[sec] = await decodeSection(remote, meta, sec);
 
@@ -703,7 +723,7 @@ function createSync(api, S, clock, writeStorage) {
                 if (lat !== rat) {
                     [list, at] = lat > rat ? [llist, lat] : [rlist, rat];
                 } else {
-                    list = unionBookmarks(llist, rlist);
+                    list = lat > 0 && (!llist.length || !rlist.length) ? [] : unionBookmarks(llist, rlist);
                     at = Math.max(lat, rat);
                 }
                 if (canon(list) !== canon(llist) || (lraw === undefined && list.length)) {
@@ -906,7 +926,7 @@ function createSync(api, S, clock, writeStorage) {
         // Library
         const view = ensureLibView(all[LIBRARY_KEY]);
         if (Object.keys(view.fav).length || Object.keys(view.fd).length || Object.keys(view.col).length || Object.keys(view.cd).length) {
-            const enc = await encodeSection('lib', view, S);
+            const enc = await encodeSection('lib', normalizeLibView(view), S);
             if (enc.bytes <= Math.min(LIB_MAX, left)) take('lib', enc);
         }
 
@@ -947,7 +967,7 @@ function createSync(api, S, clock, writeStorage) {
             return;
         }
         const remoteSetUsable = rs?.status === 'ok';
-        if (meta?.v === VERSION && remoteSetUsable && state.setAt <= rs.data.at) {
+        if (meta?.v === VERSION && remoteSetUsable && rs.meta.h === hash(canon({ at: rs.data.at, d: rs.data.d })) && state.setAt <= rs.data.at) {
             const chunks = [];
             for (let i = 0; i < rs.meta.n; i++) chunks.push(remote[`${PREFIX}set_${i}`]);
             if (chunks.every(c => typeof c === 'string')) {
@@ -1144,7 +1164,7 @@ function createSync(api, S, clock, writeStorage) {
     function onMessage(message, sender, sendResponse) {
         if (!message || (message.action !== 'SYNC_NOW' && message.action !== 'SYNC_CLEAR')) return false;
         // Only extension pages (popup / options / player), not content scripts in web pages.
-        if (sender && (sender.id !== api.runtime.id || (sender.tab && !(sender.url || '').startsWith(api.runtime.getURL(''))))) return false;
+        if (sender?.id !== api.runtime.id || sender.url !== api.runtime.getURL('popup/popup.html')) return false;
         const work = message.action === 'SYNC_NOW' ? syncNow() : clearSync();
         work.then(() => sendResponse({ ok: true, status }), err => sendResponse({ ok: false, error: String((err && err.message) || err), status }));
         return true;
@@ -1191,10 +1211,10 @@ export function initSync({ api, S, clock, writeStorage = fn => fn() } = {}) {
         const ctl = createSync(api, S, clock || defaultClock, writeStorage);
         api.storage.onChanged.addListener(ctl.onStorageChanged);
         if (api.runtime && api.runtime.onMessage) api.runtime.onMessage.addListener(ctl.onMessage);
-        const ready = ctl.init().catch(err => { console.warn('[Velostream] Sync init failed:', err); });
+        const ready = ctl.init().catch(err => { console.warn('[Aethvyr] Sync init failed:', err); });
         return { syncNow: ctl.syncNow, clearSync: ctl.clearSync, getStatus: ctl.getStatus, whenIdle: ctl.whenIdle, ready };
     } catch (err) {
-        console.warn('[Velostream] Sync init failed:', err);
+        console.warn('[Aethvyr] Sync init failed:', err);
         return noop;
     }
 }

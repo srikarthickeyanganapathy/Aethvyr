@@ -4,10 +4,10 @@
 | --- | --- |
 | 1. Foundation — complete | Branding, shared design tokens, CI, private storage protections, desktop upgrades and the installed-player lifecycle are documented in the [foundation checklist](FOUNDATION.md). |
 | 2. Intelligence (complete) | Unified profiles, shared resource budgets, adaptive buffering, GPU fallback, diagnostics, failure handling and [desktop benchmark results](FOUNDATION.md#phase-2-completion-report). |
-| 3. Experience | Lightweight and native enhancement modes, reversible cinema controls, accessibility and unified playback controls. |
-| 4. Library and Vault | Episode matching, playback queues and persistent download management. |
-| 5. Whisper | Subtitle learning controls, optional translation and local transcription. |
-| 6. Experimental research | Evaluate WebGPU, HDR processing and motion interpolation against measured playback and quality budgets. |
+| 3. Experience (complete) | Full, lightweight and enhancement-only playback, reversible cinema dimming, keyboard-accessible help and unified session controls. |
+| 4. Library and Vault (complete) | Episode identity, confirmed next links, persistent playback queue, Library layouts, local statistics and batch download management. See the [browser verification report](FOUNDATION.md#phase-4-library-and-vault). |
+| 5. Whisper (implemented) | Sentence practice, vocabulary exports and capability-gated browser-local language tools. See [desktop verification and model limits](FOUNDATION.md#phase-5-whisper). |
+| 6. Experimental research (complete) | Six browser experiments evaluated. Production release decisions, raw measurements and reproduction commands are in the [research report](PHASE6.md). |
 
 ## Benchmark protocol
 

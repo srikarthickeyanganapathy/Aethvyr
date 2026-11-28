@@ -30,3 +30,8 @@ test('saved format survives later inference and metadata sanitization', () => {
     assert.equal(meta.episode, 0);
     assert.equal(classifyLibraryMedia({ ...meta, title: 'Episode 0' }).kind, 'movie');
 });
+
+test('numbered animation specials retain fractional numbering in season zero', () => {
+    const meta = classifyLibraryMedia({title:'Observatory OVA 2.5',medium:'anime'});
+    assert.deepEqual(meta,{kind:'series',medium:'anime',season:0,episode:2.5});
+});

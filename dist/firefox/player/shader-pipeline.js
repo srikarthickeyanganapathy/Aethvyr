@@ -17,8 +17,7 @@
  * The canvas is sized min(maxRenderRes, displayed size x devicePixelRatio). Frames are driven by
  * requestVideoFrameCallback (falls back to requestAnimationFrame), so nothing runs while the
  * video is paused, hidden or audio-only; seeks and setting changes render one frame on demand.
- * A thermal guard steps the preset down (STEP_DOWN) when the GPU cannot keep up; colour grading
- * is cheap and is never stepped down.
+ * A frame-time guard steps the preset down (STEP_DOWN) when the GPU cannot keep up.
  *
  * Exposes window.VelostreamShaders = { VideoShaderPipeline, PRESETS, COLOR_NEUTRAL, STEP_DOWN,
  * isSupported }. Load player/anime4k.js (window.VelostreamAnime4K) before this file for the CNN
@@ -491,7 +490,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             let h = Math.max(2, Math.round(this.contentRect.h * dpr));
             const sourceHeight = this.preset === 'cas' ? this.video.videoHeight : 0;
             const textureLimit = this.textureLimit || (this.textureLimit = this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE));
-            const targetHeight = Math.min(Math.max(h, sourceHeight), this.maxRenderRes, textureLimit, textureLimit * h / w);
+            const targetHeight = Math.min(Math.max(h, sourceHeight), this.maxRenderRes, this.loadCap || Infinity, textureLimit, textureLimit * h / w);
             w = Math.max(2, Math.round(w * targetHeight / h));
             h = Math.max(2, Math.round(targetHeight));
             if (this.canvas.width !== w || this.canvas.height !== h) {
@@ -676,7 +675,7 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             e.progs = null;
             e.status = 'failed';
             e.error = (err && err.message) || String(err);
-            console.warn('[Velostream] Anime4K CNN unavailable, using Anime4K-lite:', e.error);
+            console.warn('[Aethvyr] Anime4K CNN unavailable, using Anime4K-lite:', e.error);
         }
 
         /** While shaders compile in the background and no frame loop runs, re-render when ready. */
@@ -838,17 +837,24 @@ void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }`;
             const frameMs = g.gpuN ? g.gpu / g.gpuN : g.cpu / Math.max(1, g.frames);
             this.lastTiming = { cpuSubmitMs: g.cpu / Math.max(1, g.frames), gpuMs: g.gpuN ? frameMs : null };
             const dropRatio = dropped / total;
-            const overloaded = frameMs > 14 || (dropped > 6 && dropRatio > 0.08);
+            const frameBudget = q && total > 1 ? Math.min(14, Math.max(5, elapsed / total * 0.65)) : 14;
+            const overloaded = frameMs > frameBudget || (dropped > 6 && dropRatio > 0.08);
             const strikes = overloaded ? (g.strikes || 0) + 1 : 0;
             this.resetGuard(false);
             this.guard.strikes = strikes;
             // Two overloaded windows in a row (6 s) before stepping down: no reaction to one spike.
-            // 'off' has no entry: colour-only mode is never stepped down (it is one cheap pass).
-            if (strikes >= 2 && STEP_DOWN[this.preset] !== undefined) {
+            // Prefer a smaller target before removing a processing pass.
+            if (strikes >= 2 && this.canvas.height > 1080 && !this.loadCap) {
+                this.loadCap = 1080;
+                this.resize();
+                this.resetGuard(true);
+                return;
+            }
+            if (strikes >= 2 && (STEP_DOWN[this.preset] !== undefined || this.colorOn)) {
                 const from = this.preset;
-                const to = STEP_DOWN[from];
-                const reason = frameMs > 14 ? `${frameMs.toFixed(1)} ms per frame` : `${dropped} dropped frames`;
-                this.configure({ preset: to }); // (colour grading is kept)
+                const to = STEP_DOWN[from] || 'off';
+                const reason = frameMs > frameBudget ? `${frameMs.toFixed(1)} ms per frame` : `${dropped} dropped frames`;
+                this.configure({ preset: to, color: to === 'off' ? {} : this.color });
                 if (this.hooks.onStepDown) this.hooks.onStepDown(to, reason, from);
             }
         }
